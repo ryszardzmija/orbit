@@ -23,7 +23,9 @@ public:
 
     FileDescriptor& operator=(FileDescriptor&& other) noexcept {
         if (this != &other) {
-            close(fd_);
+            if (fd_ != -1) {
+                close(fd_);
+            }
             fd_ = other.fd_;
             other.fd_ = -1;
         }
