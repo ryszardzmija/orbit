@@ -1,11 +1,11 @@
 #include <expected>
-#include <system_error>
 #include <iostream>
 #include <string>
+#include <system_error>
 
-#include <sys/socket.h>
-#include <netinet/in.h>
 #include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 std::expected<int, std::error_code> createTcpSocket() {
@@ -20,12 +20,12 @@ std::expected<int, std::error_code> createTcpSocket() {
 std::expected<void, std::error_code> bindAddress(int socket_fd, int port) {
     sockaddr_in addr = {
         .sin_family = AF_INET,
-        .sin_port   = htons(port),
-        .sin_addr   = { .s_addr = htonl(INADDR_ANY) },
-        .sin_zero   = {},
+        .sin_port = htons(port),
+        .sin_addr = {.s_addr = htonl(INADDR_ANY)},
+        .sin_zero = {},
     };
 
-    int result = bind(socket_fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
+    int result = bind(socket_fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr));
     if (result == -1) {
         return std::unexpected(std::error_code(errno, std::system_category()));
     }
@@ -35,7 +35,7 @@ std::expected<void, std::error_code> bindAddress(int socket_fd, int port) {
 
 std::expected<void, std::error_code> enterListenState(int socket_fd) {
     constexpr int backlog_size = 10;
-    
+
     int result = listen(socket_fd, backlog_size);
     if (result == -1) {
         return std::unexpected(std::error_code(errno, std::system_category()));
@@ -54,7 +54,8 @@ std::expected<Connection, std::error_code> acceptClientConnection(int listening_
     sockaddr_in client_addr = {};
     socklen_t client_addr_size = sizeof(client_addr);
 
-    int conn_fd = accept(listening_socket, reinterpret_cast<sockaddr*>(&client_addr), &client_addr_size);
+    int conn_fd =
+        accept(listening_socket, reinterpret_cast<sockaddr *>(&client_addr), &client_addr_size);
     if (conn_fd == -1) {
         return std::unexpected(std::error_code(errno, std::system_category()));
     }
@@ -99,7 +100,7 @@ std::expected<void, std::error_code> setReuseAddressFlag(int socket_fd) {
 
 std::string getIpAddressStr(in_addr_t address) {
     char addr_str[INET_ADDRSTRLEN];
-    in_addr addr_buf = { .s_addr = htonl(address) };
+    in_addr addr_buf = {.s_addr = htonl(address)};
     inet_ntop(AF_INET, &addr_buf, addr_str, sizeof(addr_str));
 
     return std::string(addr_str);
@@ -149,7 +150,8 @@ int main() {
     }
 
     auto [conn_fd, client_addr, client_port] = connection_result.value();
-    std::cout << "Client (" << getIpAddressStr(client_addr) << ", " << client_port << ") connected\n";
+    std::cout << "Client (" << getIpAddressStr(client_addr) << ", " << client_port
+              << ") connected\n";
 
     auto handling_result = handleClientConnection(conn_fd);
     if (!handling_result) {
