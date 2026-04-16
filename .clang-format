@@ -2,3 +2,11 @@ BasedOnStyle: LLVM
 IndentWidth: 4
 NamespaceIndentation: None
 ColumnLimit: 100
+
+BreakConstructorInitializers: BeforeColon
+PackConstructorInitializers: Never
+
+PointerAlignment: Left
+ReferenceAlignment: Left
+
+AccessModifierOffset: -4
