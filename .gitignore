@@ -1,0 +1,17 @@
+# Build
+build/
+
+# Symlinked from build directory
+compile_commands.json
+
+# VS Code
+.vscode/*
+!.vscode/settings.json
+
+# Clangd
+.cache/
+
+# Binaries and objects
+*.o
+*.a
+*.so
