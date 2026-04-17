@@ -11,6 +11,7 @@ add_executable(orbit
     src/main.cpp
     src/socket_utils.cpp
     src/address_utils.cpp
+    src/proxy.cpp
 )
 
 target_compile_options(orbit PRIVATE -Wall -Wextra -Wpedantic)

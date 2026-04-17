@@ -1,4 +1,3 @@
-#include <cerrno>
 #include <cstdlib>
 #include <iostream>
 #include <utility>
@@ -9,6 +8,7 @@
 #include "address_utils.h"
 #include "connection.h"
 #include "fd.h"
+#include "proxy.h"
 #include "socket_utils.h"
 
 int main() {
@@ -84,6 +84,16 @@ int main() {
     }
 
     std::cout << "Connected to backend (" << remote_ip_addr << ":" << remote_port << ")\n";
+
+    std::cout << "Starting proxying traffic...\n";
+
+    auto proxy_result = orbit::runProxy(connection.socketFd(), backend_socket.get());
+    if (!proxy_result) {
+        std::cerr << proxy_result.error().message() << '\n';
+        return EXIT_FAILURE;
+    }
+
+    std::cout << "Proxy shutting down...\n";
 
     return EXIT_SUCCESS;
 }
