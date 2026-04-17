@@ -11,32 +11,9 @@
 #include "fd.h"
 #include "socket_utils.h"
 
-namespace orbit {
-
-std::expected<void, std::error_code> handleClientConnection(int socket_fd) {
-    // Read bytes until the client closes their end of TCP connection.
-    constexpr size_t buf_size = 4096;
-    char buf[buf_size];
-
-    while (true) {
-        ssize_t bytes_read = recv(socket_fd, buf, buf_size, 0);
-
-        // Client closed their end of TCP connection.
-        if (bytes_read == 0) {
-            return {};
-        }
-
-        if (bytes_read == -1) {
-            return std::unexpected(std::error_code(errno, std::system_category()));
-        }
-
-        std::cout.write(buf, bytes_read);
-    }
-}
-
-} // namespace orbit
-
 int main() {
+    // Set up a socket in listening state and accept a client connection
+
     auto socket_result = orbit::createTcpSocket();
     if (!socket_result) {
         std::cerr << socket_result.error().message() << '\n';
@@ -78,14 +55,35 @@ int main() {
     }
 
     orbit::Connection connection = std::move(connection_result.value());
-    std::cout << "Client (" << orbit::getIpv4AddressStr(connection.address()) << ", "
+    std::cout << "Client (" << orbit::getIpv4AddressStr(connection.address()) << ":"
               << connection.port() << ") connected\n";
 
-    auto handling_result = orbit::handleClientConnection(connection.socketFd());
-    if (!handling_result) {
-        std::cerr << handling_result.error().message() << '\n';
+    // Create a TCP connection to a backend
+    auto backend_socket_result = orbit::createTcpSocket();
+    if (!backend_socket_result) {
+        std::cerr << backend_socket_result.error().message() << '\n';
         return EXIT_FAILURE;
     }
+
+    orbit::FileDescriptor backend_socket = std::move(backend_socket_result.value());
+
+    constexpr in_port_t remote_port = 9000;
+    const std::string remote_ip_addr("127.0.0.1");
+
+    auto addr_conv_result = orbit::getIpv4AddressBin(remote_ip_addr);
+    if (!addr_conv_result) {
+        std::cerr << addr_conv_result.error().message() << '\n';
+        return EXIT_FAILURE;
+    }
+
+    auto backend_connect_result =
+        orbit::connectToRemote(backend_socket.get(), addr_conv_result.value(), remote_port);
+    if (!backend_connect_result) {
+        std::cerr << backend_connect_result.error().message() << '\n';
+        return EXIT_FAILURE;
+    }
+
+    std::cout << "Connected to backend (" << remote_ip_addr << ":" << remote_port << ")\n";
 
     return EXIT_SUCCESS;
 }

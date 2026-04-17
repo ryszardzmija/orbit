@@ -69,4 +69,21 @@ std::expected<void, std::error_code> setReuseAddressFlag(int socket_fd) {
     return {};
 }
 
+std::expected<void, std::error_code> connectToRemote(int socket_fd, in_addr_t ipv4_address,
+                                                     in_port_t port) {
+    sockaddr_in remote_addr = {
+        .sin_family = AF_INET,
+        .sin_port = htons(port),
+        .sin_addr = {.s_addr = htonl(ipv4_address)},
+        .sin_zero = {},
+    };
+
+    int result = connect(socket_fd, reinterpret_cast<sockaddr*>(&remote_addr), sizeof(remote_addr));
+    if (result == -1) {
+        return std::unexpected(std::error_code(errno, std::system_category()));
+    }
+
+    return {};
+}
+
 } // namespace orbit

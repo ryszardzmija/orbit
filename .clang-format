@@ -10,3 +10,5 @@ PointerAlignment: Left
 ReferenceAlignment: Left
 
 AccessModifierOffset: -4
+
+InsertNewlineAtEOF: true

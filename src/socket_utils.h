@@ -18,4 +18,7 @@ std::expected<Connection, std::error_code> acceptClientConnection(int passive_so
 
 std::expected<void, std::error_code> setReuseAddressFlag(int socket_fd);
 
+std::expected<void, std::error_code> connectToRemote(int socket_fd, in_addr_t ipv4_address,
+                                                     in_port_t port);
+
 } // namespace orbit
