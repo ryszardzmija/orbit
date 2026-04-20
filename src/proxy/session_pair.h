@@ -14,6 +14,7 @@ struct SessionEndpoint {
     uint32_t current_events; // epoll registration state
     bool peer_half_closed;
     bool half_close_sent;
+    bool done_reading;
 };
 
 struct SessionPair {

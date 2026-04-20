@@ -83,8 +83,8 @@ std::expected<void, std::error_code> halfCloseConnection(int socket_fd) {
 }
 
 bool shouldHalfClose(const SessionEndpoint& endpoint) {
-    return endpoint.other->peer_half_closed && endpoint.send_buffer->empty() &&
-           !(endpoint.other->current_events & EPOLLIN);
+    return endpoint.other->peer_half_closed && endpoint.other->done_reading &&
+           endpoint.send_buffer->empty();
 }
 
 std::expected<void, std::error_code> halfCloseIfReady(SessionEndpoint& endpoint) {

@@ -23,10 +23,10 @@ std::expected<void, std::error_code> Forwarder::forward(SessionEndpoint& endpoin
     }
 
     if (recv_result.value().status == RecvStatus::Eof) {
+        endpoint.done_reading = true;
         if (auto result = unsetEpollin(endpoint); !result) {
             return result;
         }
-
         return {};
     }
 
