@@ -27,7 +27,7 @@ std::expected<void, std::error_code> PendingDataSender::sendPending(SessionEndpo
         return std::unexpected(send_result.error());
     }
 
-    size_t bytes_written = send_result.value();
+    size_t bytes_written = send_result.value().bytes_sent;
     endpoint.send_buffer->consume(bytes_written);
 
     if (endpoint.send_buffer->status() == SendBuffer::BufferStatus::Accepting) {

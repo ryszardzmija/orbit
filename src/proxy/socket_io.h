@@ -10,8 +10,13 @@ namespace orbit {
 
 enum class RecvStatus {
     Ok,
+    WouldBlock,
     Eof,
-    NoData,
+};
+
+enum class SendStatus {
+    Ok,
+    WouldBlock,
 };
 
 struct RecvResult {
@@ -19,8 +24,13 @@ struct RecvResult {
     RecvStatus status;
 };
 
+struct SendResult {
+    size_t bytes_sent;
+    SendStatus status;
+};
+
 std::expected<RecvResult, std::error_code> tryRecv(int fd, std::span<uint8_t> buf);
 
-std::expected<size_t, std::error_code> trySend(int fd, std::span<const uint8_t> buf);
+std::expected<SendResult, std::error_code> trySend(int fd, std::span<const uint8_t> buf);
 
 } // namespace orbit

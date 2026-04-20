@@ -4,19 +4,25 @@
 
 namespace orbit {
 
-std::expected<size_t, std::error_code> trySend(int fd, std::span<const uint8_t> buf) {
+std::expected<SendResult, std::error_code> trySend(int fd, std::span<const uint8_t> buf) {
     ssize_t bytes_sent = send(fd, buf.data(), buf.size(), MSG_NOSIGNAL);
 
     if (bytes_sent == -1) {
         // Kernel send buffer is full, so 0 bytes were written.
         if (errno == EAGAIN) {
-            return 0;
+            return SendResult{
+                .bytes_sent = 0,
+                .status = SendStatus::WouldBlock,
+            };
         }
 
         return std::unexpected(std::error_code(errno, std::system_category()));
     }
 
-    return bytes_sent;
+    return SendResult{
+        .bytes_sent = static_cast<size_t>(bytes_sent),
+        .status = SendStatus::Ok,
+    };
 }
 
 std::expected<RecvResult, std::error_code> tryRecv(int fd, std::span<uint8_t> buf) {
@@ -27,7 +33,7 @@ std::expected<RecvResult, std::error_code> tryRecv(int fd, std::span<uint8_t> bu
         if (errno == EAGAIN) {
             return RecvResult{
                 .bytes_received = 0,
-                .status = RecvStatus::NoData,
+                .status = RecvStatus::WouldBlock,
             };
         }
 

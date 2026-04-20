@@ -30,7 +30,7 @@ std::expected<void, std::error_code> Forwarder::forward(SessionEndpoint& endpoin
         return {};
     }
 
-    if (recv_result.value().status == RecvStatus::NoData) {
+    if (recv_result.value().status == RecvStatus::WouldBlock) {
         return {};
     }
 
@@ -43,7 +43,7 @@ std::expected<void, std::error_code> Forwarder::forward(SessionEndpoint& endpoin
         return std::unexpected(send_result.error());
     }
 
-    size_t bytes_written = send_result.value();
+    size_t bytes_written = send_result.value().bytes_sent;
 
     // All the data was successfully sent.
     if (bytes_written == bytes_read) {
