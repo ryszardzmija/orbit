@@ -2,6 +2,7 @@
 
 #include <cerrno>
 
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 
@@ -10,13 +11,39 @@
 
 namespace orbit {
 
-std::expected<FileDescriptor, std::error_code> createTcpSocket() {
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
+namespace {
+
+std::expected<FileDescriptor, std::error_code> createTcpSocketImpl(bool blocking) {
+    int type = blocking ? SOCK_STREAM : SOCK_STREAM | SOCK_NONBLOCK;
+
+    int fd = socket(AF_INET, type, 0);
     if (fd == -1) {
         return std::unexpected(std::error_code(errno, std::system_category()));
     }
 
     return FileDescriptor(fd);
+}
+
+} // namespace
+
+std::expected<FileDescriptor, std::error_code> createBlockingTcpSocket() {
+    return createTcpSocketImpl(true);
+}
+
+std::expected<FileDescriptor, std::error_code> createNonBlockingTcpSocket() {
+    return createTcpSocketImpl(false);
+}
+
+std::expected<void, std::error_code> makeSocketNonBlocking(int socket_fd) {
+    int flags = fcntl(socket_fd, F_GETFL, 0);
+    if (flags == -1) {
+        return std::unexpected(std::error_code(errno, std::system_category()));
+    }
+    if (int result = fcntl(socket_fd, F_SETFL, flags | O_NONBLOCK); result == -1) {
+        return std::unexpected(std::error_code(errno, std::system_category()));
+    }
+
+    return {};
 }
 
 std::expected<void, std::error_code> bindAddress(int socket_fd, int port) {
@@ -50,8 +77,8 @@ std::expected<Connection, std::error_code> acceptClientConnection(int listening_
     sockaddr_in client_addr = {};
     socklen_t client_addr_size = sizeof(client_addr);
 
-    int conn_fd =
-        accept(listening_socket, reinterpret_cast<sockaddr*>(&client_addr), &client_addr_size);
+    int conn_fd = accept4(listening_socket, reinterpret_cast<sockaddr*>(&client_addr),
+                          &client_addr_size, SOCK_NONBLOCK | SOCK_CLOEXEC);
     if (conn_fd == -1) {
         return std::unexpected(std::error_code(errno, std::system_category()));
     }

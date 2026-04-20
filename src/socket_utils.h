@@ -8,7 +8,10 @@
 
 namespace orbit {
 
-std::expected<FileDescriptor, std::error_code> createTcpSocket();
+std::expected<FileDescriptor, std::error_code> createBlockingTcpSocket();
+std::expected<FileDescriptor, std::error_code> createNonBlockingTcpSocket();
+
+std::expected<void, std::error_code> makeSocketNonBlocking(int socket_fd);
 
 std::expected<void, std::error_code> bindAddress(int socket_fd, int port);
 

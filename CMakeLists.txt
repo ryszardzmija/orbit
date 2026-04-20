@@ -7,11 +7,14 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+add_subdirectory(src/proxy)
+
 add_executable(orbit
     src/main.cpp
     src/socket_utils.cpp
     src/address_utils.cpp
-    src/proxy.cpp
 )
 
+target_include_directories(orbit PRIVATE src)
+target_link_libraries(orbit PRIVATE proxy)
 target_compile_options(orbit PRIVATE -Wall -Wextra -Wpedantic)

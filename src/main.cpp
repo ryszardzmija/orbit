@@ -8,21 +8,19 @@
 #include "address_utils.h"
 #include "connection.h"
 #include "fd.h"
-#include "proxy.h"
+#include "proxy/proxy.h"
 #include "socket_utils.h"
 
 int main() {
-    // Set up a socket in listening state and accept a client connection
+    std::cout << "Starting proxy...\n";
 
-    auto socket_result = orbit::createTcpSocket();
+    auto socket_result = orbit::createBlockingTcpSocket();
     if (!socket_result) {
         std::cerr << socket_result.error().message() << '\n';
         return EXIT_FAILURE;
     }
 
     orbit::FileDescriptor socket = std::move(socket_result.value());
-
-    std::cout << "Socket successfully created: " << socket.get() << '\n';
 
     auto reuse_flag_result = orbit::setReuseAddressFlag(socket.get());
     if (!reuse_flag_result) {
@@ -38,15 +36,13 @@ int main() {
         return EXIT_FAILURE;
     }
 
-    std::cout << "Socket successfully bound to port " << binding_port << '\n';
-
     auto listen_result = orbit::enterListenState(socket.get());
     if (!listen_result) {
         std::cerr << listen_result.error().message() << '\n';
         return EXIT_FAILURE;
     }
 
-    std::cout << "Socket successfully transitioned into listening state\n";
+    std::cout << "Listening for downstream connections...\n";
 
     auto connection_result = orbit::acceptClientConnection(socket.get());
     if (!connection_result) {
@@ -58,8 +54,7 @@ int main() {
     std::cout << "Client (" << orbit::getIpv4AddressStr(connection.address()) << ":"
               << connection.port() << ") connected\n";
 
-    // Create a TCP connection to a backend
-    auto backend_socket_result = orbit::createTcpSocket();
+    auto backend_socket_result = orbit::createBlockingTcpSocket();
     if (!backend_socket_result) {
         std::cerr << backend_socket_result.error().message() << '\n';
         return EXIT_FAILURE;
@@ -84,6 +79,11 @@ int main() {
     }
 
     std::cout << "Connected to backend (" << remote_ip_addr << ":" << remote_port << ")\n";
+
+    if (auto result = orbit::makeSocketNonBlocking(backend_socket.get()); !result) {
+        std::cerr << result.error().message() << '\n';
+        return EXIT_FAILURE;
+    }
 
     std::cout << "Starting proxying traffic...\n";
 
