@@ -140,12 +140,16 @@ std::expected<void, std::error_code> runEventLoop(int epfd) {
             debug_epoll_event(event_buf[i]);
 #endif
 
-            // Always try to read data first if available, even if other flags are set.
+            // There is at least one byte in the kernel receive buffer of the socket or EOF has been
+            // reached. Registered by default since data arrives unpredictably and we always want to
+            // try to forward it if possible.
             if (mask & EPOLLIN) {
                 if (auto result = forwarder.forward(*endpoint); !result) {
                     return result;
                 }
 
+                // After forwarding data from this endpoint if we have reached EOF then the other
+                // endpoint's outbound side may now be able to propagate a half-close.
                 if (auto result = halfCloseIfReady(*endpoint->other); !result) {
                     return result;
                 }
@@ -155,12 +159,16 @@ std::expected<void, std::error_code> runEventLoop(int epfd) {
                 }
             }
 
-            // Try to send data from the send buffer
+            // There is space in kernel send buffer, or at least send() syscall can accept some
+            // bytes. Registered only when there is pending data in the user space send buffer and
+            // unset otherwise.
             if (mask & EPOLLOUT) {
                 if (auto result = sender.sendPending(*endpoint); !result) {
                     return result;
                 }
 
+                // After consuming data from the user space send buffer if it is empty then one of
+                // the conditions for propagating a half-close through this endpoint was reached.
                 if (auto result = halfCloseIfReady(*endpoint); !result) {
                     return result;
                 }
@@ -170,6 +178,11 @@ std::expected<void, std::error_code> runEventLoop(int epfd) {
                 }
             }
 
+            // Peer has closed their end of the TCP connection. After send buffer and kernel receive
+            // buffer have been drained the half-close needs to propagate to the other peer in the
+            // session. Given the use of level-triggered event distribution for epoll, the event is
+            // unregistred after receiving it to prevent it from re-triggering on subsequent
+            // epoll_wait() calls.
             if (mask & EPOLLRDHUP) {
                 endpoint->peer_half_closed = true;
                 if (auto result = modifyEpollEvents(*endpoint, endpoint->socket_fd, epfd,
@@ -179,6 +192,9 @@ std::expected<void, std::error_code> runEventLoop(int epfd) {
                     return result;
                 }
 
+                // If it is already the case that the kernel receive buffer and user space send
+                // buffer are empty we are able to immediately propagate the half close through end
+                // other endpoint's outbound side.
                 if (auto result = halfCloseIfReady(*endpoint->other); !result) {
                     return result;
                 }
@@ -188,6 +204,11 @@ std::expected<void, std::error_code> runEventLoop(int epfd) {
                 }
             }
 
+            // EPOLLHUP in the context of TCP sockets means that both directions of the connection
+            // have been closed or the peer abruptly terminated the connection using RST segment.
+            // EPOLLERR signals a socket-level error.
+            // In both cases it's not possible to transmit any more data between the hosts in the
+            // session so the data sitting in the buffer of the proxy cannot be delivered.
             if (mask & (EPOLLHUP | EPOLLERR)) {
                 return getSocketErrorIfPresent(*endpoint);
             }
