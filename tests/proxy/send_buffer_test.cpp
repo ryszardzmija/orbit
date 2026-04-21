@@ -89,6 +89,55 @@ TEST_F(SendBufferTest, WriteCanExceedHighWatermarkInSingleCall) {
     EXPECT_EQ(data, result);
 }
 
+TEST_F(SendBufferTest, BufferPreservesInputDataOrdering) {
+    std::string data;
+    for (int i = 0; i < max_blocks / 2; i++) {
+        data += std::string(block_size, 'a' + i);
+    }
+
+    send_buffer.write(asBytes(data));
+    std::string result(data.size(), 0);
+    size_t bytes_copied = send_buffer.copy(asBytes(result));
+
+    EXPECT_EQ(data.size(), bytes_copied);
+    EXPECT_EQ(data, result);
+}
+
+TEST_F(SendBufferTest, BufferCorrectlyHandlesWriteConsumeCycles) {
+    std::string data1(block_size / 2, 'a');
+    std::string data2(block_size * 2, 'b');
+    std::string data3(block_size, 'c');
+
+    std::string result1(block_size / 4, 0);
+    std::string result2(block_size / 4, 0);
+    std::string result3(block_size, 0);
+    std::string result4(block_size, 0);
+    std::string result5(block_size / 2, 0);
+    std::string result6(block_size / 2, 0);
+    send_buffer.write(asBytes(data1));
+    send_buffer.write(asBytes(data2));
+    send_buffer.copy(asBytes(result1));
+    send_buffer.consume(result1.size());
+    send_buffer.copy(asBytes(result2));
+    send_buffer.consume(result2.size());
+    send_buffer.copy(asBytes(result3));
+    send_buffer.consume(result3.size());
+    send_buffer.write(asBytes(data3));
+    send_buffer.copy(asBytes(result4));
+    send_buffer.consume(result4.size());
+    send_buffer.copy(asBytes(result5));
+    send_buffer.consume(result5.size());
+    send_buffer.copy(asBytes(result6));
+    send_buffer.consume(result6.size());
+
+    EXPECT_EQ(std::string(block_size / 4, 'a'), result1);
+    EXPECT_EQ(std::string(block_size / 4, 'a'), result2);
+    EXPECT_EQ(std::string(block_size, 'b'), result3);
+    EXPECT_EQ(std::string(block_size, 'b'), result4);
+    EXPECT_EQ(std::string(block_size / 2, 'c'), result5);
+    EXPECT_EQ(std::string(block_size / 2, 'c'), result6);
+}
+
 TEST_F(SendBufferTest, CopyDoesNotReadBeyondAvailableData) {
     std::string data(block_size, 'a');
 
