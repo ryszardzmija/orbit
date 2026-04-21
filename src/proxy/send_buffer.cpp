@@ -32,6 +32,10 @@ SendBuffer::SendBuffer(size_t block_size, size_t high_watermark, size_t low_wate
         throw std::invalid_argument("block_size cannot be zero, got block_size=" +
                                     std::to_string(block_size));
     }
+    if (high_watermark == 0) {
+        throw std::invalid_argument("high_watermark cannot be zero, got high_watermark=" +
+                                    std::to_string(high_watermark));
+    }
     if (low_watermark >= high_watermark) {
         throw std::invalid_argument(
             "low_watermark must be less than high_watermark, got low_watermark=" +
