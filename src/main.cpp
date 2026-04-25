@@ -8,12 +8,19 @@
 #include <unistd.h>
 
 #include "address_utils.h"
+#include "config/config.h"
 #include "connection.h"
 #include "fd.h"
 #include "proxy/proxy.h"
 #include "socket_utils.h"
 
-int main() {
+int main(int argc, char** argv) {
+    auto config_result = orbit::parseConfig(argc, argv);
+    if (!config_result) {
+        return config_result.error().exit_code;
+    }
+    orbit::Config config = config_result.value();
+
     auto logger = spdlog::stdout_color_mt<spdlog::async_factory>("orbit");
     spdlog::set_default_logger(logger);
     spdlog::set_level(spdlog::level::info);

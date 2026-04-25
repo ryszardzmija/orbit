@@ -19,7 +19,18 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(spdlog)
 
+FetchContent_Declare(
+    cli11
+    GIT_REPOSITORY https://github.com/CLIUtils/CLI11.git
+    GIT_TAG v2.6.2
+    GIT_SHALLOW TRUE
+    SYSTEM
+    EXCLUDE_FROM_ALL
+)
+FetchContent_MakeAvailable(cli11)
+
 add_subdirectory(src/proxy)
+add_subdirectory(src/config)
 
 add_executable(orbit
     src/main.cpp
@@ -28,7 +39,7 @@ add_executable(orbit
 )
 
 target_include_directories(orbit PRIVATE src)
-target_link_libraries(orbit PRIVATE proxy spdlog::spdlog)
+target_link_libraries(orbit PRIVATE proxy config spdlog::spdlog CLI11::CLI11)
 target_compile_options(orbit PRIVATE -Wall -Wextra -Wpedantic)
 
 option(ORBIT_BUILD_TESTS "Build Unit Tests" OFF)
