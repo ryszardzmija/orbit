@@ -1,7 +1,9 @@
 #include <cstdlib>
-#include <iostream>
 #include <utility>
 
+#include <spdlog/async.h>
+#include <spdlog/sinks/stdout_color_sinks.h>
+#include <spdlog/spdlog.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -12,11 +14,17 @@
 #include "socket_utils.h"
 
 int main() {
-    std::cout << "Starting proxy...\n";
+    auto logger = spdlog::stdout_color_mt<spdlog::async_factory>("orbit");
+    spdlog::set_default_logger(logger);
+    spdlog::set_level(spdlog::level::info);
+    spdlog::set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%^%l%$] %v");
+    std::atexit([] { spdlog::shutdown(); });
+
+    spdlog::info("Starting proxy...");
 
     auto socket_result = orbit::createBlockingTcpSocket();
     if (!socket_result) {
-        std::cerr << socket_result.error().message() << '\n';
+        spdlog::error("socket() failed: {}", socket_result.error().message());
         return EXIT_FAILURE;
     }
 
@@ -24,7 +32,7 @@ int main() {
 
     auto reuse_flag_result = orbit::setReuseAddressFlag(socket.get());
     if (!reuse_flag_result) {
-        std::cerr << reuse_flag_result.error().message() << '\n';
+        spdlog::error("setsockopt() failed: {}", reuse_flag_result.error().message());
         return EXIT_FAILURE;
     }
 
@@ -32,31 +40,31 @@ int main() {
 
     auto bind_result = orbit::bindAddress(socket.get(), binding_port);
     if (!bind_result) {
-        std::cerr << bind_result.error().message() << '\n';
+        spdlog::error("bind() failed: {}", bind_result.error().message());
         return EXIT_FAILURE;
     }
 
     auto listen_result = orbit::enterListenState(socket.get());
     if (!listen_result) {
-        std::cerr << listen_result.error().message() << '\n';
+        spdlog::error("listen() failed: {}", listen_result.error().message());
         return EXIT_FAILURE;
     }
 
-    std::cout << "Listening for downstream connections...\n";
+    spdlog::info("Listening for downstream connections...");
 
     auto connection_result = orbit::acceptClientConnection(socket.get());
     if (!connection_result) {
-        std::cerr << connection_result.error().message() << '\n';
+        spdlog::error("accept() failed: {}", connection_result.error().message());
         return EXIT_FAILURE;
     }
 
     orbit::Connection connection = std::move(connection_result.value());
-    std::cout << "Client (" << orbit::getIpv4AddressStr(connection.address()) << ":"
-              << connection.port() << ") connected\n";
+    spdlog::info("Client ({}:{}) connected", orbit::getIpv4AddressStr(connection.address()),
+                 connection.port());
 
     auto backend_socket_result = orbit::createBlockingTcpSocket();
     if (!backend_socket_result) {
-        std::cerr << backend_socket_result.error().message() << '\n';
+        spdlog::error("socket() failed: {}", backend_socket_result.error().message());
         return EXIT_FAILURE;
     }
 
@@ -67,33 +75,33 @@ int main() {
 
     auto addr_conv_result = orbit::getIpv4AddressBin(remote_ip_addr);
     if (!addr_conv_result) {
-        std::cerr << addr_conv_result.error().message() << '\n';
+        spdlog::error("inet_pton() failed: {}", addr_conv_result.error().message());
         return EXIT_FAILURE;
     }
 
     auto backend_connect_result =
         orbit::connectToRemote(backend_socket.get(), addr_conv_result.value(), remote_port);
     if (!backend_connect_result) {
-        std::cerr << backend_connect_result.error().message() << '\n';
+        spdlog::error("connect() failed: {}", backend_connect_result.error().message());
         return EXIT_FAILURE;
     }
 
-    std::cout << "Connected to backend (" << remote_ip_addr << ":" << remote_port << ")\n";
+    spdlog::info("Connected to backend ({}:{})", remote_ip_addr, remote_port);
 
     if (auto result = orbit::makeSocketNonBlocking(backend_socket.get()); !result) {
-        std::cerr << result.error().message() << '\n';
+        spdlog::error("fcntl() failed: {}", result.error().message());
         return EXIT_FAILURE;
     }
 
-    std::cout << "Starting proxying traffic...\n";
+    spdlog::info("Starting proxying traffic...");
 
     auto proxy_result = orbit::runProxy(connection.socketFd(), backend_socket.get());
     if (!proxy_result) {
-        std::cerr << proxy_result.error().message() << '\n';
+        spdlog::error("Forwarding failed: {}", proxy_result.error().message());
         return EXIT_FAILURE;
     }
 
-    std::cout << "Proxy shutting down...\n";
+    spdlog::info("Proxy shutting down...");
 
     return EXIT_SUCCESS;
 }

@@ -10,3 +10,4 @@ add_library(proxy
 )
 
 target_include_directories(proxy PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(proxy PRIVATE spdlog::spdlog)
