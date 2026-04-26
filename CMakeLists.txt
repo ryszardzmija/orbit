@@ -32,6 +32,7 @@ FetchContent_MakeAvailable(cli11)
 add_subdirectory(src/proxy)
 add_subdirectory(src/config)
 add_subdirectory(src/logging)
+add_subdirectory(src/net)
 
 add_executable(orbit
     src/main.cpp
@@ -40,7 +41,7 @@ add_executable(orbit
 )
 
 target_include_directories(orbit PRIVATE src)
-target_link_libraries(orbit PRIVATE proxy config logging spdlog::spdlog CLI11::CLI11)
+target_link_libraries(orbit PRIVATE proxy config logging net spdlog::spdlog CLI11::CLI11)
 target_compile_options(orbit PRIVATE -Wall -Wextra -Wpedantic)
 
 option(ORBIT_BUILD_TESTS "Build Unit Tests" OFF)
