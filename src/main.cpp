@@ -1,8 +1,6 @@
 #include <cstdlib>
 #include <utility>
 
-#include <spdlog/async.h>
-#include <spdlog/sinks/stdout_color_sinks.h>
 #include <spdlog/spdlog.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -11,6 +9,7 @@
 #include "config/config.h"
 #include "connection.h"
 #include "fd.h"
+#include "logging/logger.h"
 #include "proxy/proxy.h"
 #include "socket_utils.h"
 
@@ -21,11 +20,7 @@ int main(int argc, char** argv) {
     }
     orbit::Config config = config_result.value();
 
-    auto logger = spdlog::stdout_color_mt<spdlog::async_factory>("orbit");
-    spdlog::set_default_logger(logger);
-    spdlog::set_level(spdlog::level::info);
-    spdlog::set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%^%l%$] %v");
-    std::atexit([] { spdlog::shutdown(); });
+    auto logger_guard = orbit::setUpLogger(config.log_level);
 
     spdlog::info("Starting proxy...");
 
