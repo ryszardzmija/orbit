@@ -10,9 +10,8 @@
 namespace orbit::net {
 
 struct ResolvedAddress {
-    int family;            // AF_INET or AF_INET6
     socklen_t addrlen;     // length to pass to bind()/connect()
-    sockaddr_storage addr; // the address itself
+    sockaddr_storage addr; // address family, IP address, port number
 };
 
 struct ResolveError {

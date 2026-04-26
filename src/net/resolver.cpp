@@ -13,7 +13,7 @@ namespace orbit::net {
 namespace {
 
 int getAiFlags(bool passive) {
-    int flags = AI_ADDRCONFIG;
+    int flags = AI_ADDRCONFIG | AI_NUMERICSERV;
 
     if (passive) {
         flags |= AI_PASSIVE;
@@ -36,7 +36,6 @@ std::vector<ResolvedAddress> getAddressVector(addrinfo* resolve_result) {
 
     for (addrinfo* p = resolve_result; p != nullptr; p = p->ai_next) {
         ResolvedAddress entry = {};
-        entry.family = p->ai_family;
         entry.addrlen = p->ai_addrlen;
         std::memcpy(&entry.addr, p->ai_addr, p->ai_addrlen);
         result.push_back(entry);
