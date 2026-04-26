@@ -10,6 +10,9 @@
 #include "config/config.h"
 #include "connection.h"
 #include "logging/logger.h"
+#include "net/address_format.h"
+#include "net/dialer.h"
+#include "net/socket_options.h"
 #include "proxy/proxy.h"
 #include "socket_utils.h"
 
@@ -64,40 +67,24 @@ int main(int argc, char** argv) {
     spdlog::info("Client ({}:{}) connected", orbit::getIpv4AddressStr(connection.address()),
                  connection.port());
 
-    auto backend_socket_result = orbit::createBlockingTcpSocket();
-    if (!backend_socket_result) {
-        spdlog::error("socket() failed: {}", backend_socket_result.error().message());
+    auto upstream_dial_result = orbit::net::dial(config.upstream_host, config.upstream_port);
+    if (!upstream_dial_result) {
+        spdlog::error("Upstream connect error: {}", upstream_dial_result.error().message);
         return EXIT_FAILURE;
     }
+    auto [upstream_socket_fd, remote] = std::move(upstream_dial_result.value());
 
-    orbit::FileDescriptor backend_socket = std::move(backend_socket_result.value());
+    spdlog::info("Connected to upstream {}:{} ({})", config.upstream_host, config.upstream_port,
+                 orbit::net::formatAddress(remote));
 
-    constexpr in_port_t remote_port = 9000;
-    const std::string remote_ip_addr("127.0.0.1");
-
-    auto addr_conv_result = orbit::getIpv4AddressBin(remote_ip_addr);
-    if (!addr_conv_result) {
-        spdlog::error("inet_pton() failed: {}", addr_conv_result.error().message());
-        return EXIT_FAILURE;
-    }
-
-    auto backend_connect_result =
-        orbit::connectToRemote(backend_socket.get(), addr_conv_result.value(), remote_port);
-    if (!backend_connect_result) {
-        spdlog::error("connect() failed: {}", backend_connect_result.error().message());
-        return EXIT_FAILURE;
-    }
-
-    spdlog::info("Connected to backend ({}:{})", remote_ip_addr, remote_port);
-
-    if (auto result = orbit::makeSocketNonBlocking(backend_socket.get()); !result) {
+    if (auto result = orbit::net::setNonBlocking(upstream_socket_fd.get()); !result) {
         spdlog::error("fcntl() failed: {}", result.error().message());
         return EXIT_FAILURE;
     }
 
     spdlog::info("Starting proxying traffic...");
 
-    auto proxy_result = orbit::runProxy(connection.socketFd(), backend_socket.get());
+    auto proxy_result = orbit::runProxy(connection.socketFd(), upstream_socket_fd.get());
     if (!proxy_result) {
         spdlog::error("Forwarding failed: {}", proxy_result.error().message());
         return EXIT_FAILURE;
