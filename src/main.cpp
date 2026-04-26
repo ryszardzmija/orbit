@@ -6,9 +6,9 @@
 #include <unistd.h>
 
 #include "address_utils.h"
+#include "common/fd.h"
 #include "config/config.h"
 #include "connection.h"
-#include "fd.h"
 #include "logging/logger.h"
 #include "proxy/proxy.h"
 #include "socket_utils.h"
