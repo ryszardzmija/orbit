@@ -7,18 +7,15 @@
 
 #include <sys/socket.h>
 
-namespace orbit::net {
+#include "net/socket_address.h"
 
-struct ResolvedAddress {
-    socklen_t addrlen;     // length to pass to bind()/connect()
-    sockaddr_storage addr; // address family, IP address, port number
-};
+namespace orbit::net {
 
 struct ResolveError {
     std::string message;
 };
 
-std::expected<std::vector<ResolvedAddress>, ResolveError> resolve(const std::string& hostname,
-                                                                  uint16_t port, bool passive);
+std::expected<std::vector<SocketAddress>, ResolveError> resolve(const std::string& hostname,
+                                                                uint16_t port, bool passive);
 
 } // namespace orbit::net

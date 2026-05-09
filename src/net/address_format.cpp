@@ -5,23 +5,23 @@
 
 #include <netdb.h>
 
-#include "resolver.h"
+#include "net/socket_address.h"
 
 namespace orbit::net {
 
-std::string formatAddress(const ResolvedAddress& resolved_address) {
+std::string formatAddress(const SocketAddress& socket_address) {
     char host[NI_MAXHOST];
     char port[NI_MAXSERV];
 
-    int res = getnameinfo(reinterpret_cast<const sockaddr*>(&resolved_address.addr),
-                          resolved_address.addrlen, host, sizeof(host), port, sizeof(port),
-                          NI_NUMERICHOST | NI_NUMERICSERV);
+    int res =
+        getnameinfo(reinterpret_cast<const sockaddr*>(&socket_address.addr), socket_address.addrlen,
+                    host, sizeof(host), port, sizeof(port), NI_NUMERICHOST | NI_NUMERICSERV);
 
     if (res != 0) {
         return "<unknown address>";
     }
 
-    if (resolved_address.addr.ss_family == AF_INET6) {
+    if (socket_address.addr.ss_family == AF_INET6) {
         return std::format("[{}]:{}", host, port);
     }
 
