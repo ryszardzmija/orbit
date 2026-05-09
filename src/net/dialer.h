@@ -5,7 +5,7 @@
 #include <string>
 
 #include "common/fd.h"
-#include "resolver.h"
+#include "net/socket_address.h"
 
 namespace orbit::net {
 
@@ -15,7 +15,7 @@ struct DialError {
 
 struct DialSuccess {
     FileDescriptor fd;
-    ResolvedAddress remote;
+    SocketAddress remote;
 };
 
 std::expected<DialSuccess, DialError> dial(const std::string& hostname, uint16_t port);

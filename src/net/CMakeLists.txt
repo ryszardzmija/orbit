@@ -3,6 +3,7 @@ add_library(net
     dialer.cpp
     address_format.cpp
     socket_options.cpp
+    listener.cpp
 )
 
-target_link_libraries(net PRIVATE common)
+target_link_libraries(net PUBLIC common)

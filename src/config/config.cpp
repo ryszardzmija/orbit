@@ -31,8 +31,9 @@ std::expected<Config, ConfigError> parseConfig(int argc, char** argv) {
     CLI::App app("orbit - a TCP reverse proxy");
     app.set_version_flag("--version", "orbit 0.1.0");
 
-    app.add_option("--listen-host", config.listen_host,
-                   "Local IPv4 address to listen on (use 0.0.0.0 to listen on all interfaces)")
+    app.add_option(
+           "--listen-host", config.listen_host,
+           "Local IPv4/IPv6 address to listen on (use 0.0.0.0/:: to listen on all interfaces)")
         ->envname("ORBIT_LISTEN_HOST")
         ->capture_default_str();
 

@@ -8,6 +8,8 @@
 
 #include <netdb.h>
 
+#include "net/socket_address.h"
+
 namespace orbit::net {
 
 namespace {
@@ -31,11 +33,11 @@ addrinfo getHints(bool passive) {
     return hints;
 }
 
-std::vector<ResolvedAddress> getAddressVector(addrinfo* resolve_result) {
-    std::vector<ResolvedAddress> result;
+std::vector<SocketAddress> getAddressVector(addrinfo* resolve_result) {
+    std::vector<SocketAddress> result;
 
     for (addrinfo* p = resolve_result; p != nullptr; p = p->ai_next) {
-        ResolvedAddress entry = {};
+        SocketAddress entry = {};
         entry.addrlen = p->ai_addrlen;
         std::memcpy(&entry.addr, p->ai_addr, p->ai_addrlen);
         result.push_back(entry);
@@ -46,8 +48,8 @@ std::vector<ResolvedAddress> getAddressVector(addrinfo* resolve_result) {
 
 } // namespace
 
-std::expected<std::vector<ResolvedAddress>, ResolveError> resolve(const std::string& hostname,
-                                                                  uint16_t port, bool passive) {
+std::expected<std::vector<SocketAddress>, ResolveError> resolve(const std::string& hostname,
+                                                                uint16_t port, bool passive) {
     addrinfo* resolve_result = nullptr;
     addrinfo hints = getHints(passive);
 

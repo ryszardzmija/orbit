@@ -2,10 +2,10 @@
 
 #include <string>
 
-#include "resolver.h"
+#include "net/socket_address.h"
 
 namespace orbit::net {
 
-std::string formatAddress(const ResolvedAddress& addr);
+std::string formatAddress(const SocketAddress& addr);
 
 }

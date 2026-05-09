@@ -37,8 +37,6 @@ add_subdirectory(src/common)
 
 add_executable(orbit
     src/main.cpp
-    src/socket_utils.cpp
-    src/address_utils.cpp
 )
 
 target_include_directories(orbit PRIVATE src)
