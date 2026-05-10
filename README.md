@@ -2,6 +2,11 @@
 
 <div align="center">
   <img src="assets/logo.png" alt="Orbit Logo" width="300"/>
+  <p>
+    <a href="https://github.com/ryszardzmija/orbit/actions/workflows/ci.yaml">
+      <img src="https://github.com/ryszardzmija/orbit/actions/workflows/ci.yaml/badge.svg" alt="CI"/>
+    </a>
+  </p>
 </div>
 
 ## Overview
