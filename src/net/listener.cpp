@@ -1,4 +1,4 @@
-#include "listener.h"
+#include "net/listener.h"
 
 #include <cerrno>
 #include <expected>
@@ -11,8 +11,8 @@
 #include "common/fd.h"
 #include "net/address_format.h"
 #include "net/resolver.h"
+#include "net/socket_address.h"
 #include "net/socket_options.h"
-#include "socket_address.h"
 
 namespace orbit::net {
 

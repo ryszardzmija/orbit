@@ -1,4 +1,4 @@
-#include "dialer.h"
+#include "net/dialer.h"
 
 #include <cerrno>
 #include <expected>
@@ -7,9 +7,9 @@
 
 #include <sys/socket.h>
 
-#include "address_format.h"
 #include "common/fd.h"
-#include "resolver.h"
+#include "net/address_format.h"
+#include "net/resolver.h"
 
 namespace orbit::net {
 

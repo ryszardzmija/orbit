@@ -5,6 +5,6 @@
 
 namespace orbit {
 
-std::expected<void, std::error_code> runProxy(int downstream_fd, int upstream_fd);
+[[nodiscard]] std::expected<void, std::error_code> runProxy(int downstream_fd, int upstream_fd);
 
 } // namespace orbit

@@ -6,8 +6,9 @@
 #include <string>
 
 #include <arpa/inet.h>
-#include <gtest/gtest.h>
 #include <netinet/in.h>
+
+#include <gtest/gtest.h>
 
 using orbit::net::formatAddress;
 using orbit::net::SocketAddress;

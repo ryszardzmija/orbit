@@ -3,8 +3,8 @@
 #include <cstdlib>
 #include <memory>
 
-#include "config.h"
-#include "send_buffer.h"
+#include "proxy/config.h"
+#include "proxy/send_buffer.h"
 
 namespace orbit {
 

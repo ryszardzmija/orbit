@@ -1,13 +1,13 @@
-#include "forwarding.h"
+#include "proxy/forwarding.h"
 
 #include <memory>
 
 #include <sys/epoll.h>
 #include <sys/socket.h>
 
-#include "epoll_utils.h"
-#include "send_buffer.h"
-#include "socket_io.h"
+#include "proxy/epoll_utils.h"
+#include "proxy/send_buffer.h"
+#include "proxy/socket_io.h"
 
 namespace orbit {
 

@@ -1,11 +1,11 @@
-#include "pending_data_sender.h"
+#include "proxy/pending_data_sender.h"
 
 #include <memory>
 
 #include <sys/epoll.h>
 
-#include "epoll_utils.h"
-#include "socket_io.h"
+#include "proxy/epoll_utils.h"
+#include "proxy/socket_io.h"
 
 namespace orbit {
 
