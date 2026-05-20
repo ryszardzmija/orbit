@@ -1,5 +1,6 @@
-#include "socket_options.h"
+#include "net/socket_options.h"
 
+#include <cerrno>
 #include <expected>
 #include <system_error>
 

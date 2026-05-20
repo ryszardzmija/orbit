@@ -1,10 +1,11 @@
+#include "proxy/send_buffer.h"
+
 #include <cstddef>
-#include <gtest/gtest.h>
 #include <span>
 #include <stdexcept>
 #include <string>
 
-#include "send_buffer.h"
+#include <gtest/gtest.h>
 
 class SendBufferTest : public testing::Test {
 protected:

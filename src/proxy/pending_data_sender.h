@@ -4,7 +4,7 @@
 #include <memory>
 #include <system_error>
 
-#include "session_pair.h"
+#include "proxy/session_pair.h"
 
 namespace orbit {
 
@@ -22,4 +22,5 @@ private:
     size_t capacity_;
     int epfd_;
 };
+
 } // namespace orbit

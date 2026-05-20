@@ -9,5 +9,6 @@ add_library(proxy
     socket_io.cpp
 )
 
-target_include_directories(proxy PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_include_directories(proxy PUBLIC ${CMAKE_SOURCE_DIR}/src)
+
 target_link_libraries(proxy PRIVATE common spdlog::spdlog)

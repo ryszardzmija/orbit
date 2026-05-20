@@ -2,8 +2,8 @@
 
 #include <memory>
 
-#include "send_buffer.h"
-#include "send_buffer_factory.h"
+#include "proxy/send_buffer.h"
+#include "proxy/send_buffer_factory.h"
 
 namespace orbit {
 

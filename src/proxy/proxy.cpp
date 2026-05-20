@@ -1,44 +1,24 @@
-// Known limitations of this implementation. These will be addressed gradually during development:
-//
-// 1. Single connection pair: This implementation handles exactly one downstream-upstream session.
-// multi-connection support with per-pair state tracking must be added.
-//
-// 2. No idle timeout: If one peer half-closes and the other never responds with a FIN segment or
-// sends any data to trigger socket error, the proxy sits idle forever. Idle-timeout teardown must
-// be added to deal with this.
-//
-// 3. Error propagation is corase and one error stops the entire proxy. We need to add retries and
-// some kind of graceful degradation, especially when multi-session support is added.
-
-#include "proxy.h"
+#include "proxy/proxy.h"
 
 #include <cstdint>
 #include <expected>
-#include <iostream>
+#include <memory>
 #include <system_error>
 
+#include <spdlog/spdlog.h>
 #include <sys/epoll.h>
 #include <sys/socket.h>
 
 #include "common/fd.h"
-#include "epoll_utils.h"
-#include "forwarding.h"
-#include "pending_data_sender.h"
-#include "send_buffer_factory.h"
-#include "session_pair.h"
+#include "proxy/epoll_utils.h"
+#include "proxy/forwarding.h"
+#include "proxy/pending_data_sender.h"
+#include "proxy/send_buffer_factory.h"
+#include "proxy/session_pair.h"
 
 namespace orbit {
 
 namespace {
-
-#ifndef NDEBUG
-inline void debug_epoll_event(const epoll_event& event) {
-    uint32_t mask = event.events;
-    SessionEndpoint* endpoint = reinterpret_cast<SessionEndpoint*>(event.data.ptr);
-    std::cerr << "event fd=" << endpoint->socket_fd << " mask=0x" << std::hex << mask << std::dec
-              << '\n';
-}
-#endif
 
 std::expected<FileDescriptor, std::error_code> createEpollInstance() {
     int epfd = epoll_create1(EPOLL_CLOEXEC);
@@ -136,9 +116,7 @@ std::expected<void, std::error_code> runEventLoop(int epfd) {
             uint32_t mask = event_buf[i].events;
             SessionEndpoint* endpoint = reinterpret_cast<SessionEndpoint*>(event_buf[i].data.ptr);
 
-#ifndef NDEBUG
-            debug_epoll_event(event_buf[i]);
-#endif
+            spdlog::debug("epoll event fd={} mask={:#x}", endpoint->socket_fd, mask);
 
             // There is at least one byte in the kernel receive buffer of the socket or EOF has been
             // reached. Registered by default since data arrives unpredictably and we always want to
@@ -181,7 +159,7 @@ std::expected<void, std::error_code> runEventLoop(int epfd) {
             // Peer has closed their end of the TCP connection. After send buffer and kernel receive
             // buffer have been drained the half-close needs to propagate to the other peer in the
             // session. Given the use of level-triggered event distribution for epoll, the event is
-            // unregistred after receiving it to prevent it from re-triggering on subsequent
+            // unregistered after receiving it to prevent it from re-triggering on subsequent
             // epoll_wait() calls.
             if (mask & EPOLLRDHUP) {
                 endpoint->peer_half_closed = true;
@@ -193,7 +171,7 @@ std::expected<void, std::error_code> runEventLoop(int epfd) {
                 }
 
                 // If it is already the case that the kernel receive buffer and user space send
-                // buffer are empty we are able to immediately propagate the half close through end
+                // buffer are empty we are able to immediately propagate the half close through the
                 // other endpoint's outbound side.
                 if (auto result = halfCloseIfReady(*endpoint->other); !result) {
                     return result;

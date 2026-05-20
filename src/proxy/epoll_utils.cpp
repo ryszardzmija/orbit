@@ -1,4 +1,4 @@
-#include "epoll_utils.h"
+#include "proxy/epoll_utils.h"
 
 #include <cerrno>
 #include <cstdint>
@@ -7,7 +7,7 @@
 
 #include <sys/epoll.h>
 
-#include "session_pair.h"
+#include "proxy/session_pair.h"
 
 namespace orbit {
 
