@@ -298,6 +298,11 @@ std::expected<void, std::error_code> ProxyReactor::start() {
                 continue;
             }
         }
+
+        // NOTE: This should be removed once event loop can accept new client connections.
+        if (!hasActiveSessions()) {
+            return {};
+        }
     }
 }
 
@@ -357,5 +362,7 @@ void ProxyReactor::closeSessionAndLog(SessionId session_id) {
         spdlog::error("Error closing session with ID {}: {}", session_id, result.error().message());
     }
 }
+
+bool ProxyReactor::hasActiveSessions() const { return !sessions_.empty(); }
 
 } // namespace orbit
