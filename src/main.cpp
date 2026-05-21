@@ -65,7 +65,7 @@ int main(int argc, char** argv) {
     spdlog::info("Starting proxying traffic...");
 
     auto reactor_create_result =
-        orbit::ProxyReactor::create(downstream_socket_fd.get(), upstream_socket_fd.get());
+        orbit::ProxyReactor::create(std::move(downstream_socket_fd), std::move(upstream_socket_fd));
     if (!reactor_create_result) {
         spdlog::error("Failed to initialize event loop: {}",
                       reactor_create_result.error().message());

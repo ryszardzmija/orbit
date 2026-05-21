@@ -98,12 +98,12 @@ std::expected<void, std::error_code> getSocketErrorIfPresent(const SessionEndpoi
 
 } // namespace
 
-ProxyReactor::ProxyReactor(FileDescriptor epfd, std::unique_ptr<SessionPair> session)
+ProxyReactor::ProxyReactor(FileDescriptor epfd, ProxySession session)
     : epfd_(std::move(epfd)),
       session_(std::move(session)) {}
 
-std::expected<ProxyReactor, std::error_code> ProxyReactor::create(int downstream_fd,
-                                                                  int upstream_fd) {
+std::expected<ProxyReactor, std::error_code> ProxyReactor::create(FileDescriptor downstream_fd,
+                                                                  FileDescriptor upstream_fd) {
     auto epoll_create_result = createEpollInstance();
     if (!epoll_create_result) {
         return std::unexpected(epoll_create_result.error());
@@ -114,18 +114,24 @@ std::expected<ProxyReactor, std::error_code> ProxyReactor::create(int downstream
                                                             .high_watermark = high_watermark,
                                                             .low_watermark = low_watermark});
 
-    std::unique_ptr<SessionPair> session =
-        makeSessionPair(downstream_fd, upstream_fd, send_buffer_factory);
+    std::unique_ptr<SessionPair> session_pair =
+        makeSessionPair(downstream_fd.get(), upstream_fd.get(), send_buffer_factory);
 
     uint32_t initial_events = EPOLLIN | EPOLLRDHUP;
-    session->downstream.current_events = initial_events;
-    session->upstream.current_events = initial_events;
+    session_pair->downstream.current_events = initial_events;
+    session_pair->upstream.current_events = initial_events;
 
     if (auto register_result =
-            registerFileDescriptors(epfd.get(), session->downstream, session->upstream);
+            registerFileDescriptors(epfd.get(), session_pair->downstream, session_pair->upstream);
         !register_result) {
         return std::unexpected(register_result.error());
     }
+
+    ProxySession session = {
+        .downstream_fd = std::move(downstream_fd),
+        .upstream_fd = std::move(upstream_fd),
+        .endpoints = std::move(session_pair),
+    };
 
     return ProxyReactor(std::move(epfd), std::move(session));
 }
