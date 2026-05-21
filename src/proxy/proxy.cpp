@@ -98,8 +98,8 @@ std::expected<void, std::error_code> getSocketErrorIfPresent(const SessionEndpoi
 } // namespace
 
 ProxyReactor::ProxyReactor(
-    FileDescriptor epfd, std::unordered_map<SessionId, ManagedSession> sessions,
-    std::unordered_map<EndpointId, EndpointRegistration> endpoint_registrations,
+    FileDescriptor epfd, absl::flat_hash_map<SessionId, ManagedSession> sessions,
+    absl::flat_hash_map<EndpointId, EndpointRegistration> endpoint_registrations,
     SessionIdGenerator session_id_generator, EndpointIdGenerator endpoint_id_generator)
     : epfd_(std::move(epfd)),
       sessions_(std::move(sessions)),
@@ -122,8 +122,8 @@ std::expected<ProxyReactor, std::error_code> ProxyReactor::create(FileDescriptor
     std::unique_ptr<SessionPair> session_pair =
         makeSessionPair(downstream_fd.get(), upstream_fd.get(), send_buffer_factory);
 
-    std::unordered_map<SessionId, ManagedSession> sessions;
-    std::unordered_map<EndpointId, EndpointRegistration> endpoint_registrations;
+    absl::flat_hash_map<SessionId, ManagedSession> sessions;
+    absl::flat_hash_map<EndpointId, EndpointRegistration> endpoint_registrations;
 
     SessionIdGenerator session_id_generator;
     EndpointIdGenerator endpoint_id_generator;

@@ -11,4 +11,10 @@ add_library(proxy
 
 target_include_directories(proxy PUBLIC ${CMAKE_SOURCE_DIR}/src)
 
-target_link_libraries(proxy PRIVATE common spdlog::spdlog)
+target_link_libraries(proxy
+    PUBLIC
+        absl::flat_hash_map
+    PRIVATE
+        common
+        spdlog::spdlog
+)
