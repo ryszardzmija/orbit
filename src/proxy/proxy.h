@@ -82,6 +82,7 @@ private:
     void closeSessionAndLog(SessionId session_id);
     SessionEndpoint& getEndpoint(ManagedSession& managed_session, EndpointRole role);
     EndpointId getOtherEndpointId(ManagedSession& managed_session, EndpointRole role);
+    bool hasActiveSessions() const;
 
     FileDescriptor epfd_;
     std::unordered_map<SessionId, ManagedSession> sessions_;
