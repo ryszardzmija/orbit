@@ -2,7 +2,8 @@
 
 #include <expected>
 #include <system_error>
-#include <unordered_map>
+
+#include <absl/container/flat_hash_map.h>
 
 #include "common/fd.h"
 #include "proxy/endpoint_context.h"
@@ -73,8 +74,8 @@ private:
         EndpointRole role;
     };
 
-    ProxyReactor(FileDescriptor epfd, std::unordered_map<SessionId, ManagedSession> sessions,
-                 std::unordered_map<EndpointId, EndpointRegistration> endpoint_registrations,
+    ProxyReactor(FileDescriptor epfd, absl::flat_hash_map<SessionId, ManagedSession> sessions,
+                 absl::flat_hash_map<EndpointId, EndpointRegistration> endpoint_registrations,
                  SessionIdGenerator session_id_generator,
                  EndpointIdGenerator endpoint_id_generator);
 
@@ -85,8 +86,8 @@ private:
     bool hasActiveSessions() const;
 
     FileDescriptor epfd_;
-    std::unordered_map<SessionId, ManagedSession> sessions_;
-    std::unordered_map<EndpointId, EndpointRegistration> endpoint_registrations_;
+    absl::flat_hash_map<SessionId, ManagedSession> sessions_;
+    absl::flat_hash_map<EndpointId, EndpointRegistration> endpoint_registrations_;
     SessionIdGenerator session_id_generator_;
     EndpointIdGenerator endpoint_id_generator_;
 };

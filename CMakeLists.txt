@@ -29,6 +29,18 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(cli11)
 
+set(ABSL_PROPAGATE_CXX_STD ON)
+
+FetchContent_Declare(
+    abseil
+    GIT_REPOSITORY https://github.com/abseil/abseil-cpp.git
+    GIT_TAG 20260107.1
+    GIT_SHALLOW TRUE
+    SYSTEM
+    EXCLUDE_FROM_ALL
+)
+FetchContent_MakeAvailable(abseil)
+
 add_subdirectory(src/proxy)
 add_subdirectory(src/config)
 add_subdirectory(src/logging)
