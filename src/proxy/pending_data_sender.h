@@ -4,7 +4,7 @@
 #include <memory>
 #include <system_error>
 
-#include "proxy/session_pair.h"
+#include "proxy/endpoint_context.h"
 
 namespace orbit {
 
@@ -12,11 +12,11 @@ class PendingDataSender {
 public:
     PendingDataSender(size_t capacity, int epfd);
 
-    std::expected<void, std::error_code> sendPending(SessionEndpoint& endpoint);
+    std::expected<void, std::error_code> sendPending(const EndpointContext& context);
 
 private:
-    std::expected<void, std::error_code> setEpollin(SessionEndpoint& endpoint);
-    std::expected<void, std::error_code> unsetEpollout(SessionEndpoint& endpoint);
+    std::expected<void, std::error_code> setEpollin(const EndpointContext& context);
+    std::expected<void, std::error_code> unsetEpollout(const EndpointContext& context);
 
     std::unique_ptr<uint8_t[]> buf_;
     size_t capacity_;
