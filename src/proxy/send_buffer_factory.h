@@ -3,14 +3,14 @@
 #include <cstdlib>
 #include <memory>
 
-#include "proxy/config.h"
 #include "proxy/send_buffer.h"
+#include "proxy/send_buffer_options.h"
 
 namespace orbit {
 
 class SendBufferFactory {
 public:
-    explicit SendBufferFactory(const Config& config);
+    explicit SendBufferFactory(const SendBufferOptions& config);
 
     std::unique_ptr<SendBuffer> make() const;
 

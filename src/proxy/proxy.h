@@ -3,8 +3,29 @@
 #include <expected>
 #include <system_error>
 
+#include "common/fd.h"
+#include "proxy/session_pair.h"
+
 namespace orbit {
 
-[[nodiscard]] std::expected<void, std::error_code> runProxy(int downstream_fd, int upstream_fd);
+class ProxyReactor {
+public:
+    static std::expected<ProxyReactor, std::error_code> create(int downstream_fd, int upstream_fd);
+
+    [[nodiscard]] std::expected<void, std::error_code> start();
+
+private:
+    constexpr static size_t block_size = 4096;
+    constexpr static size_t high_watermark = block_size * 64;
+    constexpr static size_t low_watermark = block_size * 48;
+
+    constexpr static size_t event_buf_cap = 64;
+    constexpr static size_t forwarder_buf_cap = 4096;
+
+    ProxyReactor(FileDescriptor epfd, std::unique_ptr<SessionPair> session);
+
+    FileDescriptor epfd_;
+    std::unique_ptr<SessionPair> session_;
+};
 
 } // namespace orbit
