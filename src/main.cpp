@@ -64,9 +64,17 @@ int main(int argc, char** argv) {
 
     spdlog::info("Starting proxying traffic...");
 
-    auto proxy_result = orbit::runProxy(downstream_socket_fd.get(), upstream_socket_fd.get());
-    if (!proxy_result) {
-        spdlog::error("Forwarding failed: {}", proxy_result.error().message());
+    auto reactor_create_result =
+        orbit::ProxyReactor::create(downstream_socket_fd.get(), upstream_socket_fd.get());
+    if (!reactor_create_result) {
+        spdlog::error("Failed to initialize event loop: {}",
+                      reactor_create_result.error().message());
+        return EXIT_FAILURE;
+    }
+    orbit::ProxyReactor reactor = std::move(reactor_create_result.value());
+
+    if (auto event_loop_result = reactor.start(); !event_loop_result) {
+        spdlog::error("Forwarding failed: {}", event_loop_result.error().message());
         return EXIT_FAILURE;
     }
 

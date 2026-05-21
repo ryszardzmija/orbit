@@ -6,7 +6,7 @@
 
 namespace orbit {
 
-SendBufferFactory::SendBufferFactory(const Config& config)
+SendBufferFactory::SendBufferFactory(const SendBufferOptions& config)
     : block_size_(config.block_size),
       high_watermark_(config.high_watermark),
       low_watermark_(config.low_watermark) {}

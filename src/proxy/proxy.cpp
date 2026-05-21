@@ -14,6 +14,7 @@
 #include "proxy/forwarding.h"
 #include "proxy/pending_data_sender.h"
 #include "proxy/send_buffer_factory.h"
+#include "proxy/send_buffer_options.h"
 #include "proxy/session_pair.h"
 
 namespace orbit {
@@ -95,16 +96,48 @@ std::expected<void, std::error_code> getSocketErrorIfPresent(const SessionEndpoi
     return {};
 }
 
-std::expected<void, std::error_code> runEventLoop(int epfd) {
-    constexpr size_t buf_cap = 4096;
-    Forwarder forwarder(buf_cap, epfd);
-    PendingDataSender sender(buf_cap, epfd);
+} // namespace
 
-    constexpr size_t event_buf_size = 64;
-    epoll_event event_buf[event_buf_size];
+ProxyReactor::ProxyReactor(FileDescriptor epfd, std::unique_ptr<SessionPair> session)
+    : epfd_(std::move(epfd)),
+      session_(std::move(session)) {}
+
+std::expected<ProxyReactor, std::error_code> ProxyReactor::create(int downstream_fd,
+                                                                  int upstream_fd) {
+    auto epoll_create_result = createEpollInstance();
+    if (!epoll_create_result) {
+        return std::unexpected(epoll_create_result.error());
+    }
+    FileDescriptor epfd = std::move(epoll_create_result.value());
+
+    SendBufferFactory send_buffer_factory(SendBufferOptions{.block_size = block_size,
+                                                            .high_watermark = high_watermark,
+                                                            .low_watermark = low_watermark});
+
+    std::unique_ptr<SessionPair> session =
+        makeSessionPair(downstream_fd, upstream_fd, send_buffer_factory);
+
+    uint32_t initial_events = EPOLLIN | EPOLLRDHUP;
+    session->downstream.current_events = initial_events;
+    session->upstream.current_events = initial_events;
+
+    if (auto register_result =
+            registerFileDescriptors(epfd.get(), session->downstream, session->upstream);
+        !register_result) {
+        return std::unexpected(register_result.error());
+    }
+
+    return ProxyReactor(std::move(epfd), std::move(session));
+}
+
+std::expected<void, std::error_code> ProxyReactor::start() {
+    Forwarder forwarder(forwarder_buf_cap, epfd_.get());
+    PendingDataSender sender(forwarder_buf_cap, epfd_.get());
+
+    epoll_event event_buf[event_buf_cap];
 
     while (true) {
-        int n = epoll_wait(epfd, event_buf, event_buf_size, -1);
+        int n = epoll_wait(epfd_.get(), event_buf, event_buf_cap, -1);
         if (n == -1) {
             if (errno == EINTR) {
                 continue;
@@ -163,7 +196,7 @@ std::expected<void, std::error_code> runEventLoop(int epfd) {
             // epoll_wait() calls.
             if (mask & EPOLLRDHUP) {
                 endpoint->peer_half_closed = true;
-                if (auto result = modifyEpollEvents(*endpoint, endpoint->socket_fd, epfd,
+                if (auto result = modifyEpollEvents(*endpoint, endpoint->socket_fd, epfd_.get(),
                                                     endpoint->current_events & ~EPOLLRDHUP,
                                                     endpoint->current_events);
                     !result) {
@@ -192,42 +225,6 @@ std::expected<void, std::error_code> runEventLoop(int epfd) {
             }
         }
     }
-}
-
-} // namespace
-
-std::expected<void, std::error_code> runProxy(int downstream_fd, int upstream_fd) {
-    auto epoll_create_result = createEpollInstance();
-    if (!epoll_create_result) {
-        return std::unexpected(epoll_create_result.error());
-    }
-    FileDescriptor epfd = std::move(epoll_create_result.value());
-
-    constexpr size_t block_size = 4096;
-    constexpr size_t high_watermark = block_size * 64;
-    constexpr size_t low_watermark = block_size * 48;
-    SendBufferFactory send_buffer_factory(Config{.block_size = block_size,
-                                                 .high_watermark = high_watermark,
-                                                 .low_watermark = low_watermark});
-    std::unique_ptr<SessionPair> session =
-        makeSessionPair(downstream_fd, upstream_fd, send_buffer_factory);
-
-    uint32_t initial_events = EPOLLIN |   // fd has data to read or is at EOF
-                              EPOLLRDHUP; // TCP FIN segment received
-    session->downstream.current_events = initial_events;
-    session->upstream.current_events = initial_events;
-
-    if (auto register_result =
-            registerFileDescriptors(epfd.get(), session->downstream, session->upstream);
-        !register_result) {
-        return register_result;
-    }
-
-    if (auto result = runEventLoop(epfd.get()); !result) {
-        return result;
-    }
-
-    return {};
 }
 
 } // namespace orbit

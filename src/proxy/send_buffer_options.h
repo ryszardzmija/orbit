@@ -4,7 +4,7 @@
 
 namespace orbit {
 
-struct Config {
+struct SendBufferOptions {
     size_t block_size;
     size_t high_watermark;
     size_t low_watermark;
