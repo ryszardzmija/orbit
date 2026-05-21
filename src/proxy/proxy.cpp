@@ -4,6 +4,7 @@
 #include <expected>
 #include <memory>
 #include <system_error>
+#include <utility>
 
 #include <spdlog/spdlog.h>
 #include <sys/epoll.h>
@@ -29,25 +30,22 @@ std::expected<FileDescriptor, std::error_code> createEpollInstance() {
     return FileDescriptor(epfd);
 }
 
-std::expected<void, std::error_code> registerFileDescriptors(int epfd, SessionEndpoint& downstream,
-                                                             SessionEndpoint& upstream) {
-    epoll_event downstream_event = {
-        .events = downstream.current_events,
-        .data = {.ptr = &downstream},
+std::expected<void, std::error_code>
+registerFileDescriptor(int epfd, int fd, uint32_t initial_events, EndpointId endpoint_id) {
+    epoll_event events = {
+        .events = initial_events,
+        .data = {.u64 = endpoint_id},
     };
 
-    if (int result = epoll_ctl(epfd, EPOLL_CTL_ADD, downstream.socket_fd, &downstream_event);
-        result == -1) {
+    if (int result = epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &events); result == -1) {
         return std::unexpected(std::error_code(errno, std::system_category()));
     }
 
-    epoll_event upstream_event = {
-        .events = upstream.current_events,
-        .data = {.ptr = &upstream},
-    };
+    return {};
+}
 
-    if (int result = epoll_ctl(epfd, EPOLL_CTL_ADD, upstream.socket_fd, &upstream_event);
-        result == -1) {
+std::expected<void, std::error_code> deregisterFileDescriptor(int epfd, int fd) {
+    if (int result = epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr); result == -1) {
         return std::unexpected(std::error_code(errno, std::system_category()));
     }
 
@@ -79,6 +77,7 @@ std::expected<void, std::error_code> halfCloseIfReady(SessionEndpoint& endpoint)
     return {};
 }
 
+// Whether the session associated with this endpoint should be torn down.
 bool shouldTearDown(const SessionEndpoint& endpoint) {
     return endpoint.half_close_sent && endpoint.other->half_close_sent;
 }
@@ -98,9 +97,15 @@ std::expected<void, std::error_code> getSocketErrorIfPresent(const SessionEndpoi
 
 } // namespace
 
-ProxyReactor::ProxyReactor(FileDescriptor epfd, ProxySession session)
+ProxyReactor::ProxyReactor(
+    FileDescriptor epfd, std::unordered_map<SessionId, ManagedSession> sessions,
+    std::unordered_map<EndpointId, EndpointRegistration> endpoint_registrations,
+    SessionIdGenerator session_id_generator, EndpointIdGenerator endpoint_id_generator)
     : epfd_(std::move(epfd)),
-      session_(std::move(session)) {}
+      sessions_(std::move(sessions)),
+      endpoint_registrations_(std::move(endpoint_registrations)),
+      session_id_generator_(session_id_generator),
+      endpoint_id_generator_(endpoint_id_generator) {}
 
 std::expected<ProxyReactor, std::error_code> ProxyReactor::create(FileDescriptor downstream_fd,
                                                                   FileDescriptor upstream_fd) {
@@ -117,23 +122,62 @@ std::expected<ProxyReactor, std::error_code> ProxyReactor::create(FileDescriptor
     std::unique_ptr<SessionPair> session_pair =
         makeSessionPair(downstream_fd.get(), upstream_fd.get(), send_buffer_factory);
 
+    std::unordered_map<SessionId, ManagedSession> sessions;
+    std::unordered_map<EndpointId, EndpointRegistration> endpoint_registrations;
+
+    SessionIdGenerator session_id_generator;
+    EndpointIdGenerator endpoint_id_generator;
+
+    SessionId session_id = session_id_generator.getNextId();
+    EndpointId downstream_id = endpoint_id_generator.getNextId();
+    EndpointId upstream_id = endpoint_id_generator.getNextId();
+
     uint32_t initial_events = EPOLLIN | EPOLLRDHUP;
     session_pair->downstream.current_events = initial_events;
     session_pair->upstream.current_events = initial_events;
 
     if (auto register_result =
-            registerFileDescriptors(epfd.get(), session_pair->downstream, session_pair->upstream);
+            registerFileDescriptor(epfd.get(), downstream_fd.get(), initial_events, downstream_id);
+        !register_result) {
+        return std::unexpected(register_result.error());
+    }
+    if (auto register_result =
+            registerFileDescriptor(epfd.get(), upstream_fd.get(), initial_events, upstream_id);
         !register_result) {
         return std::unexpected(register_result.error());
     }
 
-    ProxySession session = {
-        .downstream_fd = std::move(downstream_fd),
-        .upstream_fd = std::move(upstream_fd),
-        .endpoints = std::move(session_pair),
+    ManagedSession managed_session{
+        .session =
+            {
+                .downstream_fd = std::move(downstream_fd),
+                .upstream_fd = std::move(upstream_fd),
+                .endpoints = std::move(session_pair),
+            },
+        .downstream_endpoint_id = downstream_id,
+        .upstream_endpoint_id = upstream_id,
     };
+    auto [it, inserted] = sessions.emplace(session_id, std::move(managed_session));
+    assert(inserted);
 
-    return ProxyReactor(std::move(epfd), std::move(session));
+    EndpointRegistration downstream_registration{
+        .session_id = session_id,
+        .role = EndpointRole::Downstream,
+    };
+    auto [downstream_it, downstream_inserted] =
+        endpoint_registrations.emplace(downstream_id, downstream_registration);
+    assert(downstream_inserted);
+
+    EndpointRegistration upstream_registration{
+        .session_id = session_id,
+        .role = EndpointRole::Upstream,
+    };
+    auto [upstream_it, upstream_inserted] =
+        endpoint_registrations.emplace(upstream_id, upstream_registration);
+    assert(upstream_inserted);
+
+    return ProxyReactor(std::move(epfd), std::move(sessions), std::move(endpoint_registrations),
+                        session_id_generator, endpoint_id_generator);
 }
 
 std::expected<void, std::error_code> ProxyReactor::start() {
@@ -153,26 +197,47 @@ std::expected<void, std::error_code> ProxyReactor::start() {
 
         for (int i = 0; i < n; i++) {
             uint32_t mask = event_buf[i].events;
-            SessionEndpoint* endpoint = reinterpret_cast<SessionEndpoint*>(event_buf[i].data.ptr);
+            EndpointId endpoint_id = static_cast<EndpointId>(event_buf[i].data.u64);
 
-            spdlog::debug("epoll event fd={} mask={:#x}", endpoint->socket_fd, mask);
+            auto it = endpoint_registrations_.find(endpoint_id);
+            if (it == endpoint_registrations_.end()) {
+                continue;
+            }
+            EndpointRegistration& registration = it->second;
+            SessionId session_id = registration.session_id;
+
+            auto session_it = sessions_.find(session_id);
+            if (session_it == sessions_.end()) {
+                continue;
+            }
+            ManagedSession& managed_session = session_it->second;
+
+            SessionEndpoint& endpoint = getEndpoint(managed_session, registration.role);
+
+            EndpointContext context = {.endpoint = endpoint,
+                                       .endpoint_id = endpoint_id,
+                                       .other_endpoint_id =
+                                           getOtherEndpointId(managed_session, registration.role)};
+
+            spdlog::debug("epoll event fd={} mask={:#x}", endpoint.socket_fd, mask);
 
             // There is at least one byte in the kernel receive buffer of the socket or EOF has been
             // reached. Registered by default since data arrives unpredictably and we always want to
             // try to forward it if possible.
             if (mask & EPOLLIN) {
-                if (auto result = forwarder.forward(*endpoint); !result) {
+                if (auto result = forwarder.forward(context); !result) {
                     return result;
                 }
 
                 // After forwarding data from this endpoint if we have reached EOF then the other
                 // endpoint's outbound side may now be able to propagate a half-close.
-                if (auto result = halfCloseIfReady(*endpoint->other); !result) {
+                if (auto result = halfCloseIfReady(*(endpoint.other)); !result) {
                     return result;
                 }
 
-                if (shouldTearDown(*endpoint)) {
-                    return {};
+                if (shouldTearDown(endpoint)) {
+                    closeSessionAndLog(session_id);
+                    continue;
                 }
             }
 
@@ -180,18 +245,19 @@ std::expected<void, std::error_code> ProxyReactor::start() {
             // bytes. Registered only when there is pending data in the user space send buffer and
             // unset otherwise.
             if (mask & EPOLLOUT) {
-                if (auto result = sender.sendPending(*endpoint); !result) {
+                if (auto result = sender.sendPending(context); !result) {
                     return result;
                 }
 
                 // After consuming data from the user space send buffer if it is empty then one of
                 // the conditions for propagating a half-close through this endpoint was reached.
-                if (auto result = halfCloseIfReady(*endpoint); !result) {
+                if (auto result = halfCloseIfReady(endpoint); !result) {
                     return result;
                 }
 
-                if (shouldTearDown(*endpoint)) {
-                    return {};
+                if (shouldTearDown(endpoint)) {
+                    closeSessionAndLog(session_id);
+                    continue;
                 }
             }
 
@@ -201,10 +267,10 @@ std::expected<void, std::error_code> ProxyReactor::start() {
             // unregistered after receiving it to prevent it from re-triggering on subsequent
             // epoll_wait() calls.
             if (mask & EPOLLRDHUP) {
-                endpoint->peer_half_closed = true;
-                if (auto result = modifyEpollEvents(*endpoint, endpoint->socket_fd, epfd_.get(),
-                                                    endpoint->current_events & ~EPOLLRDHUP,
-                                                    endpoint->current_events);
+                endpoint.peer_half_closed = true;
+                if (auto result = modifyEpollEvents(context, endpoint.socket_fd, epfd_.get(),
+                                                    endpoint.current_events & ~EPOLLRDHUP,
+                                                    endpoint.current_events);
                     !result) {
                     return result;
                 }
@@ -212,12 +278,13 @@ std::expected<void, std::error_code> ProxyReactor::start() {
                 // If it is already the case that the kernel receive buffer and user space send
                 // buffer are empty we are able to immediately propagate the half close through the
                 // other endpoint's outbound side.
-                if (auto result = halfCloseIfReady(*endpoint->other); !result) {
+                if (auto result = halfCloseIfReady(*(endpoint.other)); !result) {
                     return result;
                 }
 
-                if (shouldTearDown(*endpoint)) {
-                    return {};
+                if (shouldTearDown(endpoint)) {
+                    closeSessionAndLog(session_id);
+                    continue;
                 }
             }
 
@@ -227,9 +294,67 @@ std::expected<void, std::error_code> ProxyReactor::start() {
             // In both cases it's not possible to transmit any more data between the hosts in the
             // session so the data sitting in the buffer of the proxy cannot be delivered.
             if (mask & (EPOLLHUP | EPOLLERR)) {
-                return getSocketErrorIfPresent(*endpoint);
+                closeSessionAndLog(session_id);
+                continue;
             }
         }
+    }
+}
+
+SessionEndpoint& ProxyReactor::getEndpoint(ManagedSession& managed_session, EndpointRole role) {
+    switch (role) {
+    case EndpointRole::Upstream:
+        return managed_session.session.endpoints->upstream;
+    case EndpointRole::Downstream:
+        return managed_session.session.endpoints->downstream;
+    }
+
+    assert(false && "Invalid EndpointRole value");
+    std::unreachable();
+}
+
+EndpointId ProxyReactor::getOtherEndpointId(ManagedSession& managed_session, EndpointRole role) {
+    switch (role) {
+    case EndpointRole::Upstream:
+        return managed_session.downstream_endpoint_id;
+    case EndpointRole::Downstream:
+        return managed_session.upstream_endpoint_id;
+    }
+
+    assert(false && "Invalid EndpointRole value");
+    std::unreachable();
+}
+
+std::expected<void, std::error_code> ProxyReactor::closeSession(SessionId session_id) {
+    auto it = sessions_.find(session_id);
+    if (it == sessions_.end()) {
+        return {};
+    }
+
+    ManagedSession& managed_session = it->second;
+
+    if (auto result =
+            deregisterFileDescriptor(epfd_.get(), managed_session.session.downstream_fd.get());
+        !result) {
+        return result;
+    }
+    if (auto result =
+            deregisterFileDescriptor(epfd_.get(), managed_session.session.upstream_fd.get());
+        !result) {
+        return result;
+    }
+
+    endpoint_registrations_.erase(managed_session.downstream_endpoint_id);
+    endpoint_registrations_.erase(managed_session.upstream_endpoint_id);
+
+    sessions_.erase(it);
+
+    return {};
+}
+
+void ProxyReactor::closeSessionAndLog(SessionId session_id) {
+    if (auto result = closeSession(session_id); !result) {
+        spdlog::error("Error closing session with ID {}: {}", session_id, result.error().message());
     }
 }
 
