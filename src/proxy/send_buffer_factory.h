@@ -6,7 +6,7 @@
 #include "proxy/send_buffer.h"
 #include "proxy/send_buffer_options.h"
 
-namespace orbit {
+namespace orbit::proxy {
 
 class SendBufferFactory {
 public:
@@ -20,4 +20,4 @@ private:
     size_t low_watermark_;
 };
 
-} // namespace orbit
+} // namespace orbit::proxy

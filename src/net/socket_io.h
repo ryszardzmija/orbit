@@ -6,7 +6,7 @@
 #include <span>
 #include <system_error>
 
-namespace orbit {
+namespace orbit::net {
 
 enum class RecvStatus {
     Ok,
@@ -33,4 +33,4 @@ std::expected<RecvResult, std::error_code> tryRecv(int fd, std::span<uint8_t> bu
 
 std::expected<SendResult, std::error_code> trySend(int fd, std::span<const uint8_t> buf);
 
-} // namespace orbit
+} // namespace orbit::net

@@ -7,6 +7,8 @@
 
 #include <gtest/gtest.h>
 
+using orbit::proxy::SendBuffer;
+
 class SendBufferTest : public testing::Test {
 protected:
     static constexpr size_t block_size = 64;
@@ -17,7 +19,7 @@ protected:
     SendBufferTest()
         : send_buffer(block_size, high_watermark, low_watermark) {}
 
-    orbit::SendBuffer send_buffer;
+    SendBuffer send_buffer;
 };
 
 namespace {
@@ -153,7 +155,7 @@ TEST_F(SendBufferTest, CopyDoesNotReadBeyondAvailableData) {
 TEST_F(SendBufferTest, InitialBufferIsEmpty) { EXPECT_TRUE(send_buffer.empty()); }
 
 TEST_F(SendBufferTest, InitialBufferIsAccepting) {
-    EXPECT_EQ(orbit::SendBuffer::BufferStatus::Accepting, send_buffer.status());
+    EXPECT_EQ(SendBuffer::BufferStatus::Accepting, send_buffer.status());
 }
 
 TEST_F(SendBufferTest, BufferIsPausedAfterHittingHighWatermark) {
@@ -161,7 +163,7 @@ TEST_F(SendBufferTest, BufferIsPausedAfterHittingHighWatermark) {
 
     send_buffer.write(asBytes(data));
 
-    EXPECT_EQ(orbit::SendBuffer::BufferStatus::Paused, send_buffer.status());
+    EXPECT_EQ(SendBuffer::BufferStatus::Paused, send_buffer.status());
 }
 
 TEST_F(SendBufferTest, BufferResumesAfterComingBackToLowWatermark) {
@@ -170,7 +172,7 @@ TEST_F(SendBufferTest, BufferResumesAfterComingBackToLowWatermark) {
     send_buffer.write(asBytes(data));
     send_buffer.consume(max_blocks * block_size - low_watermark);
 
-    EXPECT_EQ(orbit::SendBuffer::BufferStatus::Accepting, send_buffer.status());
+    EXPECT_EQ(SendBuffer::BufferStatus::Accepting, send_buffer.status());
 }
 
 TEST_F(SendBufferTest, BufferResumesAfterGoingBelowLowWatermark) {
@@ -179,32 +181,30 @@ TEST_F(SendBufferTest, BufferResumesAfterGoingBelowLowWatermark) {
     send_buffer.write(asBytes(data));
     send_buffer.consume(max_blocks * block_size - low_watermark + 1);
 
-    EXPECT_EQ(orbit::SendBuffer::BufferStatus::Accepting, send_buffer.status());
+    EXPECT_EQ(SendBuffer::BufferStatus::Accepting, send_buffer.status());
 }
 
 TEST_F(SendBufferTest, BufferConstructionFailsForBlockSizeOfZero) {
-    EXPECT_THROW(orbit::SendBuffer(0, high_watermark, low_watermark), std::invalid_argument);
+    EXPECT_THROW(SendBuffer(0, high_watermark, low_watermark), std::invalid_argument);
 }
 
 TEST_F(SendBufferTest, BufferConstructionFailsForZeroHighWatermark) {
-    EXPECT_THROW(orbit::SendBuffer(block_size, 0, 0), std::invalid_argument);
+    EXPECT_THROW(SendBuffer(block_size, 0, 0), std::invalid_argument);
 }
 
 TEST_F(SendBufferTest, BufferConstructionSucceedsForZeroLowWatermark) {
-    EXPECT_NO_THROW(orbit::SendBuffer(block_size, high_watermark, 0));
+    EXPECT_NO_THROW(SendBuffer(block_size, high_watermark, 0));
 }
 
 TEST_F(SendBufferTest, BufferConstructionFailsForBlockSizeGreaterThanHighWatermark) {
-    EXPECT_THROW(orbit::SendBuffer(high_watermark + 1, high_watermark, low_watermark),
+    EXPECT_THROW(SendBuffer(high_watermark + 1, high_watermark, low_watermark),
                  std::invalid_argument);
 }
 
 TEST_F(SendBufferTest, BufferConstructionFailsForLowWatermarkEqualToHighWatermark) {
-    EXPECT_THROW(orbit::SendBuffer(block_size, high_watermark, high_watermark),
-                 std::invalid_argument);
+    EXPECT_THROW(SendBuffer(block_size, high_watermark, high_watermark), std::invalid_argument);
 }
 
 TEST_F(SendBufferTest, BufferConstructionFailsForLowWatermarkGreaterThanHighWatermark) {
-    EXPECT_THROW(orbit::SendBuffer(block_size, high_watermark, high_watermark + 1),
-                 std::invalid_argument);
+    EXPECT_THROW(SendBuffer(block_size, high_watermark, high_watermark + 1), std::invalid_argument);
 }

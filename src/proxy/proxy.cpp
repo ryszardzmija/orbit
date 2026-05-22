@@ -18,7 +18,7 @@
 #include "proxy/send_buffer_options.h"
 #include "proxy/session_pair.h"
 
-namespace orbit {
+namespace orbit::proxy {
 
 namespace {
 
@@ -365,4 +365,4 @@ void ProxyReactor::closeSessionAndLog(SessionId session_id) {
 
 bool ProxyReactor::hasActiveSessions() const { return !sessions_.empty(); }
 
-} // namespace orbit
+} // namespace orbit::proxy

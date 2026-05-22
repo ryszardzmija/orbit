@@ -5,11 +5,11 @@
 #include <sys/epoll.h>
 #include <sys/socket.h>
 
+#include "net/socket_io.h"
 #include "proxy/epoll_utils.h"
 #include "proxy/send_buffer.h"
-#include "proxy/socket_io.h"
 
-namespace orbit {
+namespace orbit::proxy {
 
 Forwarder::Forwarder(size_t capacity, int epfd)
     : buf_(std::make_unique<uint8_t[]>(capacity)),
@@ -18,12 +18,12 @@ Forwarder::Forwarder(size_t capacity, int epfd)
 
 std::expected<void, std::error_code> Forwarder::forward(const EndpointContext& context) {
     auto recv_result =
-        tryRecv(context.endpoint.socket_fd, std::span<uint8_t>(buf_.get(), capacity_));
+        net::tryRecv(context.endpoint.socket_fd, std::span<uint8_t>(buf_.get(), capacity_));
     if (!recv_result) {
         return std::unexpected(recv_result.error());
     }
 
-    if (recv_result.value().status == RecvStatus::Eof) {
+    if (recv_result.value().status == net::RecvStatus::Eof) {
         context.endpoint.done_reading = true;
         if (auto result = unsetEpollin(context); !result) {
             return result;
@@ -31,14 +31,14 @@ std::expected<void, std::error_code> Forwarder::forward(const EndpointContext& c
         return {};
     }
 
-    if (recv_result.value().status == RecvStatus::WouldBlock) {
+    if (recv_result.value().status == net::RecvStatus::WouldBlock) {
         return {};
     }
 
     size_t bytes_read = recv_result.value().bytes_received;
 
-    auto send_result = trySend(context.endpoint.other->socket_fd,
-                               std::span<const uint8_t>(buf_.get(), bytes_read));
+    auto send_result = net::trySend(context.endpoint.other->socket_fd,
+                                    std::span<const uint8_t>(buf_.get(), bytes_read));
 
     if (!send_result) {
         return std::unexpected(send_result.error());
@@ -90,4 +90,4 @@ std::expected<void, std::error_code> Forwarder::setEpollout(const EndpointContex
                              context.endpoint.other->current_events);
 }
 
-} // namespace orbit
+} // namespace orbit::proxy

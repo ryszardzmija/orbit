@@ -6,7 +6,7 @@
 
 #include "proxy/endpoint_context.h"
 
-namespace orbit {
+namespace orbit::proxy {
 
 std::expected<void, std::error_code> modifyEpollEvents(const EndpointContext& context, int fd,
                                                        int epfd, uint32_t new_events,

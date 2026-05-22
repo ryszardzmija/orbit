@@ -2,7 +2,7 @@
 
 #include <memory>
 
-namespace orbit {
+namespace orbit::proxy {
 
 std::unique_ptr<SessionPair> makeSessionPair(int downstream_fd, int upstream_fd,
                                              const SendBufferFactory& factory) {
@@ -31,4 +31,4 @@ std::unique_ptr<SessionPair> makeSessionPair(int downstream_fd, int upstream_fd,
     return pair;
 }
 
-} // namespace orbit
+} // namespace orbit::proxy

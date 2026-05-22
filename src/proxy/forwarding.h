@@ -7,7 +7,7 @@
 #include "proxy/endpoint_context.h"
 #include "proxy/session_pair.h"
 
-namespace orbit {
+namespace orbit::proxy {
 
 class Forwarder {
 public:
@@ -25,4 +25,4 @@ private:
     int epfd_;
 };
 
-} // namespace orbit
+} // namespace orbit::proxy
