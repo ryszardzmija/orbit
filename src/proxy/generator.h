@@ -2,7 +2,7 @@
 
 #include <cstdint>
 
-namespace orbit {
+namespace orbit::proxy {
 
 class MonotonicIdGenerator {
 public:
@@ -16,4 +16,4 @@ private:
     Id next_id_ = 1;
 };
 
-} // namespace orbit
+} // namespace orbit::proxy

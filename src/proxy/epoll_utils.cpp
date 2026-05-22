@@ -9,7 +9,7 @@
 
 #include "proxy/session_pair.h"
 
-namespace orbit {
+namespace orbit::proxy {
 
 std::expected<void, std::error_code> modifyEpollEvents(const EndpointContext& context, int fd,
                                                        int epfd, uint32_t new_events,
@@ -28,4 +28,4 @@ std::expected<void, std::error_code> modifyEpollEvents(const EndpointContext& co
     return {};
 }
 
-} // namespace orbit
+} // namespace orbit::proxy

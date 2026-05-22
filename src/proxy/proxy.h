@@ -10,7 +10,7 @@
 #include "proxy/generator.h"
 #include "proxy/session_pair.h"
 
-namespace orbit {
+namespace orbit::proxy {
 
 class ProxyReactor {
 public:
@@ -92,4 +92,4 @@ private:
     EndpointIdGenerator endpoint_id_generator_;
 };
 
-} // namespace orbit
+} // namespace orbit::proxy

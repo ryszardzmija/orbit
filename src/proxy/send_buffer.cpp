@@ -8,7 +8,7 @@
 #include <span>
 #include <stdexcept>
 
-namespace orbit {
+namespace orbit::proxy {
 
 // ListNode
 SendBuffer::ListNode::ListNode(size_t capacity)
@@ -156,4 +156,4 @@ void SendBuffer::updateStatus() {
     }
 }
 
-} // namespace orbit
+} // namespace orbit::proxy

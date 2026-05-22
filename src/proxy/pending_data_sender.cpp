@@ -4,10 +4,10 @@
 
 #include <sys/epoll.h>
 
+#include "net/socket_io.h"
 #include "proxy/epoll_utils.h"
-#include "proxy/socket_io.h"
 
-namespace orbit {
+namespace orbit::proxy {
 
 PendingDataSender::PendingDataSender(size_t capacity, int epfd)
     : buf_(std::make_unique<uint8_t[]>(capacity)),
@@ -23,8 +23,8 @@ PendingDataSender::sendPending(const EndpointContext& context) {
         return {};
     }
 
-    auto send_result =
-        trySend(context.endpoint.socket_fd, std::span<const uint8_t>(buf_.get(), bytes_buffered));
+    auto send_result = net::trySend(context.endpoint.socket_fd,
+                                    std::span<const uint8_t>(buf_.get(), bytes_buffered));
     if (!send_result) {
         return std::unexpected(send_result.error());
     }
@@ -66,4 +66,4 @@ PendingDataSender::unsetEpollout(const EndpointContext& context) {
                              context.endpoint.current_events);
 }
 
-} // namespace orbit
+} // namespace orbit::proxy

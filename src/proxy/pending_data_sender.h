@@ -6,7 +6,7 @@
 
 #include "proxy/endpoint_context.h"
 
-namespace orbit {
+namespace orbit::proxy {
 
 class PendingDataSender {
 public:
@@ -23,4 +23,4 @@ private:
     int epfd_;
 };
 
-} // namespace orbit
+} // namespace orbit::proxy

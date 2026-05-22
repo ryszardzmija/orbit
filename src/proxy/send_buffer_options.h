@@ -2,7 +2,7 @@
 
 #include <cstddef>
 
-namespace orbit {
+namespace orbit::proxy {
 
 struct SendBufferOptions {
     size_t block_size;
@@ -10,4 +10,4 @@ struct SendBufferOptions {
     size_t low_watermark;
 };
 
-} // namespace orbit
+} // namespace orbit::proxy

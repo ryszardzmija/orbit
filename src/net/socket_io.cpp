@@ -1,8 +1,8 @@
-#include "proxy/socket_io.h"
+#include "net/socket_io.h"
 
 #include <sys/socket.h>
 
-namespace orbit {
+namespace orbit::net {
 
 std::expected<SendResult, std::error_code> trySend(int fd, std::span<const uint8_t> buf) {
     ssize_t bytes_sent = send(fd, buf.data(), buf.size(), MSG_NOSIGNAL);
@@ -53,4 +53,4 @@ std::expected<RecvResult, std::error_code> tryRecv(int fd, std::span<uint8_t> bu
     };
 }
 
-} // namespace orbit
+} // namespace orbit::net

@@ -3,7 +3,7 @@
 #include "proxy/generator.h"
 #include "proxy/session_pair.h"
 
-namespace orbit {
+namespace orbit::proxy {
 
 using EndpointId = MonotonicIdGenerator::Id;
 
@@ -13,4 +13,4 @@ struct EndpointContext {
     EndpointId other_endpoint_id;
 };
 
-} // namespace orbit
+} // namespace orbit::proxy

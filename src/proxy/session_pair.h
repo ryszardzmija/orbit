@@ -5,7 +5,7 @@
 #include "proxy/send_buffer.h"
 #include "proxy/send_buffer_factory.h"
 
-namespace orbit {
+namespace orbit::proxy {
 
 struct SessionEndpoint {
     int socket_fd;
@@ -25,4 +25,4 @@ struct SessionPair {
 std::unique_ptr<SessionPair> makeSessionPair(int downstream_fd, int upstream_fd,
                                              const SendBufferFactory& factory);
 
-} // namespace orbit
+} // namespace orbit::proxy
