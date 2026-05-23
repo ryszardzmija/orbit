@@ -25,4 +25,31 @@ std::expected<FileDescriptor, std::error_code> createShutdownSignalFd() {
     return FileDescriptor(fd);
 }
 
+std::expected<int, std::error_code> drainSignalFd(int fd) {
+    int count = 0;
+    while (true) {
+        signalfd_siginfo info = {};
+        ssize_t bytes_read = read(fd, &info, sizeof(info));
+
+        if (bytes_read == sizeof(info)) {
+            count++;
+            continue;
+        }
+
+        if (bytes_read == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            return count;
+        }
+
+        if (bytes_read == -1 && errno == EINTR) {
+            continue;
+        }
+
+        if (bytes_read == -1) {
+            return std::unexpected(std::error_code(errno, std::system_category()));
+        }
+
+        return std::unexpected(std::make_error_code(std::errc::io_error));
+    }
+}
+
 } // namespace orbit::proxy::detail

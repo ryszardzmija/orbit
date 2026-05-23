@@ -42,7 +42,9 @@ struct ListenerRegistration {};
 
 struct ShutdownSignalRegistration {};
 
-using ReactorRegistration =
-    std::variant<EndpointRegistration, ListenerRegistration, ShutdownSignalRegistration>;
+struct ShutdownTimerRegistration {};
+
+using ReactorRegistration = std::variant<EndpointRegistration, ListenerRegistration,
+                                         ShutdownSignalRegistration, ShutdownTimerRegistration>;
 
 } // namespace orbit::proxy::detail

@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <expected>
 #include <memory>
+#include <optional>
 #include <system_error>
 #include <utility>
 #include <variant>
@@ -22,6 +23,7 @@
 #include "proxy/detail/send_buffer_options.h"
 #include "proxy/detail/session_pair.h"
 #include "proxy/detail/signal_fd.h"
+#include "proxy/detail/timer_fd.h"
 
 namespace orbit::proxy {
 
@@ -87,50 +89,13 @@ bool shouldTearDown(const detail::SessionEndpoint& endpoint) {
     return endpoint.half_close_sent && endpoint.other->half_close_sent;
 }
 
-std::expected<void, std::error_code>
-getSocketErrorIfPresent(const detail::SessionEndpoint& endpoint) {
-    int err = 0;
-    socklen_t len = sizeof(err);
-    if (auto result = getsockopt(endpoint.socket_fd, SOL_SOCKET, SO_ERROR, &err, &len);
-        result == -1) {
-        return std::unexpected(std::error_code(errno, std::system_category()));
-    }
-    if (err != 0) {
-        return std::unexpected(std::error_code(err, std::system_category()));
-    }
-    return {};
-}
-
-std::expected<void, std::error_code> drainSignalFd(int fd) {
-    while (true) {
-        signalfd_siginfo info = {};
-        ssize_t bytes_read = read(fd, &info, sizeof(info));
-
-        if (bytes_read == sizeof(info)) {
-            continue;
-        }
-
-        if (bytes_read == -1 && errno == EAGAIN) {
-            return {};
-        }
-
-        if (bytes_read == -1 && errno == EINTR) {
-            continue;
-        }
-
-        if (bytes_read == -1) {
-            return std::unexpected(std::error_code(errno, std::system_category()));
-        }
-
-        return std::unexpected(std::make_error_code(std::errc::io_error));
-    }
-}
-
 } // namespace
 
-ProxyReactor::ProxyReactor(FileDescriptor epfd, FileDescriptor shutdown_signal_fd)
+ProxyReactor::ProxyReactor(FileDescriptor epfd, FileDescriptor shutdown_signal_fd,
+                           FileDescriptor shutdown_timer_fd)
     : epfd_(std::move(epfd)),
       shutdown_signal_fd_(std::move(shutdown_signal_fd)),
+      shutdown_timer_fd_(std::move(shutdown_timer_fd)),
       send_buffer_factory_(detail::SendBufferOptions{.block_size = block_size,
                                                      .high_watermark = high_watermark,
                                                      .low_watermark = low_watermark}),
@@ -151,9 +116,19 @@ std::expected<ProxyReactor, std::error_code> ProxyReactor::create(FileDescriptor
     }
     FileDescriptor signal_fd = std::move(signalfd_create_result.value());
 
-    ProxyReactor reactor(std::move(epfd), std::move(signal_fd));
+    auto timerfd_create_result = detail::createShutdownTimerFd();
+    if (!timerfd_create_result) {
+        return std::unexpected(timerfd_create_result.error());
+    }
+    FileDescriptor timer_fd = std::move(timerfd_create_result.value());
+
+    ProxyReactor reactor(std::move(epfd), std::move(signal_fd), std::move(timer_fd));
 
     if (auto register_result = reactor.registerShutdownSignalEvent(); !register_result) {
+        return std::unexpected(register_result.error());
+    }
+
+    if (auto register_result = reactor.registerShutdownTimerEvent(); !register_result) {
         return std::unexpected(register_result.error());
     }
 
@@ -171,7 +146,7 @@ std::expected<void, std::error_code> ProxyReactor::start() {
 
     epoll_event event_buf[event_buf_cap];
 
-    while (true) {
+    while (!shouldStop()) {
         int n = epoll_wait(epfd_.get(), event_buf, event_buf_cap, -1);
         if (n == -1) {
             if (errno == EINTR) {
@@ -213,14 +188,24 @@ std::expected<void, std::error_code> ProxyReactor::start() {
                                   handler_result.error().message());
                     return handler_result;
                 }
+            } else if (auto* shutdown_timer =
+                           std::get_if<detail::ShutdownTimerRegistration>(&registration)) {
+                if (auto handler_result = handleShutdownTimer(*shutdown_timer); !handler_result) {
+                    spdlog::error("Error in shutdown timer handler: {}",
+                                  handler_result.error().message());
+                    return handler_result;
+                }
+            } else {
+                assert(false && "Invalid ReactorRegistration dispatch");
+            }
+
+            if (shouldStop()) {
+                break;
             }
         }
-
-        // NOTE: This should be removed once event loop can accept new client connections.
-        if (!hasActiveSessions()) {
-            return {};
-        }
     }
+
+    return {};
 }
 
 detail::SessionEndpoint& ProxyReactor::getEndpoint(detail::ManagedSession& managed_session,
@@ -289,6 +274,45 @@ std::expected<void, std::error_code> ProxyReactor::closeSession(detail::SessionI
     return {};
 }
 
+std::expected<void, std::error_code> ProxyReactor::forceCloseSession(detail::SessionId session_id) {
+    auto it = sessions_.find(session_id);
+    if (it == sessions_.end()) {
+        return {};
+    }
+
+    detail::ManagedSession& managed_session = it->second;
+
+    std::optional<std::error_code> first_error;
+
+    if (auto result =
+            deregisterFileDescriptor(epfd_.get(), managed_session.session.downstream_fd.get());
+        !result) {
+        spdlog::warn("Failed to deregister downstream socket for session {} from epoll: {}",
+                     session_id, result.error().message());
+        first_error = result.error();
+    }
+    if (auto result =
+            deregisterFileDescriptor(epfd_.get(), managed_session.session.upstream_fd.get());
+        !result) {
+        spdlog::warn("Failed to deregister upstream socket for session {} from epoll: {}",
+                     session_id, result.error().message());
+        if (!first_error) {
+            first_error = result.error();
+        }
+    }
+
+    registrations_.erase(managed_session.downstream_endpoint_id);
+    registrations_.erase(managed_session.upstream_endpoint_id);
+
+    sessions_.erase(it);
+
+    if (first_error) {
+        return std::unexpected(first_error.value());
+    }
+
+    return {};
+}
+
 void ProxyReactor::closeSessionAndLog(detail::SessionId session_id) {
     if (auto result = closeSession(session_id); !result) {
         spdlog::error("Error closing session with ID {}: {}", session_id, result.error().message());
@@ -328,6 +352,14 @@ std::expected<void, std::error_code> ProxyReactor::registerShutdownSignalEvent()
 
     return registerReactorSource(shutdown_signal_fd_.get(), initial_events, id,
                                  detail::ShutdownSignalRegistration{});
+}
+
+std::expected<void, std::error_code> ProxyReactor::registerShutdownTimerEvent() {
+    uint32_t initial_events = EPOLLIN;
+    detail::ReactorSourceId id = reactor_source_id_generator_.getNextId();
+
+    return registerReactorSource(shutdown_timer_fd_.get(), initial_events, id,
+                                 detail::ShutdownTimerRegistration{});
 }
 
 std::expected<void, std::error_code> ProxyReactor::addSession(FileDescriptor upstream_fd,
@@ -469,15 +501,107 @@ ProxyReactor::handleEndpoint(detail::EndpointRegistration registration, uint32_t
     return {};
 }
 
-// TODO: Implement the rest of the handlers.
 std::expected<void, std::error_code>
-ProxyReactor::handleShutdownSignal(detail::ShutdownSignalRegistration registration) {
-    return drainSignalFd(shutdown_signal_fd_.get());
+ProxyReactor::handleShutdownSignal(detail::ShutdownSignalRegistration) {
+    auto drain_result = detail::drainSignalFd(shutdown_signal_fd_.get());
+    if (!drain_result) {
+        return std::unexpected(drain_result.error());
+    }
+    int count = drain_result.value();
+
+    for (int i = 0; i < count; i++) {
+        if (auto shutdown_request_result = handleShutdownRequest(); !shutdown_request_result) {
+            return shutdown_request_result;
+        }
+    }
+
+    return {};
 }
 
 std::expected<void, std::error_code>
-ProxyReactor::handleListener(detail::ListenerRegistration registration) {
+ProxyReactor::handleShutdownTimer(detail::ShutdownTimerRegistration) {
+    if (auto drain_result = detail::drainTimerFd(shutdown_timer_fd_.get()); !drain_result) {
+        return drain_result;
+    }
+
+    return handleShutdownRequest();
+}
+
+std::expected<void, std::error_code> ProxyReactor::handleListener(detail::ListenerRegistration) {
     return {};
+}
+
+std::expected<void, std::error_code> ProxyReactor::handleShutdownRequest() {
+    switch (shutdown_state_) {
+    case ShutdownState::Running:
+        if (auto timer_arming_result =
+                detail::armTimer(shutdown_timer_fd_.get(), graceful_shutdown_timeout_s);
+            !timer_arming_result) {
+            return timer_arming_result;
+        }
+        shutdown_state_ = ShutdownState::GracefullyStopping;
+        break;
+    case ShutdownState::GracefullyStopping:
+        if (auto timer_disarming_result = detail::disarmTimer(shutdown_timer_fd_.get());
+            !timer_disarming_result) {
+            return timer_disarming_result;
+        }
+        shutdown_state_ = ShutdownState::HardStopping;
+        performHardStop();
+        break;
+    case ShutdownState::HardStopping:
+        // No-op
+        break;
+    }
+
+    return {};
+}
+
+bool ProxyReactor::shouldStop() const {
+    if (shutdown_state_ == ShutdownState::HardStopping) {
+        return true;
+    }
+
+    if (shutdown_state_ == ShutdownState::GracefullyStopping && !hasActiveSessions()) {
+        return true;
+    }
+
+    // NOTE: This should be removed once the event loop can accept downstream connections.
+    if (!hasActiveSessions()) {
+        return true;
+    }
+
+    return false;
+}
+
+std::expected<void, std::error_code> ProxyReactor::forceCloseAllSessions() {
+    std::optional<std::error_code> first_error;
+
+    while (!sessions_.empty()) {
+        detail::SessionId session_id = sessions_.begin()->first;
+
+        if (auto result = forceCloseSession(session_id); !result) {
+            spdlog::warn("Failed to close session {} during hard shutdown: {}", session_id,
+                         result.error().message());
+
+            if (!first_error) {
+                first_error = result.error();
+            }
+        }
+    }
+
+    if (first_error) {
+        return std::unexpected(first_error.value());
+    }
+
+    return {};
+}
+
+void ProxyReactor::performHardStop() {
+    if (auto sessions_closure_result = forceCloseAllSessions(); !sessions_closure_result) {
+        spdlog::error("Failed to close all sessions during hard shutdown: {}",
+                      sessions_closure_result.error().message());
+    }
 }
 
 } // namespace orbit::proxy

@@ -7,6 +7,7 @@ add_library(proxy
     detail/send_buffer.cpp
     detail/session_pair.cpp
     detail/signal_fd.cpp
+    detail/timer_fd.cpp
 )
 
 target_include_directories(proxy PUBLIC ${CMAKE_SOURCE_DIR}/src)
