@@ -29,7 +29,16 @@ private:
     constexpr static size_t forwarder_buf_cap = 4096;
     constexpr static size_t sender_buf_cap = 4096;
 
-    ProxyReactor(FileDescriptor epfd, FileDescriptor shutdown_signal_fd);
+    constexpr static int graceful_shutdown_timeout_s = 30;
+
+    enum class ShutdownState {
+        Running,
+        GracefullyStopping,
+        HardStopping,
+    };
+
+    ProxyReactor(FileDescriptor epfd, FileDescriptor shutdown_signal_fd,
+                 FileDescriptor shutdown_timer_fd);
 
     std::expected<void, std::error_code> registerEndpoint(int fd, uint32_t initial_events,
                                                           detail::SessionId session_id,
@@ -38,6 +47,7 @@ private:
     std::expected<void, std::error_code> registerListener(int fd,
                                                           detail::ReactorSourceId source_id);
     std::expected<void, std::error_code> registerShutdownSignalEvent();
+    std::expected<void, std::error_code> registerShutdownTimerEvent();
     std::expected<void, std::error_code>
     registerReactorSource(int fd, uint32_t initial_events, detail::ReactorSourceId id,
                           const detail::ReactorRegistration& reactor_registration);
@@ -46,10 +56,13 @@ private:
     std::expected<void, std::error_code> closeSession(detail::SessionId session_id);
     std::expected<void, std::error_code> handleEndpoint(detail::EndpointRegistration registration,
                                                         uint32_t event_mask);
-    std::expected<void, std::error_code>
-    handleShutdownSignal(detail::ShutdownSignalRegistration registration);
-    std::expected<void, std::error_code> handleListener(detail::ListenerRegistration registration);
+    std::expected<void, std::error_code> handleShutdownSignal(detail::ShutdownSignalRegistration);
+    std::expected<void, std::error_code> handleShutdownTimer(detail::ShutdownTimerRegistration);
+    std::expected<void, std::error_code> handleListener(detail::ListenerRegistration);
     void closeSessionAndLog(detail::SessionId session_id);
+    std::expected<void, std::error_code> forceCloseSession(detail::SessionId session_id);
+    std::expected<void, std::error_code> forceCloseAllSessions();
+    void performHardStop();
     detail::SessionEndpoint& getEndpoint(detail::ManagedSession& managed_session,
                                          detail::EndpointRole role);
     detail::ReactorSourceId getEndpointId(detail::ManagedSession& managed_session,
@@ -57,9 +70,12 @@ private:
     detail::ReactorSourceId getOtherEndpointId(detail::ManagedSession& managed_session,
                                                detail::EndpointRole role);
     bool hasActiveSessions() const;
+    std::expected<void, std::error_code> handleShutdownRequest();
+    bool shouldStop() const;
 
     FileDescriptor epfd_;
     FileDescriptor shutdown_signal_fd_;
+    FileDescriptor shutdown_timer_fd_;
     absl::flat_hash_map<detail::SessionId, detail::ManagedSession> sessions_;
     absl::flat_hash_map<detail::ReactorSourceId, detail::ReactorRegistration> registrations_;
     detail::SessionIdGenerator session_id_generator_;
@@ -67,6 +83,7 @@ private:
     detail::SendBufferFactory send_buffer_factory_;
     detail::Forwarder forwarder_;
     detail::PendingDataSender sender_;
+    ShutdownState shutdown_state_ = ShutdownState::Running;
 };
 
 } // namespace orbit::proxy
