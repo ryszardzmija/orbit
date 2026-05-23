@@ -10,8 +10,19 @@
 #include "net/listener.h"
 #include "net/socket_options.h"
 #include "proxy/proxy.h"
+#include "signal/signal_block.h"
 
 int main(int argc, char** argv) {
+    auto signal_mask_make_result = orbit::makeShutdownSignalMask();
+    if (!signal_mask_make_result) {
+        return EXIT_FAILURE;
+    }
+    sigset_t shutdown_signal_mask = signal_mask_make_result.value();
+    if (auto signal_block_result = orbit::blockSignals(shutdown_signal_mask);
+        !signal_block_result) {
+        return EXIT_FAILURE;
+    }
+
     auto config_result = orbit::parseConfig(argc, argv);
     if (!config_result) {
         return config_result.error().exit_code;
@@ -61,8 +72,6 @@ int main(int argc, char** argv) {
         spdlog::error("fcntl() failed: {}", result.error().message());
         return EXIT_FAILURE;
     }
-
-    spdlog::info("Starting proxying traffic...");
 
     auto reactor_create_result = orbit::proxy::ProxyReactor::create(std::move(downstream_socket_fd),
                                                                     std::move(upstream_socket_fd));

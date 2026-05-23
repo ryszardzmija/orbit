@@ -46,13 +46,14 @@ add_subdirectory(src/config)
 add_subdirectory(src/logging)
 add_subdirectory(src/net)
 add_subdirectory(src/common)
+add_subdirectory(src/signal)
 
 add_executable(orbit
     src/main.cpp
 )
 
 target_include_directories(orbit PRIVATE src)
-target_link_libraries(orbit PRIVATE proxy config logging net common spdlog::spdlog CLI11::CLI11)
+target_link_libraries(orbit PRIVATE proxy config logging net common signal spdlog::spdlog CLI11::CLI11)
 target_compile_options(orbit PRIVATE -Wall -Wextra -Wpedantic)
 
 option(ORBIT_BUILD_TESTS "Build Unit Tests" OFF)

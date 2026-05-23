@@ -167,6 +167,8 @@ std::expected<ProxyReactor, std::error_code> ProxyReactor::create(FileDescriptor
 }
 
 std::expected<void, std::error_code> ProxyReactor::start() {
+    spdlog::info("Starting proxying traffic...");
+
     epoll_event event_buf[event_buf_cap];
 
     while (true) {
