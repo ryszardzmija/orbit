@@ -1,10 +1,11 @@
-#include "proxy/session_pair.h"
+#include "proxy/detail/session_pair.h"
 
 #include <memory>
 
-namespace orbit::proxy {
+namespace orbit::proxy::detail {
 
 std::unique_ptr<SessionPair> makeSessionPair(int downstream_fd, int upstream_fd,
+                                             uint32_t initial_events,
                                              const SendBufferFactory& factory) {
     auto pair = std::make_unique<SessionPair>();
 
@@ -12,7 +13,7 @@ std::unique_ptr<SessionPair> makeSessionPair(int downstream_fd, int upstream_fd,
         .socket_fd = upstream_fd,
         .other = &pair->downstream,
         .send_buffer = factory.make(),
-        .current_events = 0,
+        .current_events = initial_events,
         .peer_half_closed = false,
         .half_close_sent = false,
         .done_reading = false,
@@ -22,7 +23,7 @@ std::unique_ptr<SessionPair> makeSessionPair(int downstream_fd, int upstream_fd,
         .socket_fd = downstream_fd,
         .other = &pair->upstream,
         .send_buffer = factory.make(),
-        .current_events = 0,
+        .current_events = initial_events,
         .peer_half_closed = false,
         .half_close_sent = false,
         .done_reading = false,
@@ -31,4 +32,4 @@ std::unique_ptr<SessionPair> makeSessionPair(int downstream_fd, int upstream_fd,
     return pair;
 }
 
-} // namespace orbit::proxy
+} // namespace orbit::proxy::detail

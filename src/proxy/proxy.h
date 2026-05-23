@@ -6,9 +6,10 @@
 #include <absl/container/flat_hash_map.h>
 
 #include "common/fd.h"
-#include "proxy/endpoint_context.h"
-#include "proxy/generator.h"
-#include "proxy/session_pair.h"
+#include "proxy/detail/forwarding.h"
+#include "proxy/detail/generator.h"
+#include "proxy/detail/pending_data_sender.h"
+#include "proxy/detail/session_pair.h"
 
 namespace orbit::proxy {
 
@@ -26,70 +27,66 @@ private:
 
     constexpr static size_t event_buf_cap = 64;
     constexpr static size_t forwarder_buf_cap = 4096;
-
-    using SessionId = MonotonicIdGenerator::Id;
+    constexpr static size_t sender_buf_cap = 4096;
 
     class SessionIdGenerator {
     public:
         SessionIdGenerator() = default;
 
-        SessionId getNextId() { return generator_.getNextId(); }
+        detail::SessionId getNextId() { return generator_.getNextId(); }
 
     private:
-        MonotonicIdGenerator generator_;
+        detail::MonotonicIdGenerator generator_;
     };
 
-    class EndpointIdGenerator {
+    class ReactorSourceIdGenerator {
     public:
-        EndpointIdGenerator() = default;
+        ReactorSourceIdGenerator() = default;
 
-        EndpointId getNextId() { return generator_.getNextId(); }
+        detail::ReactorSourceId getNextId() { return generator_.getNextId(); }
 
     private:
-        MonotonicIdGenerator generator_;
+        detail::MonotonicIdGenerator generator_;
     };
 
-    // Owns resources associated with the session.
-    struct ProxySession {
-        FileDescriptor downstream_fd;
-        FileDescriptor upstream_fd;
-        std::unique_ptr<SessionPair> endpoints;
-    };
+    ProxyReactor(FileDescriptor epfd, FileDescriptor shutdown_signal_fd);
 
-    // Reactor's view of a managed session.
-    struct ManagedSession {
-        ProxySession session;
-        EndpointId downstream_endpoint_id;
-        EndpointId upstream_endpoint_id;
-    };
-
-    enum class EndpointRole {
-        Downstream,
-        Upstream,
-    };
-
-    // Reactor's record of a registered endpoint.
-    struct EndpointRegistration {
-        SessionId session_id;
-        EndpointRole role;
-    };
-
-    ProxyReactor(FileDescriptor epfd, absl::flat_hash_map<SessionId, ManagedSession> sessions,
-                 absl::flat_hash_map<EndpointId, EndpointRegistration> endpoint_registrations,
-                 SessionIdGenerator session_id_generator,
-                 EndpointIdGenerator endpoint_id_generator);
-
-    std::expected<void, std::error_code> closeSession(SessionId session_id);
-    void closeSessionAndLog(SessionId session_id);
-    SessionEndpoint& getEndpoint(ManagedSession& managed_session, EndpointRole role);
-    EndpointId getOtherEndpointId(ManagedSession& managed_session, EndpointRole role);
+    std::expected<void, std::error_code> registerEndpoint(int fd, uint32_t initial_events,
+                                                          detail::SessionId session_id,
+                                                          detail::EndpointRole role,
+                                                          detail::ReactorSourceId id);
+    std::expected<void, std::error_code> registerListener(int fd,
+                                                          detail::ReactorSourceId source_id);
+    std::expected<void, std::error_code> registerShutdownSignalEvent();
+    std::expected<void, std::error_code>
+    registerReactorSource(int fd, uint32_t initial_events, detail::ReactorSourceId id,
+                          const detail::ReactorRegistration& reactor_registration);
+    std::expected<void, std::error_code> addSession(FileDescriptor upstream_fd,
+                                                    FileDescriptor downstream_fd);
+    std::expected<void, std::error_code> closeSession(detail::SessionId session_id);
+    std::expected<void, std::error_code> handleEndpoint(detail::EndpointRegistration registration,
+                                                        uint32_t event_mask);
+    std::expected<void, std::error_code>
+    handleShutdownSignal(detail::ShutdownSignalRegistration registration);
+    std::expected<void, std::error_code> handleListener(detail::ListenerRegistration registration);
+    void closeSessionAndLog(detail::SessionId session_id);
+    detail::SessionEndpoint& getEndpoint(detail::ManagedSession& managed_session,
+                                         detail::EndpointRole role);
+    detail::ReactorSourceId getEndpointId(detail::ManagedSession& managed_session,
+                                          detail::EndpointRole role);
+    detail::ReactorSourceId getOtherEndpointId(detail::ManagedSession& managed_session,
+                                               detail::EndpointRole role);
     bool hasActiveSessions() const;
 
     FileDescriptor epfd_;
-    absl::flat_hash_map<SessionId, ManagedSession> sessions_;
-    absl::flat_hash_map<EndpointId, EndpointRegistration> endpoint_registrations_;
+    FileDescriptor shutdown_signal_fd_;
+    absl::flat_hash_map<detail::SessionId, detail::ManagedSession> sessions_;
+    absl::flat_hash_map<detail::ReactorSourceId, detail::ReactorRegistration> registrations_;
     SessionIdGenerator session_id_generator_;
-    EndpointIdGenerator endpoint_id_generator_;
+    ReactorSourceIdGenerator reactor_source_id_generator_;
+    detail::SendBufferFactory send_buffer_factory_;
+    detail::Forwarder forwarder_;
+    detail::PendingDataSender sender_;
 };
 
 } // namespace orbit::proxy

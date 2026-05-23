@@ -3,10 +3,10 @@
 #include <cstdlib>
 #include <memory>
 
-#include "proxy/send_buffer.h"
-#include "proxy/send_buffer_options.h"
+#include "proxy/detail/send_buffer.h"
+#include "proxy/detail/send_buffer_options.h"
 
-namespace orbit::proxy {
+namespace orbit::proxy::detail {
 
 class SendBufferFactory {
 public:
@@ -20,4 +20,4 @@ private:
     size_t low_watermark_;
 };
 
-} // namespace orbit::proxy
+} // namespace orbit::proxy::detail

@@ -1,4 +1,4 @@
-#include "proxy/epoll_utils.h"
+#include "proxy/detail/epoll_utils.h"
 
 #include <cerrno>
 #include <cstdint>
@@ -7,9 +7,9 @@
 
 #include <sys/epoll.h>
 
-#include "proxy/session_pair.h"
+#include "proxy/detail/session_pair.h"
 
-namespace orbit::proxy {
+namespace orbit::proxy::detail {
 
 std::expected<void, std::error_code> modifyEpollEvents(const EndpointContext& context, int fd,
                                                        int epfd, uint32_t new_events,

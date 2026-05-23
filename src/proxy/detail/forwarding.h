@@ -4,10 +4,10 @@
 #include <expected>
 #include <system_error>
 
-#include "proxy/endpoint_context.h"
-#include "proxy/session_pair.h"
+#include "proxy/detail/endpoint_context.h"
+#include "proxy/detail/session_pair.h"
 
-namespace orbit::proxy {
+namespace orbit::proxy::detail {
 
 class Forwarder {
 public:

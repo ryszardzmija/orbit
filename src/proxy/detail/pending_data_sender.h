@@ -4,9 +4,9 @@
 #include <memory>
 #include <system_error>
 
-#include "proxy/endpoint_context.h"
+#include "proxy/detail/endpoint_context.h"
 
-namespace orbit::proxy {
+namespace orbit::proxy::detail {
 
 class PendingDataSender {
 public:

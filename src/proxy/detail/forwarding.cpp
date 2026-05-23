@@ -1,4 +1,4 @@
-#include "proxy/forwarding.h"
+#include "proxy/detail/forwarding.h"
 
 #include <memory>
 
@@ -6,10 +6,10 @@
 #include <sys/socket.h>
 
 #include "net/socket_io.h"
-#include "proxy/epoll_utils.h"
-#include "proxy/send_buffer.h"
+#include "proxy/detail/epoll_utils.h"
+#include "proxy/detail/send_buffer.h"
 
-namespace orbit::proxy {
+namespace orbit::proxy::detail {
 
 Forwarder::Forwarder(size_t capacity, int epfd)
     : buf_(std::make_unique<uint8_t[]>(capacity)),

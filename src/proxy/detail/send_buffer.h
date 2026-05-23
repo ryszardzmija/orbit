@@ -4,7 +4,7 @@
 #include <memory>
 #include <span>
 
-namespace orbit::proxy {
+namespace orbit::proxy::detail {
 
 class SendBuffer {
 public:
@@ -67,4 +67,4 @@ private:
     BufferStatus status_ = BufferStatus::Accepting;
 };
 
-} // namespace orbit::proxy
+} // namespace orbit::proxy::detail

@@ -1,11 +1,12 @@
 add_library(proxy
-    epoll_utils.cpp
-    forwarding.cpp
-    pending_data_sender.cpp
     proxy.cpp
-    send_buffer_factory.cpp
-    send_buffer.cpp
-    session_pair.cpp
+    detail/epoll_utils.cpp
+    detail/forwarding.cpp
+    detail/pending_data_sender.cpp
+    detail/send_buffer_factory.cpp
+    detail/send_buffer.cpp
+    detail/session_pair.cpp
+    detail/signal_fd.cpp
 )
 
 target_include_directories(proxy PUBLIC ${CMAKE_SOURCE_DIR}/src)
