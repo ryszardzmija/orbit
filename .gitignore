@@ -15,3 +15,6 @@ compile_commands.json
 *.o
 *.a
 *.so
+
+# CMake
+CMakePresets.json
