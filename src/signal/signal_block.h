@@ -3,7 +3,7 @@
 #include <expected>
 #include <system_error>
 
-#include <signal.h>
+#include <signal.h> // IWYU pragma: keep
 
 namespace orbit {
 
