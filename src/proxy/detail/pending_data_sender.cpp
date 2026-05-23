@@ -1,13 +1,13 @@
-#include "proxy/pending_data_sender.h"
+#include "proxy/detail/pending_data_sender.h"
 
 #include <memory>
 
 #include <sys/epoll.h>
 
 #include "net/socket_io.h"
-#include "proxy/epoll_utils.h"
+#include "proxy/detail/epoll_utils.h"
 
-namespace orbit::proxy {
+namespace orbit::proxy::detail {
 
 PendingDataSender::PendingDataSender(size_t capacity, int epfd)
     : buf_(std::make_unique<uint8_t[]>(capacity)),

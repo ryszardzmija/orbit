@@ -1,4 +1,4 @@
-#include "proxy/send_buffer.h"
+#include "proxy/detail/send_buffer.h"
 
 #include <algorithm>
 #include <cassert>
@@ -8,7 +8,7 @@
 #include <span>
 #include <stdexcept>
 
-namespace orbit::proxy {
+namespace orbit::proxy::detail {
 
 // ListNode
 SendBuffer::ListNode::ListNode(size_t capacity)
@@ -156,4 +156,4 @@ void SendBuffer::updateStatus() {
     }
 }
 
-} // namespace orbit::proxy
+} // namespace orbit::proxy::detail

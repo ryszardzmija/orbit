@@ -4,9 +4,9 @@
 #include <expected>
 #include <system_error>
 
-#include "proxy/endpoint_context.h"
+#include "proxy/detail/endpoint_context.h"
 
-namespace orbit::proxy {
+namespace orbit::proxy::detail {
 
 std::expected<void, std::error_code> modifyEpollEvents(const EndpointContext& context, int fd,
                                                        int epfd, uint32_t new_events,

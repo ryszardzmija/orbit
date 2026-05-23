@@ -1,4 +1,4 @@
-#include "proxy/send_buffer.h"
+#include "proxy/detail/send_buffer.h"
 
 #include <cstddef>
 #include <span>
@@ -7,7 +7,7 @@
 
 #include <gtest/gtest.h>
 
-using orbit::proxy::SendBuffer;
+using orbit::proxy::detail::SendBuffer;
 
 class SendBufferTest : public testing::Test {
 protected:
