@@ -7,8 +7,8 @@
 
 #include "common/fd.h"
 #include "proxy/detail/forwarding.h"
-#include "proxy/detail/generator.h"
 #include "proxy/detail/pending_data_sender.h"
+#include "proxy/detail/reactor_generator.h"
 #include "proxy/detail/session_pair.h"
 
 namespace orbit::proxy {
@@ -28,26 +28,6 @@ private:
     constexpr static size_t event_buf_cap = 64;
     constexpr static size_t forwarder_buf_cap = 4096;
     constexpr static size_t sender_buf_cap = 4096;
-
-    class SessionIdGenerator {
-    public:
-        SessionIdGenerator() = default;
-
-        detail::SessionId getNextId() { return generator_.getNextId(); }
-
-    private:
-        detail::MonotonicIdGenerator generator_;
-    };
-
-    class ReactorSourceIdGenerator {
-    public:
-        ReactorSourceIdGenerator() = default;
-
-        detail::ReactorSourceId getNextId() { return generator_.getNextId(); }
-
-    private:
-        detail::MonotonicIdGenerator generator_;
-    };
 
     ProxyReactor(FileDescriptor epfd, FileDescriptor shutdown_signal_fd);
 
@@ -82,8 +62,8 @@ private:
     FileDescriptor shutdown_signal_fd_;
     absl::flat_hash_map<detail::SessionId, detail::ManagedSession> sessions_;
     absl::flat_hash_map<detail::ReactorSourceId, detail::ReactorRegistration> registrations_;
-    SessionIdGenerator session_id_generator_;
-    ReactorSourceIdGenerator reactor_source_id_generator_;
+    detail::SessionIdGenerator session_id_generator_;
+    detail::ReactorSourceIdGenerator reactor_source_id_generator_;
     detail::SendBufferFactory send_buffer_factory_;
     detail::Forwarder forwarder_;
     detail::PendingDataSender sender_;
