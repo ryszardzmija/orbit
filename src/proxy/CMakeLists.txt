@@ -18,4 +18,5 @@ target_link_libraries(proxy
         common
         spdlog::spdlog
         net
+        signal
 )
