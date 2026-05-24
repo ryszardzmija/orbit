@@ -1,5 +1,6 @@
 #include "net/listener.h"
 
+#include <cassert>
 #include <cerrno>
 #include <expected>
 #include <format>
@@ -18,10 +19,8 @@ namespace orbit::net {
 
 namespace {
 
-constexpr int max_backlog_size = 10;
-
 std::expected<FileDescriptor, std::error_code> createTcpSocket(const SocketAddress& address) {
-    int fd = socket(address.addr.ss_family, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    int fd = socket(address.addr.ss_family, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
     if (fd == -1) {
         return std::unexpected(std::error_code(errno, std::system_category()));
     }
@@ -38,7 +37,7 @@ std::expected<void, std::error_code> bindAddress(int socket_fd, const SocketAddr
     return {};
 }
 
-std::expected<void, std::error_code> enterListenState(int socket_fd) {
+std::expected<void, std::error_code> enterListenState(int socket_fd, int max_backlog_size) {
     int result = listen(socket_fd, max_backlog_size);
     if (result == -1) {
         return std::unexpected(std::error_code(errno, std::system_category()));
@@ -73,16 +72,20 @@ Listener::Listener(FileDescriptor listen_fd, SocketAddress local_address)
     : listen_fd_(std::move(listen_fd)),
       local_address_(local_address) {}
 
-std::expected<Listener, ListenError> Listener::create(const std::string& interface, uint16_t port) {
-    auto resolve_result = resolve(interface, port, true);
+std::expected<Listener, ListenError> Listener::create(const ListenSocketAddress& address,
+                                                      int max_backlog_size) {
+    assert(max_backlog_size > 0);
+
+    auto resolve_result = resolve(address.interface, address.port, true);
     if (!resolve_result) {
-        return std::unexpected(ListenError{std::format("resolve {}:{} failed: {}", interface, port,
-                                                       resolve_result.error().message)});
+        return std::unexpected(
+            ListenError{std::format("resolve {}:{} failed: {}", address.interface, address.port,
+                                    resolve_result.error().message)});
     }
 
     if (resolve_result->empty()) {
-        return std::unexpected(
-            ListenError{std::format("resolve {}:{} returned no addresses", interface, port)});
+        return std::unexpected(ListenError{
+            std::format("resolve {}:{} returned no addresses", address.interface, address.port)});
     }
 
     std::string attempts;
@@ -114,7 +117,7 @@ std::expected<Listener, ListenError> Listener::create(const std::string& interfa
             continue;
         }
 
-        auto enter_listen_result = enterListenState(socket_fd.get());
+        auto enter_listen_result = enterListenState(socket_fd.get(), max_backlog_size);
         if (!enter_listen_result) {
             addSpaceIfNotEmpty(attempts);
             attempts +=
@@ -133,31 +136,39 @@ std::expected<Listener, ListenError> Listener::create(const std::string& interfa
         return Listener(std::move(socket_fd), local_address_result.value());
     }
 
-    return std::unexpected(
-        ListenError(std::format("listen {}:{} failed: {}", interface, port, attempts)));
+    return std::unexpected(ListenError(
+        std::format("listen {}:{} failed: {}", address.interface, address.port, attempts)));
 }
 
-std::expected<AcceptSuccess, AcceptError> Listener::acceptClientConnection() {
-    sockaddr_storage client_addr = {};
-    socklen_t client_addr_len = sizeof(client_addr);
+std::expected<AcceptResult, std::error_code> Listener::acceptClientConnection() {
+    while (true) {
+        sockaddr_storage client_addr = {};
+        socklen_t client_addr_len = sizeof(client_addr);
 
-    int raw_fd = accept4(listen_fd_.get(), reinterpret_cast<sockaddr*>(&client_addr),
-                         &client_addr_len, SOCK_CLOEXEC);
+        int fd = accept4(listen_fd_.get(), reinterpret_cast<sockaddr*>(&client_addr),
+                         &client_addr_len, SOCK_CLOEXEC | SOCK_NONBLOCK);
 
-    if (raw_fd == -1) {
-        return std::unexpected(
-            AcceptError{std::format("accept: {}", std::system_category().message(errno))});
+        if (fd == -1 && errno == EINTR) {
+            continue;
+        }
+
+        if (fd == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            return AcceptWouldBlock{};
+        }
+
+        if (fd == -1) {
+            return std::unexpected(std::error_code(errno, std::system_category()));
+        }
+
+        return AcceptSuccess{
+            .fd = FileDescriptor(fd),
+            .remote =
+                {
+                    .addrlen = client_addr_len,
+                    .addr = client_addr,
+                },
+        };
     }
-
-    SocketAddress remote = {
-        .addrlen = client_addr_len,
-        .addr = client_addr,
-    };
-
-    return AcceptSuccess{
-        .fd = FileDescriptor(raw_fd),
-        .remote = remote,
-    };
 }
 
 } // namespace orbit::net

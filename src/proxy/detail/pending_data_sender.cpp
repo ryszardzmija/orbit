@@ -1,69 +1,54 @@
 #include "proxy/detail/pending_data_sender.h"
 
+#include <cassert>
 #include <memory>
 
 #include <sys/epoll.h>
 
 #include "net/socket_io.h"
-#include "proxy/detail/epoll_utils.h"
 
 namespace orbit::proxy::detail {
 
-PendingDataSender::PendingDataSender(size_t capacity, int epfd)
+PendingDataSender::PendingDataSender(size_t capacity)
     : buf_(std::make_unique<uint8_t[]>(capacity)),
-      capacity_(capacity),
-      epfd_(epfd) {}
+      capacity_(capacity) {}
 
-std::expected<void, std::error_code>
-PendingDataSender::sendPending(const EndpointContext& context) {
-    size_t bytes_buffered =
-        context.endpoint.send_buffer->copy(std::span<uint8_t>(buf_.get(), capacity_));
+PendingDataSender PendingDataSender::create(size_t capacity) {
+    assert(capacity > 0);
+
+    return PendingDataSender(capacity);
+}
+
+std::expected<SendResult, SendError> PendingDataSender::sendPending(SessionEndpoint& endpoint) {
+    assert(endpoint.other != nullptr);
+    assert(endpoint.send_buffer != nullptr);
+
+    size_t bytes_buffered = endpoint.send_buffer->copy(std::span<uint8_t>(buf_.get(), capacity_));
 
     if (bytes_buffered == 0) {
-        return {};
+        return SendResult{
+            .source_reading_allowed =
+                endpoint.send_buffer->status() == SendBuffer::BufferStatus::Accepting &&
+                !endpoint.other->done_reading,
+            .destination_buffer_drained = endpoint.send_buffer->empty(),
+        };
     }
 
-    auto send_result = net::trySend(context.endpoint.socket_fd,
-                                    std::span<const uint8_t>(buf_.get(), bytes_buffered));
+    auto send_result =
+        net::trySend(endpoint.socket_fd, std::span<const uint8_t>(buf_.get(), bytes_buffered));
     if (!send_result) {
-        return std::unexpected(send_result.error());
+        return std::unexpected(SendError{send_result.error().message()});
     }
 
     size_t bytes_written = send_result.value().bytes_sent;
-    context.endpoint.send_buffer->consume(bytes_written);
+    endpoint.send_buffer->consume(bytes_written);
 
-    if (context.endpoint.send_buffer->status() == SendBuffer::BufferStatus::Accepting &&
-        !context.endpoint.other->done_reading) {
-        if (auto result = setEpollin(context); !result) {
-            return result;
-        }
-    }
-
-    if (context.endpoint.send_buffer->empty()) {
-        if (auto result = unsetEpollout(context); !result) {
-            return result;
-        }
-    }
-    return {};
-}
-
-std::expected<void, std::error_code> PendingDataSender::setEpollin(const EndpointContext& context) {
-    EndpointContext other_context = {
-        .endpoint = *(context.endpoint.other),
-        .endpoint_id = context.other_endpoint_id,
-        .other_endpoint_id = context.endpoint_id,
+    return SendResult{
+        .source_reading_allowed =
+            endpoint.send_buffer->status() == SendBuffer::BufferStatus::Accepting &&
+            !endpoint.other->done_reading,
+        .destination_buffer_drained = endpoint.send_buffer->empty(),
     };
-
-    return modifyEpollEvents(other_context, context.endpoint.other->socket_fd, epfd_,
-                             context.endpoint.other->current_events | EPOLLIN,
-                             context.endpoint.other->current_events);
 }
 
-std::expected<void, std::error_code>
-PendingDataSender::unsetEpollout(const EndpointContext& context) {
-    return modifyEpollEvents(context, context.endpoint.socket_fd, epfd_,
-                             context.endpoint.current_events & ~EPOLLOUT,
-                             context.endpoint.current_events);
-}
-
-} // namespace orbit::proxy
+} // namespace orbit::proxy::detail

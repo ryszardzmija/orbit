@@ -9,6 +9,11 @@
 
 namespace orbit::net {
 
+struct DialSocketAddress {
+    std::string hostname;
+    uint16_t port;
+};
+
 struct DialError {
     std::string message;
 };
@@ -18,6 +23,6 @@ struct DialSuccess {
     SocketAddress remote;
 };
 
-std::expected<DialSuccess, DialError> dial(const std::string& hostname, uint16_t port);
+std::expected<DialSuccess, DialError> dial(const DialSocketAddress& address);
 
 } // namespace orbit::net
