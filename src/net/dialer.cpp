@@ -13,16 +13,17 @@
 
 namespace orbit::net {
 
-std::expected<DialSuccess, DialError> dial(const std::string& hostname, uint16_t port) {
-    auto resolve_result = resolve(hostname, port, false);
+std::expected<DialSuccess, DialError> dial(const DialSocketAddress& address) {
+    auto resolve_result = resolve(address.hostname, address.port, false);
     if (!resolve_result) {
-        return std::unexpected(DialError{std::format("resolve {}:{} failed: {}", hostname, port,
-                                                     resolve_result.error().message)});
+        return std::unexpected(
+            DialError{std::format("resolve {}:{} failed: {}", address.hostname, address.port,
+                                  resolve_result.error().message)});
     }
 
     if (resolve_result->empty()) {
-        return std::unexpected(
-            DialError{std::format("resolve {}:{} returned no addresses", hostname, port)});
+        return std::unexpected(DialError{
+            std::format("resolve {}:{} returned no addresses", address.hostname, address.port)});
     }
 
     std::string attempts;
@@ -56,7 +57,7 @@ std::expected<DialSuccess, DialError> dial(const std::string& hostname, uint16_t
     }
 
     return std::unexpected(
-        DialError{std::format("dial {}:{} failed: {}", hostname, port, attempts)});
+        DialError{std::format("dial {}:{} failed: {}", address.hostname, address.port, attempts)});
 }
 
 } // namespace orbit::net
