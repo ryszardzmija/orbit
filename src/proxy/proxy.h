@@ -1,6 +1,7 @@
 #pragma once
 
 #include <expected>
+#include <optional>
 #include <string>
 #include <system_error>
 
@@ -9,6 +10,7 @@
 #include "common/fd.h"
 #include "net/dialer.h"
 #include "net/listener.h"
+#include "proxy/detail/active_listener.h"
 #include "proxy/detail/forwarding.h"
 #include "proxy/detail/pending_data_sender.h"
 #include "proxy/detail/reactor_generator.h"
@@ -72,19 +74,17 @@ private:
 
     ProxyReactor(FileDescriptor epfd, FileDescriptor shutdown_signal_fd,
                  FileDescriptor shutdown_timer_fd, detail::Forwarder forwarder,
-                 detail::PendingDataSender sender, net::Listener listener,
-                 const net::DialSocketAddress& dial_address);
+                 detail::PendingDataSender sender, const net::DialSocketAddress& dial_address);
 
     // Resource registration
-    std::expected<void, std::error_code> registerEndpoint(int fd, uint32_t initial_events,
-                                                          detail::SessionId session_id,
-                                                          detail::EndpointRole role,
-                                                          detail::ReactorSourceId id);
-    std::expected<void, std::error_code> registerListener();
-    std::expected<void, std::error_code> registerShutdownSignalEvent();
-    std::expected<void, std::error_code> registerShutdownTimerEvent();
-    std::expected<void, std::error_code>
-    registerReactorSource(int fd, uint32_t initial_events, detail::ReactorSourceId id,
+    std::expected<detail::ReactorSourceId, std::error_code>
+    registerEndpoint(int fd, uint32_t initial_events, detail::SessionId session_id,
+                     detail::EndpointRole role);
+    std::expected<detail::ReactorSourceId, std::error_code> registerListener(int fd);
+    std::expected<detail::ReactorSourceId, std::error_code> registerShutdownSignalEvent();
+    std::expected<detail::ReactorSourceId, std::error_code> registerShutdownTimerEvent();
+    std::expected<detail::ReactorSourceId, std::error_code>
+    registerReactorSource(int fd, uint32_t initial_events,
                           const detail::ReactorRegistration& reactor_registration);
     std::expected<void, std::error_code> unregisterReactorSource(int fd,
                                                                  detail::ReactorSourceId id);
@@ -112,9 +112,7 @@ private:
                            detail::SessionEndpoint& destination);
     std::expected<EndpointEventOutcome, FatalReactorError>
     handleEndpointPeerHalfClosed(detail::SessionId session_id, detail::ReactorSourceId endpoint_id,
-                                 detail::SessionEndpoint& endpoint,
-                                 detail::ReactorSourceId other_endpoint_id,
-                                 detail::SessionEndpoint& other_endpoint);
+                                 detail::SessionEndpoint& endpoint);
     std::expected<EndpointEventOutcome, FatalReactorError>
     handleEndpointHangup(detail::SessionId session_id);
     std::expected<EndpointEventOutcome, FatalReactorError>
@@ -154,7 +152,7 @@ private:
     detail::SendBufferFactory send_buffer_factory_;
     detail::Forwarder forwarder_;
     detail::PendingDataSender sender_;
-    net::Listener listener_;
+    std::optional<detail::ActiveListener> active_listener_;
     ShutdownState shutdown_state_ = ShutdownState::Running;
     net::DialSocketAddress dial_address;
 };
