@@ -152,18 +152,17 @@ bool isRecoverableAcceptError(const std::error_code& error) {
 
 ProxyReactor::ProxyReactor(FileDescriptor epfd, FileDescriptor shutdown_signal_fd,
                            FileDescriptor shutdown_timer_fd, detail::Forwarder forwarder,
-                           detail::PendingDataSender sender, net::Listener listener,
+                           detail::PendingDataSender sender,
                            const net::DialSocketAddress& dial_address)
     : epfd_(std::move(epfd)),
       shutdown_signal_fd_(std::move(shutdown_signal_fd)),
       shutdown_timer_fd_(std::move(shutdown_timer_fd)),
-      forwarder_(std::move(forwarder)),
-      sender_(std::move(sender)),
-      listener_(std::move(listener)),
-      dial_address(dial_address),
       send_buffer_factory_(detail::SendBufferOptions{.block_size = block_size,
                                                      .high_watermark = high_watermark,
-                                                     .low_watermark = low_watermark}) {}
+                                                     .low_watermark = low_watermark}),
+      forwarder_(std::move(forwarder)),
+      sender_(std::move(sender)),
+      dial_address(dial_address) {}
 
 std::expected<ProxyReactor, ProxyCreateError>
 ProxyReactor::create(const net::ListenSocketAddress& listen_address,
@@ -197,18 +196,24 @@ ProxyReactor::create(const net::ListenSocketAddress& listen_address,
     net::Listener listener = std::move(listener_create_result.value());
 
     ProxyReactor reactor(std::move(epfd), std::move(signal_fd), std::move(timer_fd),
-                         std::move(forwarder), std::move(sender), std::move(listener),
-                         dial_address);
+                         std::move(forwarder), std::move(sender), dial_address);
+
+    auto listener_register_result = reactor.registerListener(listener.fd());
+    if (!listener_register_result) {
+        return std::unexpected(ProxyCreateError{listener_register_result.error().message()});
+    }
+    detail::ReactorSourceId listener_id = listener_register_result.value();
+
+    reactor.active_listener_ = detail::ActiveListener{
+        .listener = std::move(listener),
+        .listener_id = listener_id,
+    };
 
     if (auto register_result = reactor.registerShutdownSignalEvent(); !register_result) {
         return std::unexpected(ProxyCreateError{register_result.error().message()});
     }
 
     if (auto register_result = reactor.registerShutdownTimerEvent(); !register_result) {
-        return std::unexpected(ProxyCreateError{register_result.error().message()});
-    }
-
-    if (auto register_result = reactor.registerListener(); !register_result) {
         return std::unexpected(ProxyCreateError{register_result.error().message()});
     }
 
@@ -352,31 +357,32 @@ void ProxyReactor::closeSessionAndLog(detail::SessionId session_id) {
 
 bool ProxyReactor::hasActiveSessions() const { return !sessions_.empty(); }
 
-std::expected<void, std::error_code>
-ProxyReactor::registerReactorSource(int fd, uint32_t initial_events, detail::ReactorSourceId id,
+std::expected<detail::ReactorSourceId, std::error_code>
+ProxyReactor::registerReactorSource(int fd, uint32_t initial_events,
                                     const detail::ReactorRegistration& reactor_registration) {
+    detail::ReactorSourceId id = reactor_source_id_generator_.getNextId();
+
     if (auto result = registerFileDescriptor(epfd_.get(), fd, initial_events, id); !result) {
-        return result;
+        return std::unexpected(result.error());
     }
 
     auto [source_it, source_inserted] = registrations_.emplace(id, reactor_registration);
     assert(source_inserted);
 
-    return {};
+    return id;
 }
 
 // If everything succeeds then the endpoint is registered and the resulting state is consistent.
 // If anything fails the object's state remains as if this function was not called.
-std::expected<void, std::error_code> ProxyReactor::registerEndpoint(int fd, uint32_t initial_events,
-                                                                    detail::SessionId session_id,
-                                                                    detail::EndpointRole role,
-                                                                    detail::ReactorSourceId id) {
+std::expected<detail::ReactorSourceId, std::error_code>
+ProxyReactor::registerEndpoint(int fd, uint32_t initial_events, detail::SessionId session_id,
+                               detail::EndpointRole role) {
     detail::EndpointRegistration registration = {
         .session_id = session_id,
         .role = role,
     };
 
-    return registerReactorSource(fd, initial_events, id, registration);
+    return registerReactorSource(fd, initial_events, registration);
 }
 
 std::expected<void, std::error_code>
@@ -391,27 +397,24 @@ ProxyReactor::unregisterReactorSource(int fd, detail::ReactorSourceId id) {
     return {};
 }
 
-std::expected<void, std::error_code> ProxyReactor::registerListener() {
+std::expected<detail::ReactorSourceId, std::error_code> ProxyReactor::registerListener(int fd) {
     uint32_t initial_events = EPOLLIN;
-    detail::ReactorSourceId id = reactor_source_id_generator_.getNextId();
 
-    return registerReactorSource(listener_.fd(), initial_events, id,
-                                 detail::ListenerRegistration{});
+    return registerReactorSource(fd, initial_events, detail::ListenerRegistration{});
 }
 
-std::expected<void, std::error_code> ProxyReactor::registerShutdownSignalEvent() {
+std::expected<detail::ReactorSourceId, std::error_code>
+ProxyReactor::registerShutdownSignalEvent() {
     uint32_t initial_events = EPOLLIN;
-    detail::ReactorSourceId id = reactor_source_id_generator_.getNextId();
 
-    return registerReactorSource(shutdown_signal_fd_.get(), initial_events, id,
+    return registerReactorSource(shutdown_signal_fd_.get(), initial_events,
                                  detail::ShutdownSignalRegistration{});
 }
 
-std::expected<void, std::error_code> ProxyReactor::registerShutdownTimerEvent() {
+std::expected<detail::ReactorSourceId, std::error_code> ProxyReactor::registerShutdownTimerEvent() {
     uint32_t initial_events = EPOLLIN;
-    detail::ReactorSourceId id = reactor_source_id_generator_.getNextId();
 
-    return registerReactorSource(shutdown_timer_fd_.get(), initial_events, id,
+    return registerReactorSource(shutdown_timer_fd_.get(), initial_events,
                                  detail::ShutdownTimerRegistration{});
 }
 
@@ -427,36 +430,34 @@ std::expected<void, AddSessionError> ProxyReactor::addSession(FileDescriptor ups
     std::unique_ptr<detail::SessionPair> session_pair = makeSessionPair(
         downstream_fd.get(), upstream_fd.get(), initial_events, send_buffer_factory_);
 
-    detail::ReactorSourceId downstream_id = reactor_source_id_generator_.getNextId();
-    detail::ReactorSourceId upstream_id = reactor_source_id_generator_.getNextId();
-
-    if (auto register_result = registerEndpoint(downstream_fd.get(), initial_events, session_id,
-                                                detail::EndpointRole::Downstream, downstream_id);
-        !register_result) {
+    auto downstream_register_result = registerEndpoint(
+        downstream_fd.get(), initial_events, session_id, detail::EndpointRole::Downstream);
+    if (!downstream_register_result) {
 
         return std::unexpected(AddSessionError{
-            .message = register_result.error().message(),
+            .message = downstream_register_result.error().message(),
             .status = RollbackStatus::Success,
         });
     }
+    detail::ReactorSourceId downstream_id = downstream_register_result.value();
 
-    if (auto register_result = registerEndpoint(upstream_fd.get(), initial_events, session_id,
-                                                detail::EndpointRole::Upstream, upstream_id);
-        !register_result) {
-
+    auto upstream_register_result = registerEndpoint(upstream_fd.get(), initial_events, session_id,
+                                                     detail::EndpointRole::Upstream);
+    if (!upstream_register_result) {
         if (auto deregister_result = unregisterReactorSource(downstream_fd.get(), downstream_id);
             !deregister_result) {
             return std::unexpected(AddSessionError{
-                .message = register_result.error().message(),
+                .message = upstream_register_result.error().message(),
                 .status = RollbackStatus::Failure,
             });
         }
 
         return std::unexpected(AddSessionError{
-            .message = register_result.error().message(),
+            .message = upstream_register_result.error().message(),
             .status = RollbackStatus::Success,
         });
     }
+    detail::ReactorSourceId upstream_id = upstream_register_result.value();
 
     detail::ManagedSession managed_session{
         .session =
@@ -526,8 +527,7 @@ ProxyReactor::handleEndpoint(detail::EndpointRegistration registration, uint32_t
     // unregistered after receiving it to prevent it from re-triggering on subsequent
     // epoll_wait() calls.
     if (event_mask & EPOLLRDHUP) {
-        auto result = handleEndpointPeerHalfClosed(session_id, endpoint_id, endpoint,
-                                                   other_endpoint_id, *(endpoint.other));
+        auto result = handleEndpointPeerHalfClosed(session_id, endpoint_id, endpoint);
         if (!result) {
             return std::unexpected(result.error());
         }
@@ -668,10 +668,10 @@ std::expected<EndpointEventOutcome, FatalReactorError> ProxyReactor::handleEndpo
     return EndpointEventOutcome::KeepSession;
 }
 
-std::expected<EndpointEventOutcome, FatalReactorError> ProxyReactor::handleEndpointPeerHalfClosed(
-    detail::SessionId session_id, detail::ReactorSourceId endpoint_id,
-    detail::SessionEndpoint& endpoint, detail::ReactorSourceId other_endpoint_id,
-    detail::SessionEndpoint& other_endpoint) {
+std::expected<EndpointEventOutcome, FatalReactorError>
+ProxyReactor::handleEndpointPeerHalfClosed(detail::SessionId session_id,
+                                           detail::ReactorSourceId endpoint_id,
+                                           detail::SessionEndpoint& endpoint) {
     endpoint.peer_half_closed = true;
 
     if (auto result = disablePeerHalfCloseEvents(endpoint_id, endpoint); !result) {
@@ -836,7 +836,7 @@ ProxyReactor::handleShutdownTimer(detail::ShutdownTimerRegistration) {
 
 std::expected<void, FatalReactorError> ProxyReactor::handleListener(detail::ListenerRegistration) {
     for (int i = 0; i < max_accept_batch_size; i++) {
-        auto accept_result = listener_.acceptClientConnection();
+        auto accept_result = active_listener_->listener.acceptClientConnection();
         if (!accept_result) {
             if (isRecoverableAcceptError(accept_result.error())) {
                 spdlog::warn("Connection could not be accepted: {}",
@@ -911,6 +911,12 @@ std::expected<void, std::error_code> ProxyReactor::handleShutdownRequest() {
             !timer_arming_result) {
             return timer_arming_result;
         }
+        if (auto unregister_listener_result = unregisterReactorSource(
+                active_listener_->listener.fd(), active_listener_->listener_id);
+            !unregister_listener_result) {
+            return unregister_listener_result;
+        }
+        active_listener_.reset();
         shutdown_state_ = ShutdownState::GracefullyStopping;
         break;
     case ShutdownState::GracefullyStopping:

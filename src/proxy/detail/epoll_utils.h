@@ -4,7 +4,8 @@
 #include <expected>
 #include <system_error>
 
-#include "proxy/detail/endpoint_context.h"
+#include "proxy/detail/reactor_types.h"
+#include "proxy/detail/session_pair.h"
 
 namespace orbit::proxy::detail {
 
