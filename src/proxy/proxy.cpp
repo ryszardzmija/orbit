@@ -626,7 +626,10 @@ std::expected<EndpointEventOutcome, FatalReactorError> ProxyReactor::handleEndpo
     detail::SessionEndpoint& destination) {
     auto send_result = sender_.sendPending(destination);
     if (!send_result) {
-        return std::unexpected(FatalReactorError{send_result.error().message});
+        spdlog::error("Pending outbound data sending failed in session {}: {}", session_id,
+                      send_result.error().message);
+        closeSessionAndLog(session_id);
+        return EndpointEventOutcome::SessionClosed;
     }
 
     // Synchronize epoll interest list state
