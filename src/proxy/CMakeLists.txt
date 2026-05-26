@@ -8,6 +8,8 @@ add_library(proxy
     detail/session_pair.cpp
     detail/signal_fd.cpp
     detail/timer_fd.cpp
+    detail/resolved_upstream.cpp
+    detail/upstream_dialer.cpp
 )
 
 target_include_directories(proxy PUBLIC ${CMAKE_SOURCE_DIR}/src)

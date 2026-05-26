@@ -76,7 +76,11 @@ std::expected<Listener, ListenError> Listener::create(const ListenSocketAddress&
                                                       int max_backlog_size) {
     assert(max_backlog_size > 0);
 
-    auto resolve_result = resolve(address.interface, address.port, true);
+    ResolutionEndpoint endpoint = {
+        .hostname = address.interface,
+        .port = address.port,
+    };
+    auto resolve_result = resolve(endpoint, true);
     if (!resolve_result) {
         return std::unexpected(
             ListenError{std::format("resolve {}:{} failed: {}", address.interface, address.port,

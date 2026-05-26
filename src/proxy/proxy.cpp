@@ -17,7 +17,6 @@
 
 #include "common/fd.h"
 #include "net/address_format.h"
-#include "net/socket_options.h"
 #include "proxy/detail/epoll_utils.h"
 #include "proxy/detail/forwarding.h"
 #include "proxy/detail/pending_data_sender.h"
@@ -148,12 +147,37 @@ bool isRecoverableAcceptError(const std::error_code& error) {
     }
 }
 
+bool isFatalDialError(const std::error_code& error) {
+    switch (error.value()) {
+    case EADDRINUSE:
+    case EAGAIN:
+    case EALREADY:
+    case ECONNREFUSED:
+    case EISCONN:
+    case ENETUNREACH:
+    case EHOSTUNREACH:
+    case ETIMEDOUT:
+        return false;
+    default:
+        return true;
+    }
+}
+
+std::optional<std::error_code> getFirstFatalError(const std::vector<std::error_code>& codes) {
+    for (const auto& code : codes) {
+        if (isFatalDialError(code)) {
+            return code;
+        }
+    }
+
+    return std::nullopt;
+}
+
 } // namespace
 
 ProxyReactor::ProxyReactor(FileDescriptor epfd, FileDescriptor shutdown_signal_fd,
                            FileDescriptor shutdown_timer_fd, detail::Forwarder forwarder,
-                           detail::PendingDataSender sender,
-                           const net::DialSocketAddress& dial_address)
+                           detail::PendingDataSender sender, detail::UpstreamDialer upstream_dialer)
     : epfd_(std::move(epfd)),
       shutdown_signal_fd_(std::move(shutdown_signal_fd)),
       shutdown_timer_fd_(std::move(shutdown_timer_fd)),
@@ -162,11 +186,11 @@ ProxyReactor::ProxyReactor(FileDescriptor epfd, FileDescriptor shutdown_signal_f
                                                      .low_watermark = low_watermark}),
       forwarder_(std::move(forwarder)),
       sender_(std::move(sender)),
-      dial_address(dial_address) {}
+      upstream_dialer_(std::move(upstream_dialer)) {}
 
 std::expected<ProxyReactor, ProxyCreateError>
 ProxyReactor::create(const net::ListenSocketAddress& listen_address,
-                     const net::DialSocketAddress& dial_address) {
+                     const net::ResolutionEndpoint& upstream_address) {
     auto epoll_create_result = createEpollInstance();
     if (!epoll_create_result) {
         return std::unexpected(ProxyCreateError{epoll_create_result.error().message()});
@@ -185,6 +209,12 @@ ProxyReactor::create(const net::ListenSocketAddress& listen_address,
     }
     FileDescriptor timer_fd = std::move(timerfd_create_result.value());
 
+    auto dialer_create_result = detail::UpstreamDialer::create(upstream_address);
+    if (!dialer_create_result) {
+        return std::unexpected(ProxyCreateError{dialer_create_result.error().message});
+    }
+    detail::UpstreamDialer dialer = std::move(dialer_create_result.value());
+
     detail::Forwarder forwarder = detail::Forwarder::create(forwarder_buf_cap);
 
     detail::PendingDataSender sender = detail::PendingDataSender::create(sender_buf_cap);
@@ -196,7 +226,7 @@ ProxyReactor::create(const net::ListenSocketAddress& listen_address,
     net::Listener listener = std::move(listener_create_result.value());
 
     ProxyReactor reactor(std::move(epfd), std::move(signal_fd), std::move(timer_fd),
-                         std::move(forwarder), std::move(sender), dial_address);
+                         std::move(forwarder), std::move(sender), std::move(dialer));
 
     auto listener_register_result = reactor.registerListener(listener.fd());
     if (!listener_register_result) {
@@ -267,6 +297,14 @@ std::expected<void, ProxyRuntimeError> ProxyReactor::start() {
                            std::get_if<detail::ShutdownTimerRegistration>(&registration)) {
                 if (auto handler_result = handleShutdownTimer(*shutdown_timer); !handler_result) {
                     spdlog::error("Error in shutdown timer handler: {}",
+                                  handler_result.error().message);
+                    return std::unexpected(ProxyRuntimeError{handler_result.error().message});
+                }
+            } else if (auto* pending_connection =
+                           std::get_if<detail::PendingDialRegistration>(&registration)) {
+                if (auto handler_result = handlePendingConnection(source_id, *pending_connection);
+                    !handler_result) {
+                    spdlog::error("Error in pending connection handler: {}",
                                   handler_result.error().message);
                     return std::unexpected(ProxyRuntimeError{handler_result.error().message});
                 }
@@ -416,6 +454,22 @@ std::expected<detail::ReactorSourceId, std::error_code> ProxyReactor::registerSh
 
     return registerReactorSource(shutdown_timer_fd_.get(), initial_events,
                                  detail::ShutdownTimerRegistration{});
+}
+
+std::expected<detail::ReactorSourceId, std::error_code>
+ProxyReactor::registerPendingConnection(detail::PendingConnection pending_connection) {
+    uint32_t initial_events = EPOLLOUT;
+    int fd = pending_connection.attempted_connection_fd->get();
+    detail::PendingConnectionId id = pending_connection_id_generator_.getNextId();
+
+    pending_connections_.emplace(id, std::move(pending_connection));
+
+    auto register_result =
+        registerReactorSource(fd, initial_events, detail::PendingDialRegistration{id});
+    if (!register_result) {
+        pending_connections_.erase(id);
+    }
+    return register_result;
 }
 
 // If everything succeeds both endpoints are registered, maps are populated, and file descriptors
@@ -859,30 +913,57 @@ std::expected<void, FatalReactorError> ProxyReactor::handleListener(detail::List
 
         spdlog::info("Client {} connected", net::formatAddress(accept_success.remote));
 
-        auto dial_result = net::dial(dial_address);
+        auto dial_result =
+            upstream_dialer_.dial(std::move(accept_success.fd), accept_success.remote);
         if (!dial_result) {
-            spdlog::error("Error connecting to {}:{} : {}", dial_address.hostname,
-                          dial_address.port, dial_result.error().message);
-            // FileDescriptor ensures accepted socket is closed.
+            if (auto error_result = handleDialError(std::move(dial_result.error()));
+                !error_result) {
+                return error_result;
+            }
+
             continue;
         }
 
-        auto dial_success = std::move(dial_result.value());
+        if (auto dispatch_result = handleDialResult(std::move(*dial_result)); !dispatch_result) {
+            return dispatch_result;
+        }
+    }
 
+    return {};
+}
+
+std::expected<void, FatalReactorError>
+ProxyReactor::handlePendingConnection(detail::ReactorSourceId id,
+                                      detail::PendingDialRegistration registration) {
+    auto it = pending_connections_.find(registration.pending_connection_id);
+    assert(it != pending_connections_.end());
+
+    detail::PendingConnection pending_connection = std::move(it->second);
+    pending_connections_.erase(registration.pending_connection_id);
+
+    if (auto unregister_result =
+            unregisterReactorSource(pending_connection.attempted_connection_fd->get(), id);
+        !unregister_result) {
+        return std::unexpected(FatalReactorError{unregister_result.error().message()});
+    }
+
+    auto dial_result = upstream_dialer_.advanceDialAttempt(std::move(pending_connection));
+    if (!dial_result) {
+        return handleDialError(std::move(dial_result.error()));
+    }
+
+    return handleDialResult(std::move(*dial_result));
+}
+
+std::expected<void, FatalReactorError>
+ProxyReactor::handleDialResult(detail::UpstreamDialResult dial_result) {
+    if (auto* connected = std::get_if<detail::UpstreamDialConnected>(&dial_result)) {
         spdlog::info("Connected to {} on behalf of client {}",
-                     net::formatAddress(dial_success.remote),
-                     net::formatAddress(accept_success.remote));
+                     net::formatAddress(connected->upstream_address),
+                     net::formatAddress(connected->accepted_address));
 
-        // NOTE: Right now socket created by net::dial() is blocking to make connect() call blocking
-        // so this should be removed after this is no longer the case.
-        if (auto result = net::setNonBlocking(dial_success.fd.get()); !result) {
-            spdlog::error("Error making upstream socket non-blocking: {}",
-                          result.error().message());
-            continue;
-        }
-
-        if (auto session_add_result =
-                addSession(std::move(dial_success.fd), std::move(accept_success.fd));
+        if (auto session_add_result = addSession(std::move(connected->upstream_connection_fd),
+                                                 std::move(connected->accepted_connection_fd));
             !session_add_result) {
 
             if (session_add_result.error().status == RollbackStatus::Failure) {
@@ -892,15 +973,44 @@ std::expected<void, FatalReactorError> ProxyReactor::handleListener(detail::List
             }
 
             spdlog::error("Failed to establish session between {} and {} : {}",
-                          net::formatAddress(accept_success.remote),
-                          net::formatAddress(dial_success.remote),
+                          net::formatAddress(connected->accepted_address),
+                          net::formatAddress(connected->upstream_address),
                           session_add_result.error().message);
-            continue;
+            return {};
         }
 
         spdlog::info("Session between {} and {} established",
-                     net::formatAddress(accept_success.remote),
-                     net::formatAddress(dial_success.remote));
+                     net::formatAddress(connected->accepted_address),
+                     net::formatAddress(connected->upstream_address));
+
+    } else if (auto* in_progress = std::get_if<detail::UpstreamDialInProgress>(&dial_result)) {
+        net::SocketAddress accepted_address = in_progress->pending_connection.accepted_address;
+
+        if (auto register_result =
+                registerPendingConnection(std::move(in_progress->pending_connection));
+            !register_result) {
+            return std::unexpected(FatalReactorError{register_result.error().message()});
+        }
+
+        spdlog::debug("Pending connection for {} registered", net::formatAddress(accepted_address));
+
+    } else {
+        assert(false && "Invalid DialResult value");
+    }
+
+    return {};
+}
+
+std::expected<void, FatalReactorError>
+ProxyReactor::handleDialError(detail::UpstreamDialError dial_error) {
+    const auto& upstream_endpoint = upstream_dialer_.upstreamEndpoint();
+    spdlog::error("Connecting to {}:{} failed: {}", upstream_endpoint.hostname,
+                  upstream_endpoint.port, dial_error.error_messages);
+
+    std::optional<std::error_code> fatal_error = getFirstFatalError(dial_error.error_codes);
+    if (fatal_error) {
+        return std::unexpected(
+            FatalReactorError{std::format("Dial failed: {}", fatal_error->message())});
     }
 
     return {};

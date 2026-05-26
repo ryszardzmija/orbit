@@ -1,28 +1,33 @@
 #pragma once
 
-#include <cstdint>
 #include <expected>
-#include <string>
+#include <system_error>
 
 #include "common/fd.h"
 #include "net/socket_address.h"
 
 namespace orbit::net {
 
-struct DialSocketAddress {
-    std::string hostname;
-    uint16_t port;
-};
-
-struct DialError {
-    std::string message;
+enum class ConnectState {
+    Connected,
+    InProgress,
 };
 
 struct DialSuccess {
     FileDescriptor fd;
-    SocketAddress remote;
+    ConnectState state;
 };
 
-std::expected<DialSuccess, DialError> dial(const DialSocketAddress& address);
+enum class DialFailedOp {
+    Socket,
+    Connect,
+};
+
+struct DialError {
+    std::error_code code;
+    DialFailedOp failed_op;
+};
+
+std::expected<DialSuccess, DialError> dial(const SocketAddress& address);
 
 } // namespace orbit::net
