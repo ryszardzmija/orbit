@@ -33,8 +33,10 @@ int main(int argc, char** argv) {
             .interface = config.listen_host,
             .port = config.listen_port,
         },
-        orbit::net::DialSocketAddress{.hostname = config.upstream_host,
-                                      .port = config.upstream_port});
+        orbit::net::ResolutionEndpoint{
+            .hostname = config.upstream_host,
+            .port = config.upstream_port,
+        });
 
     if (!reactor_create_result) {
         spdlog::error("Failed to initialize event loop: {}", reactor_create_result.error().message);

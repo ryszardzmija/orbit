@@ -48,13 +48,13 @@ std::vector<SocketAddress> getAddressVector(addrinfo* resolve_result) {
 
 } // namespace
 
-std::expected<std::vector<SocketAddress>, ResolveError> resolve(const std::string& hostname,
-                                                                uint16_t port, bool passive) {
+std::expected<std::vector<SocketAddress>, ResolveError> resolve(const ResolutionEndpoint& endpoint,
+                                                                bool passive) {
     addrinfo* resolve_result = nullptr;
     addrinfo hints = getHints(passive);
 
-    std::string port_str = std::to_string(port);
-    const char* host_str = hostname.empty() ? nullptr : hostname.c_str();
+    std::string port_str = std::to_string(endpoint.port);
+    const char* host_str = endpoint.hostname.empty() ? nullptr : endpoint.hostname.c_str();
 
     if (int res = getaddrinfo(host_str, port_str.c_str(), &hints, &resolve_result); res != 0) {
         if (res == EAI_SYSTEM) {

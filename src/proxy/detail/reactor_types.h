@@ -12,6 +12,7 @@ namespace orbit::proxy::detail {
 // TODO: Document the structs
 
 using SessionId = MonotonicIdGenerator::Id;
+using PendingConnectionId = MonotonicIdGenerator::Id;
 using ReactorSourceId = MonotonicIdGenerator::Id;
 
 // Owns resources associated with the session.
@@ -44,7 +45,12 @@ struct ShutdownSignalRegistration {};
 
 struct ShutdownTimerRegistration {};
 
-using ReactorRegistration = std::variant<EndpointRegistration, ListenerRegistration,
-                                         ShutdownSignalRegistration, ShutdownTimerRegistration>;
+struct PendingDialRegistration {
+    PendingConnectionId pending_connection_id;
+};
+
+using ReactorRegistration =
+    std::variant<EndpointRegistration, ListenerRegistration, ShutdownSignalRegistration,
+                 ShutdownTimerRegistration, PendingDialRegistration>;
 
 } // namespace orbit::proxy::detail

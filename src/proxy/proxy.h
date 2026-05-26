@@ -8,12 +8,13 @@
 #include <absl/container/flat_hash_map.h>
 
 #include "common/fd.h"
-#include "net/dialer.h"
 #include "net/listener.h"
 #include "proxy/detail/active_listener.h"
 #include "proxy/detail/forwarding.h"
+#include "proxy/detail/pending_connection.h"
 #include "proxy/detail/pending_data_sender.h"
 #include "proxy/detail/reactor_generator.h"
+#include "proxy/detail/upstream_dialer.h"
 
 namespace orbit::proxy {
 
@@ -49,7 +50,7 @@ class ProxyReactor {
 public:
     static std::expected<ProxyReactor, ProxyCreateError>
     create(const net::ListenSocketAddress& listen_address,
-           const net::DialSocketAddress& dial_address);
+           const net::ResolutionEndpoint& upstream_address);
 
     [[nodiscard]] std::expected<void, ProxyRuntimeError> start();
 
@@ -74,7 +75,7 @@ private:
 
     ProxyReactor(FileDescriptor epfd, FileDescriptor shutdown_signal_fd,
                  FileDescriptor shutdown_timer_fd, detail::Forwarder forwarder,
-                 detail::PendingDataSender sender, const net::DialSocketAddress& dial_address);
+                 detail::PendingDataSender sender, detail::UpstreamDialer upstream_dialer);
 
     // Resource registration
     std::expected<detail::ReactorSourceId, std::error_code>
@@ -83,6 +84,9 @@ private:
     std::expected<detail::ReactorSourceId, std::error_code> registerListener(int fd);
     std::expected<detail::ReactorSourceId, std::error_code> registerShutdownSignalEvent();
     std::expected<detail::ReactorSourceId, std::error_code> registerShutdownTimerEvent();
+    std::expected<detail::ReactorSourceId, std::error_code>
+    registerPendingConnection(detail::PendingConnection pending_connection);
+
     std::expected<detail::ReactorSourceId, std::error_code>
     registerReactorSource(int fd, uint32_t initial_events,
                           const detail::ReactorRegistration& reactor_registration);
@@ -101,7 +105,11 @@ private:
     std::expected<void, FatalReactorError> handleShutdownSignal(detail::ShutdownSignalRegistration);
     std::expected<void, FatalReactorError> handleShutdownTimer(detail::ShutdownTimerRegistration);
     std::expected<void, FatalReactorError> handleListener(detail::ListenerRegistration);
+    std::expected<void, FatalReactorError>
+    handlePendingConnection(detail::ReactorSourceId id,
+                            detail::PendingDialRegistration registration);
 
+    // Handlers for handleEndpoint()
     std::expected<EndpointEventOutcome, FatalReactorError>
     handleEndpointReadable(detail::SessionId session_id, detail::ReactorSourceId source_id,
                            detail::SessionEndpoint& source, detail::ReactorSourceId destination_id,
@@ -117,6 +125,10 @@ private:
     handleEndpointHangup(detail::SessionId session_id);
     std::expected<EndpointEventOutcome, FatalReactorError>
     handleEndpointError(detail::SessionId session_id, detail::SessionEndpoint& endpoint);
+
+    // Handlers for handlePendingConnection()
+    std::expected<void, FatalReactorError> handleDialResult(detail::UpstreamDialResult dial_result);
+    std::expected<void, FatalReactorError> handleDialError(detail::UpstreamDialError dial_error);
 
     std::expected<void, std::error_code> handleShutdownRequest();
 
@@ -146,15 +158,18 @@ private:
     FileDescriptor shutdown_signal_fd_;
     FileDescriptor shutdown_timer_fd_;
     absl::flat_hash_map<detail::SessionId, detail::ManagedSession> sessions_;
+    absl::flat_hash_map<detail::PendingConnectionId, detail::PendingConnection>
+        pending_connections_;
     absl::flat_hash_map<detail::ReactorSourceId, detail::ReactorRegistration> registrations_;
     detail::SessionIdGenerator session_id_generator_;
+    detail::PendingConnectionIdGenerator pending_connection_id_generator_;
     detail::ReactorSourceIdGenerator reactor_source_id_generator_;
     detail::SendBufferFactory send_buffer_factory_;
     detail::Forwarder forwarder_;
     detail::PendingDataSender sender_;
     std::optional<detail::ActiveListener> active_listener_;
+    detail::UpstreamDialer upstream_dialer_;
     ShutdownState shutdown_state_ = ShutdownState::Running;
-    net::DialSocketAddress dial_address;
 };
 
 } // namespace orbit::proxy

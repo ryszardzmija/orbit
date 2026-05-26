@@ -15,6 +15,16 @@ private:
     detail::MonotonicIdGenerator generator_;
 };
 
+class PendingConnectionIdGenerator {
+public:
+    PendingConnectionIdGenerator() = default;
+
+    detail::PendingConnectionId getNextId() { return generator_.getNextId(); }
+
+private:
+    detail::MonotonicIdGenerator generator_;
+};
+
 class ReactorSourceIdGenerator {
 public:
     ReactorSourceIdGenerator() = default;
