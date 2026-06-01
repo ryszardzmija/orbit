@@ -1,6 +1,5 @@
 add_library(proxy
     proxy.cpp
-    detail/epoll_utils.cpp
     detail/forwarding.cpp
     detail/pending_data_sender.cpp
     detail/send_buffer_factory.cpp
@@ -10,6 +9,8 @@ add_library(proxy
     detail/timer_fd.cpp
     detail/resolved_upstream.cpp
     detail/upstream_dialer.cpp
+    detail/epoll/epoll_poller.cpp
+    detail/sources/reactor_sources.cpp
 )
 
 target_include_directories(proxy PUBLIC ${CMAKE_SOURCE_DIR}/src)
