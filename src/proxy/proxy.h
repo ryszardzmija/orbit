@@ -116,6 +116,9 @@ private:
     applySessionEventResult(detail::SessionId session_id,
                             const detail::SessionEventResult& event_result);
     Status<std::error_code> synchronizeSessionInterests(detail::SessionId session_id);
+    Status<std::error_code> synchronizeEndpoint(detail::SessionId session_id,
+                                                detail::EndpointRole role, detail::SourceId source_id,
+                                                const detail::EndpointInterests& interests);
 
     // Reactor shutdown
     Status<std::error_code> forceCloseAllSessions();

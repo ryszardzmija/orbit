@@ -51,6 +51,9 @@ public:
     // Stops tracking a source even if kernel deregistration fails.
     Status<std::error_code> retire(SourceId id);
 
+    // Whether a source is currently being watched.
+    bool isWatching(SourceId id) const;
+
     // Blocks until at least one watched source becomes ready. Interruptions
     // are retried internally.
     Result<std::vector<ReadyEvent>, std::error_code> wait();

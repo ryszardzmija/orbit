@@ -66,9 +66,15 @@ public:
     SessionSourceIds sourceIds(SessionId id) const;
     SessionInterests interests(SessionId id) const;
 
+    // Whether an endpoint should be retired from the poller: it has hung up and can therefore
+    // produce no further useful events. Leaving it registered would spin the reactor because
+    // EPOLLHUP is reported unconditionally.
+    bool shouldRetire(SessionId id, EndpointRole role) const;
+
     SessionEventResult handleReadable(SessionId id, EndpointRole role);
     SessionEventResult handleWritable(SessionId id, EndpointRole role);
     SessionEventResult handlePeerHalfClosed(SessionId id, EndpointRole role);
+    SessionEventResult handleHangup(SessionId id, EndpointRole role);
     SessionEventResult handleError(SessionId id, EndpointRole role);
 
 private:

@@ -1,4 +1,5 @@
 import concurrent.futures
+import os
 import signal
 import socket
 import struct
@@ -11,6 +12,20 @@ import unittest
 HEADER_SIZE = 4
 SOCKET_TIMEOUT = 5
 ORBIT_BINARY = sys.argv.pop(1)
+CLOCK_TICKS_PER_SECOND = os.sysconf("SC_CLK_TCK")
+
+
+def process_cpu_seconds(pid):
+    """Total user + system CPU time consumed by a process, in seconds."""
+    with open(f"/proc/{pid}/stat") as stat_file:
+        content = stat_file.read()
+    # Field 2 (comm) is parenthesized and may itself contain spaces and parentheses, so parse
+    # everything after the final ')'. The remainder starts at field 3 (state), making utime
+    # (field 14) and stime (field 15) the 12th and 13th entries.
+    fields_after_comm = content[content.rindex(")") + 1:].split()
+    utime = int(fields_after_comm[11])
+    stime = int(fields_after_comm[12])
+    return (utime + stime) / CLOCK_TICKS_PER_SECOND
 
 
 def send_message(sock, payload):
@@ -135,6 +150,10 @@ def finish_session(client, backend):
     expect_eof(backend)
     backend.shutdown(socket.SHUT_WR)
     expect_eof(client)
+
+
+# Large enough to exercise multi-read forwarding, small enough that sendall never blocks.
+HANGUP_PAYLOAD = bytes(range(256)) * 512
 
 
 class ProxySessionIntegrationTest(unittest.TestCase):
@@ -274,6 +293,86 @@ class ProxySessionIntegrationTest(unittest.TestCase):
         self.assertEqual(b"response-during-shutdown", recv_message(client))
 
         finish_session(client, backend)
+        self.assert_clean_exit()
+
+    def test_client_full_hangup_delivers_its_data_without_loss(self):
+        # Drive the client socket into a full hangup (EPOLLHUP): the proxy half-closes the client
+        # (after the backend finishes) and then the client closes its own write side, so both
+        # directions of the client socket are shut. The data the client sent earlier must still
+        # be delivered to the backend in full, and the session must tear down cleanly.
+        client, backend = self.proxy.connect_session()
+        backend_payload = b"backend-response-before-client-hangup"
+
+        client.sendall(HANGUP_PAYLOAD)
+
+        # Backend finishes its own direction; the proxy propagates the half-close to the client.
+        backend.sendall(backend_payload)
+        backend.shutdown(socket.SHUT_WR)
+        self.assertEqual(backend_payload, recv_exact(client, len(backend_payload)))
+        expect_eof(client)
+
+        # The client closes its write side too: the client socket is now fully hung up (EPOLLHUP).
+        client.shutdown(socket.SHUT_WR)
+
+        # The client's payload must still reach the backend, followed by a clean EOF.
+        self.assertEqual(HANGUP_PAYLOAD, recv_exact(backend, len(HANGUP_PAYLOAD)))
+        expect_eof(backend)
+
+        self.proxy.process.send_signal(signal.SIGTERM)
+        self.assert_clean_exit()
+
+    def test_backend_full_hangup_delivers_its_data_without_loss(self):
+        # Symmetric to the client-hangup case: the backend socket reaches a full hangup while the
+        # backend's earlier payload must still be delivered to the client without loss.
+        client, backend = self.proxy.connect_session()
+        client_payload = b"client-request-before-backend-hangup"
+
+        backend.sendall(HANGUP_PAYLOAD)
+
+        client.sendall(client_payload)
+        client.shutdown(socket.SHUT_WR)
+        self.assertEqual(client_payload, recv_exact(backend, len(client_payload)))
+        expect_eof(backend)
+
+        backend.shutdown(socket.SHUT_WR)
+
+        self.assertEqual(HANGUP_PAYLOAD, recv_exact(client, len(HANGUP_PAYLOAD)))
+        expect_eof(client)
+
+        self.proxy.process.send_signal(signal.SIGTERM)
+        self.assert_clean_exit()
+
+    def test_hung_up_endpoint_does_not_keep_the_reactor_busy(self):
+        # Guards against a regression in which a hung-up endpoint keeps producing events: EPOLLHUP
+        # is reported unconditionally by epoll, so a reactor that left such an endpoint registered
+        # with an empty interest mask would busy-loop. After driving the client into a full hangup,
+        # the reactor must stay idle (blocked in epoll_wait) rather than burning CPU.
+        client, backend = self.proxy.connect_session()
+        response = b"backend-response-before-idle-hangup"
+
+        client.sendall(HANGUP_PAYLOAD)
+        backend.sendall(response)
+        backend.shutdown(socket.SHUT_WR)
+        self.assertEqual(response, recv_exact(client, len(response)))
+        expect_eof(client)
+        self.assertEqual(HANGUP_PAYLOAD, recv_exact(backend, len(HANGUP_PAYLOAD)))
+        client.shutdown(socket.SHUT_WR)
+
+        # Let things settle, then confirm the reactor is not burning CPU.
+        measurement_window = 1.0
+        time.sleep(0.1)
+        cpu_before = process_cpu_seconds(self.proxy.process.pid)
+        time.sleep(measurement_window)
+        cpu_used = process_cpu_seconds(self.proxy.process.pid) - cpu_before
+        self.assertLess(
+            cpu_used,
+            0.25,
+            f"reactor used {cpu_used:.3f}s of CPU over {measurement_window}s while idle; "
+            "a hung-up endpoint is likely spinning",
+        )
+
+        expect_eof(backend)
+        self.proxy.process.send_signal(signal.SIGTERM)
         self.assert_clean_exit()
 
     def test_second_shutdown_signal_force_closes_active_sessions(self):

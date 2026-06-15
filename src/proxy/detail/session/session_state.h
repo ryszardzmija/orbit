@@ -12,6 +12,9 @@ struct EndpointState {
     bool peer_half_closed;
     bool half_close_sent;
     bool done_reading;
+    // Set when the socket reports a hangup (EPOLLHUP): the connection is fully torn down, so we
+    // can no longer write to it and any data still buffered for it is undeliverable.
+    bool write_closed;
 };
 
 struct SessionEndpoint {
