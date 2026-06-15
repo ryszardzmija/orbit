@@ -11,11 +11,9 @@
 #include "proxy/detail/active_listener.h"
 #include "proxy/detail/dial/connection_id.h"
 #include "proxy/detail/epoll/epoll_poller.h"
-#include "proxy/detail/forwarding.h"
 #include "proxy/detail/pending_connection.h"
-#include "proxy/detail/pending_data_sender.h"
 #include "proxy/detail/session/session_id.h"
-#include "proxy/detail/session/session_types.h"
+#include "proxy/detail/session/session_manager.h"
 #include "proxy/detail/sources/reactor_sources.h"
 #include "proxy/detail/upstream_dialer.h"
 
@@ -44,11 +42,6 @@ struct AddSessionError {
     RollbackStatus status;
 };
 
-enum class EndpointEventOutcome {
-    KeepSession,
-    SessionClosed,
-};
-
 class ProxyReactor {
 public:
     static Result<ProxyReactor, ProxyCreateError>
@@ -75,9 +68,13 @@ private:
         HardStopping,
     };
 
+    enum class EndpointEventOutcome {
+        KeepSession,
+        SessionClosed,
+    };
+
     ProxyReactor(detail::EpollPoller poller, FileDescriptor shutdown_signal_fd,
-                 FileDescriptor shutdown_timer_fd, detail::Forwarder forwarder,
-                 detail::PendingDataSender sender, detail::UpstreamDialer upstream_dialer);
+                 FileDescriptor shutdown_timer_fd, detail::UpstreamDialer upstream_dialer);
 
     // Resource registration
     Result<detail::SourceId, std::error_code> registerEndpoint(int fd, uint32_t initial_events,
@@ -108,38 +105,19 @@ private:
     Status<FatalReactorError> handlePendingConnection(detail::SourceId id,
                                                       detail::PendingDialRegistration registration);
 
-    // Handlers for handleEndpoint()
-    Result<EndpointEventOutcome, FatalReactorError>
-    handleEndpointReadable(detail::SessionId session_id, detail::SourceId source_id,
-                           detail::SessionEndpoint& source, detail::SourceId destination_id,
-                           detail::SessionEndpoint& destination);
-    Result<EndpointEventOutcome, FatalReactorError>
-    handleEndpointWritable(detail::SessionId session_id, detail::SourceId source_id,
-                           detail::SessionEndpoint& source, detail::SourceId destination_id,
-                           detail::SessionEndpoint& destination);
-    Result<EndpointEventOutcome, FatalReactorError>
-    handleEndpointPeerHalfClosed(detail::SessionId session_id, detail::SourceId endpoint_id,
-                                 detail::SessionEndpoint& endpoint);
-    Result<EndpointEventOutcome, FatalReactorError>
-    handleEndpointHangup(detail::SessionId session_id);
-    Result<EndpointEventOutcome, FatalReactorError>
-    handleEndpointError(detail::SessionId session_id, detail::SessionEndpoint& endpoint);
-
     // Handlers for handlePendingConnection()
     Status<FatalReactorError> handleDialResult(detail::UpstreamDialResult dial_result);
     Status<FatalReactorError> handleDialError(detail::UpstreamDialError dial_error);
 
     Status<std::error_code> handleShutdownRequest();
 
-    // epoll interest list synchronization
-    Status<std::error_code> ensureReadableInterest(detail::SourceId source_id);
-    Status<std::error_code> ensureNoReadableInterest(detail::SourceId source_id);
-    Status<std::error_code> ensureWritableInterest(detail::SourceId source_id);
-    Status<std::error_code> ensureNoWritableInterest(detail::SourceId source_id);
-    Status<std::error_code> disablePeerHalfCloseEvents(detail::SourceId source_id);
+    // Session state synchronization
+    Result<EndpointEventOutcome, FatalReactorError>
+    applySessionEventResult(detail::SessionId session_id,
+                            const detail::SessionEventResult& event_result);
+    Status<std::error_code> synchronizeSessionInterests(detail::SessionId session_id);
 
     // Reactor shutdown
-    Status<std::error_code> forceCloseSession(detail::SessionId session_id);
     Status<std::error_code> forceCloseAllSessions();
     void performHardStop();
 
@@ -149,16 +127,12 @@ private:
 
     detail::EpollPoller poller_;
     detail::ReactorSources sources_;
+    detail::SessionManager session_manager_;
     FileDescriptor shutdown_signal_fd_;
     FileDescriptor shutdown_timer_fd_;
-    absl::flat_hash_map<detail::SessionId, detail::ManagedSession> sessions_;
     absl::flat_hash_map<detail::PendingConnectionId, detail::PendingConnection>
         pending_connections_;
-    detail::SessionIdGenerator session_id_generator_;
     detail::PendingConnectionIdGenerator pending_connection_id_generator_;
-    detail::SendBufferFactory send_buffer_factory_;
-    detail::Forwarder forwarder_;
-    detail::PendingDataSender sender_;
     std::optional<detail::ActiveListener> active_listener_;
     detail::UpstreamDialer upstream_dialer_;
     ShutdownState shutdown_state_ = ShutdownState::Running;

@@ -3,8 +3,8 @@
 #include <cstdlib>
 #include <memory>
 
-#include "proxy/detail/send_buffer.h"
-#include "proxy/detail/send_buffer_options.h"
+#include "proxy/detail/buffer/send_buffer.h"
+#include "proxy/detail/buffer/send_buffer_options.h"
 
 namespace orbit::proxy::detail {
 

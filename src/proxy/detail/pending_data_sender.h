@@ -1,21 +1,13 @@
 #pragma once
 
 #include <cstdint>
-#include <expected>
 #include <memory>
 #include <string>
 
-#include "proxy/detail/session_pair.h"
+#include "common/status.h"
+#include "proxy/detail/session/session_state.h"
 
 namespace orbit::proxy::detail {
-
-// Session state that must currently hold true.
-struct SendResult {
-    // Source socket is allowed to read more data.
-    bool source_reading_allowed;
-    // Destination has no pending outbound data.
-    bool destination_buffer_drained;
-};
 
 struct SendError {
     std::string message;
@@ -25,7 +17,7 @@ class PendingDataSender {
 public:
     static PendingDataSender create(size_t capacity);
 
-    std::expected<SendResult, SendError> sendPending(SessionEndpoint& endpoint);
+    Status<SendError> sendPending(SessionEndpoint& destination);
 
 private:
     explicit PendingDataSender(size_t capacity);
