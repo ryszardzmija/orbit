@@ -1,4 +1,4 @@
-#include "proxy/detail/send_buffer.h"
+#include "proxy/detail/buffer/send_buffer.h"
 
 #include <cstddef>
 #include <span>

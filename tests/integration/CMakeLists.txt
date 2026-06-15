@@ -1,16 +1,16 @@
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
 add_test(
-    NAME integration_two_client_forwarding
+    NAME integration_proxy_sessions
     COMMAND
         "${Python3_EXECUTABLE}"
-        "${CMAKE_CURRENT_SOURCE_DIR}/two_client_forwarding_test.py"
+        "${CMAKE_CURRENT_SOURCE_DIR}/proxy_sessions_test.py"
         "$<TARGET_FILE:orbit>"
 )
 
 set_tests_properties(
-    integration_two_client_forwarding
+    integration_proxy_sessions
     PROPERTIES
-        TIMEOUT 10
+        TIMEOUT 45
         LABELS integration
 )

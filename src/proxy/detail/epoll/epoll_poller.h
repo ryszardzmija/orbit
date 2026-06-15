@@ -32,8 +32,8 @@ class EpollPoller {
 public:
     static Result<EpollPoller, std::error_code> create();
 
-    // Starts watching fd under source_id with the given epoll interest mask.
-    Status<std::error_code> add(SourceId source_id, int fd, uint32_t interests);
+    // Starts watching fd under SourceId with the given epoll interest mask.
+    Status<std::error_code> add(SourceId id, int fd, uint32_t interests);
 
     // Replaces interests for an existing registration.
     Status<std::error_code> setInterests(SourceId id, uint32_t new_interests);

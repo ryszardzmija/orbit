@@ -1,10 +1,10 @@
 add_library(proxy
     proxy.cpp
+    detail/buffer/send_buffer.cpp
+    detail/buffer/send_buffer_factory.cpp
     detail/forwarding.cpp
     detail/pending_data_sender.cpp
-    detail/send_buffer_factory.cpp
-    detail/send_buffer.cpp
-    detail/session_pair.cpp
+    detail/session/session_manager.cpp
     detail/signal_fd.cpp
     detail/timer_fd.cpp
     detail/resolved_upstream.cpp
