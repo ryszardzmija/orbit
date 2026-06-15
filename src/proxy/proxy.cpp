@@ -215,17 +215,23 @@ Status<std::error_code> ProxyReactor::closeSession(detail::SessionId session_id)
     detail::SessionSourceIds source_ids = session_manager_.sourceIds(session_id);
     std::optional<std::error_code> first_error;
 
-    if (auto result = poller_.retire(source_ids.downstream); !result) {
-        first_error = result.error();
-    }
-    sources_.remove(source_ids.downstream);
-
-    if (auto result = poller_.retire(source_ids.upstream); !result) {
-        if (!first_error) {
+    // An endpoint that hung up is retired during interest synchronization, so only retire the
+    // endpoints that are still watched to avoid deregistering them twice.
+    if (poller_.isWatching(source_ids.downstream)) {
+        if (auto result = poller_.retire(source_ids.downstream); !result) {
             first_error = result.error();
         }
+        sources_.remove(source_ids.downstream);
     }
-    sources_.remove(source_ids.upstream);
+
+    if (poller_.isWatching(source_ids.upstream)) {
+        if (auto result = poller_.retire(source_ids.upstream); !result) {
+            if (!first_error) {
+                first_error = result.error();
+            }
+        }
+        sources_.remove(source_ids.upstream);
+    }
 
     session_manager_.remove(session_id);
 
@@ -373,10 +379,10 @@ Status<FatalReactorError> ProxyReactor::handleEndpoint(detail::EndpointRegistrat
         detail::SessionId, detail::EndpointRole);
 
     // Each ready epoll event is dispatched to the matching SessionManager handler, in priority
-    // order. EPOLLIN runs first so an endpoint is always drained before any teardown decision.
-    // EPOLLHUP is intentionally absent: it may be delivered with unread stream data, so EPOLLIN
-    // processing must drain the endpoint, while EPOLLERR handles an abrupt failure.
-    static constexpr std::array<std::pair<uint32_t, SessionEventHandler>, 4> handlers = {{
+    // order. EPOLLIN runs first so an endpoint is always drained before any teardown decision,
+    // and EPOLLERR runs before EPOLLHUP so an abrupt failure tears the session down rather than
+    // attempting a graceful hangup drain.
+    static constexpr std::array<std::pair<uint32_t, SessionEventHandler>, 5> handlers = {{
         // There is at least one byte in the kernel receive buffer of the socket or EOF has been
         // reached. Registered by default since data arrives unpredictably and we always want to
         // try to forward it if possible.
@@ -389,6 +395,9 @@ Status<FatalReactorError> ProxyReactor::handleEndpoint(detail::EndpointRegistrat
         {EPOLLRDHUP, &detail::SessionManager::handlePeerHalfClosed},
         // A socket-level error occurred. The session cannot continue and is torn down.
         {EPOLLERR, &detail::SessionManager::handleError},
+        // The connection hung up. SessionManager preserves any remaining inbound data, stops
+        // writing to the socket, and closes the session once the surviving direction has drained.
+        {EPOLLHUP, &detail::SessionManager::handleHangup},
     }};
 
     for (const auto& [event_flag, handler] : handlers) {
@@ -432,13 +441,36 @@ Status<std::error_code> ProxyReactor::synchronizeSessionInterests(detail::Sessio
     detail::SessionSourceIds source_ids = session_manager_.sourceIds(session_id);
     detail::SessionInterests interests = session_manager_.interests(session_id);
 
-    if (auto result =
-            poller_.setInterests(source_ids.downstream, getEventMask(interests.downstream));
+    if (auto result = synchronizeEndpoint(session_id, detail::EndpointRole::Downstream,
+                                          source_ids.downstream, interests.downstream);
         !result) {
         return result;
     }
 
-    return poller_.setInterests(source_ids.upstream, getEventMask(interests.upstream));
+    return synchronizeEndpoint(session_id, detail::EndpointRole::Upstream, source_ids.upstream,
+                               interests.upstream);
+}
+
+Status<std::error_code>
+ProxyReactor::synchronizeEndpoint(detail::SessionId session_id, detail::EndpointRole role,
+                                  detail::SourceId source_id,
+                                  const detail::EndpointInterests& interests) {
+    // A hung-up endpoint can produce no further useful events, but EPOLLHUP is reported
+    // unconditionally, so leaving it registered would spin the reactor. Retire it from the poller
+    // while keeping the session alive so the surviving direction can finish flushing. Retirement
+    // is permanent, so a source already retired by an earlier sync is simply skipped.
+    if (session_manager_.shouldRetire(session_id, role)) {
+        if (!poller_.isWatching(source_id)) {
+            return {};
+        }
+        if (auto result = poller_.retire(source_id); !result) {
+            return result;
+        }
+        sources_.remove(source_id);
+        return {};
+    }
+
+    return poller_.setInterests(source_id, getEventMask(interests));
 }
 
 Status<FatalReactorError> ProxyReactor::handleShutdownSignal(detail::ShutdownSignalRegistration) {

@@ -65,6 +65,30 @@ Status<ForwardError> Forwarder::forward(SessionEndpoint& source, SessionEndpoint
     return {};
 }
 
+Status<ForwardError> Forwarder::drain(SessionEndpoint& source, SessionEndpoint& destination) {
+    while (true) {
+        auto recv_result =
+            net::tryRecv(source.fd.get(), std::span<uint8_t>(buf_.get(), capacity_));
+        if (!recv_result) {
+            return std::unexpected(ForwardError{
+                .message = recv_result.error().message(),
+                .failed_op = FailedOp::Recv,
+            });
+        }
+
+        if (recv_result.value().status == net::RecvStatus::Eof) {
+            source.state.done_reading = true;
+            return {};
+        }
+
+        if (recv_result.value().status == net::RecvStatus::WouldBlock) {
+            return {};
+        }
+
+        bufferData(destination, recv_result.value().bytes_received);
+    }
+}
+
 void Forwarder::bufferData(SessionEndpoint& destination, size_t bytes_read) {
     auto to_buffer = std::span<const uint8_t>(buf_.get(), bytes_read);
     destination.state.send_buffer->write(to_buffer);

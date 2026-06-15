@@ -27,6 +27,12 @@ public:
 
     Status<ForwardError> forward(SessionEndpoint& source, SessionEndpoint& destination);
 
+    // Reads everything currently available from source into destination's send buffer until the
+    // socket would block or reaches EOF. Unlike forward() this ignores the destination's
+    // backpressure watermark: it is meant to drain a hung-up source whose data must be preserved
+    // before the source is retired, and the amount available is bounded by the kernel buffer.
+    Status<ForwardError> drain(SessionEndpoint& source, SessionEndpoint& destination);
+
 private:
     explicit Forwarder(size_t capacity);
 
