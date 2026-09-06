@@ -27,6 +27,7 @@ int main(int argc, char** argv) {
     orbit::Config config = config_result.value();
 
     auto logger_guard = orbit::setUpLogger(config.log_level);
+    const orbit::UpstreamConfig& upstream = config.upstreams.front();
 
     auto reactor_create_result = orbit::proxy::ProxyReactor::create(
         orbit::net::ListenSocketAddress{
@@ -34,8 +35,8 @@ int main(int argc, char** argv) {
             .port = config.listen_port,
         },
         orbit::net::ResolutionEndpoint{
-            .hostname = config.upstream_host,
-            .port = config.upstream_port,
+            .hostname = upstream.host,
+            .port = upstream.port,
         });
 
     if (!reactor_create_result) {
