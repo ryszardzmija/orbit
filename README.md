@@ -13,7 +13,7 @@
 
 Orbit is intended to become a gateway to ShaleDB, a Dynamo-like distributed key-value store. For
 now, it is a transparent TCP reverse proxy: clients connect to Orbit and Orbit forwards their byte
-streams to one configured upstream server without interpreting the protocol.
+streams to the first configured upstream server without interpreting the protocol (before load balancing is implemented).
 
 ## Design
 
@@ -55,8 +55,7 @@ Start Orbit in another terminal:
 ./build/orbit \
   --listen-host 127.0.0.1 \
   --listen-port 8080 \
-  --upstream-host 127.0.0.1 \
-  --upstream-port 7000
+  --upstream 127.0.0.1:7000
 ```
 
 Then send a message through the proxy:
@@ -70,7 +69,10 @@ one terminal is also a quick way to try multiple simultaneous sessions.
 
 ## Configuration
 
-The upstream host and port are required. Orbit listens on `0.0.0.0:8080` by default and logs at
-`info` level; these can be changed with `--listen-host`, `--listen-port`, and `--log-level`.
-Options can also be set through corresponding `ORBIT_` environment variables, such as
-`ORBIT_UPSTREAM_HOST` and `ORBIT_UPSTREAM_PORT`.
+At least one upstream is required. Pass an endpoint as `--upstream HOST:PORT`, using
+`--upstream [ADDRESS]:PORT` for IPv6, and repeat the option to configure multiple upstreams. Orbit
+currently forwards connections through the first configured upstream.
+
+Orbit listens on `0.0.0.0:8080` by default and logs at `info` level; these can be changed with
+`--listen-host`, `--listen-port`, and `--log-level`. Options can also be set through corresponding
+`ORBIT_` environment variables. `ORBIT_UPSTREAMS` accepts a comma-separated list of upstreams.
