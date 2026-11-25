@@ -72,15 +72,16 @@ Source baseline is `e3aec7b`. A source-confirmed finding follows from the implem
 - **Source and evidence** — [`ProxyReactor::handleListener`](../src/proxy/proxy.cpp) caps accept iterations at 16, and [`EpollPoller::wait`](../src/proxy/detail/epoll/epoll_poller.h) takes up to 1,024 events. A normal [`Forwarder::forward`](../src/proxy/detail/forwarding.cpp) and [`PendingDataSender::sendPending`](../src/proxy/detail/pending_data_sender.cpp) process one 4 KiB chunk each, apart from interrupted syscall retries. The hangup drain loops until would-block, EOF or error. [`UpstreamDialer::tryCandidatesFrom`](../src/proxy/detail/upstream_dialer.cpp) can scan all remaining candidates inside a handler.
 - **Conditions and impact** — Residual hangup input, repeated accepts with many failing addresses, or a large ready batch can delay other ready sessions and shutdown handling. Accept iteration count does not bound the duration of the dial work done inside each iteration. The code has no handler time budget or service-latency guarantee.
 - **Verification** — Source-confirmed work bounds and unbudgeted paths. Starvation duration and throughput impact remain unmeasured.
-- **Follow-up** — Establish a mixed-workload latency baseline in M0.3. Measure drain, dial and accept costs before selecting fairness budgets.
+- **Follow-up** — M0.3 measures single-connection echo latency. Measure mixed-workload latency and drain, dial and accept costs before selecting fairness budgets.
 
 ## LIM-010 — Logging is the runtime observability surface
 
 - **Classification and priority** — Functional limitation, medium.
-- **Source and evidence** — [`setUpLogger` and `LoggerGuard`](../src/logging/logger.cpp) provide configurable async stdout logging and a shutdown-time overrun warning. The reactor reports connected clients, dial and session setup, and errors. Neither [`ProxyReactor`](../src/proxy/proxy.cpp) nor [`SessionManager`](../src/proxy/detail/session/session_manager.cpp) exports connection, queue, latency, throughput or overload statistics. [The integration suite](../tests/integration/proxy_sessions_test.py) samples process CPU for an idle-HUP regression. There is no checked-in profiler integration, benchmark harness or published performance baseline.
+- **Source and evidence** — [`setUpLogger` and `LoggerGuard`](../src/logging/logger.cpp) provide configurable async stdout logging and a shutdown-time overrun warning. The reactor reports connected clients, dial and session setup, and errors. Neither [`ProxyReactor`](../src/proxy/proxy.cpp) nor [`SessionManager`](../src/proxy/detail/session/session_manager.cpp) exports connection, queue, latency, throughput or overload statistics. [The integration suite](../tests/integration/proxy_sessions_test.py) samples process CPU for an idle-HUP regression.
 - **Conditions and impact** — Under sustained load or logging queue overflow, logs give limited evidence about bottlenecks, occupancy, fairness or the causes of rejection. The idle CPU test provides no throughput or tail latency measurement.
 - **Verification** — Source and repository inventory. No performance claims were measured for this audit.
-- **Follow-up** — Define connection, dial and buffer statistics and a repeatable workload before doing performance optimization. Capture workload, build type, machine and kernel settings so results can be compared.
+- **Disposition** — M0.3 adds scripts for repeatable external measurements. [Loopback benchmarks](../benchmarks/README.md)
+- **Follow-up** — Define runtime connection, dial and buffer statistics.
 
 ## LIM-011 — Fault and readiness tests leave gaps
 
