@@ -1,9 +1,10 @@
-find_package(Python3 REQUIRED COMPONENTS Interpreter)
+find_package(Python3 3.10 REQUIRED COMPONENTS Interpreter)
 
 add_test(
     NAME integration_proxy_sessions
     COMMAND
         "${Python3_EXECUTABLE}"
+        -u
         "${CMAKE_CURRENT_SOURCE_DIR}/proxy_sessions_test.py"
         "$<TARGET_FILE:orbit>"
 )
@@ -13,4 +14,5 @@ set_tests_properties(
     PROPERTIES
         TIMEOUT 45
         LABELS integration
+        RUN_SERIAL TRUE
 )

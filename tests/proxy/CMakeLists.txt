@@ -7,5 +7,4 @@ target_link_libraries(proxy_tests PRIVATE
     GTest::gtest_main
 )
 
-include(GoogleTest)
-gtest_discover_tests(proxy_tests)
+orbit_discover_unit_tests(proxy_tests)

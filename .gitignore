@@ -16,8 +16,8 @@ compile_commands.json
 *.a
 *.so
 
-# CMake
-CMakePresets.json
+# Local CMake presets
+CMakeUserPresets.json
 
 # CLion
 .idea/

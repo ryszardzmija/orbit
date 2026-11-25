@@ -35,14 +35,17 @@ behavior, the [engineering invariants](docs/invariants.md) for correctness requi
 
 ## Building
 
-Orbit requires Linux, CMake 3.28 or newer, Ninja, and a C++23 compiler. Configuration fetches its
-dependencies if they are not already present.
+On Linux, the `debug` preset uses GCC 15, CMake 3.28 or newer, Ninja, Git and Python 3.10 or
+newer. CMake fetches the pinned dependencies during configuration.
 
 ```sh
-cmake -S . -B build -G Ninja -DORBIT_BUILD_TESTS=ON
-cmake --build build
-ctest --test-dir build --output-on-failure
+cmake --preset debug
+cmake --build --preset debug
+ctest --preset debug
 ```
+
+The [development guide](docs/development.md) covers tool installation, the `release` and
+`sanitizers` presets, test selection and CI diagnostics.
 
 ## Trying it out
 
@@ -56,7 +59,7 @@ socat -v TCP-LISTEN:7000,reuseaddr,fork EXEC:/bin/cat
 Start Orbit in another terminal:
 
 ```sh
-./build/orbit \
+./build/debug/orbit \
   --listen-host 127.0.0.1 \
   --listen-port 8080 \
   --upstream 127.0.0.1:7000

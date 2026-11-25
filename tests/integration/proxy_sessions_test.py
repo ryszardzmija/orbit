@@ -1,17 +1,29 @@
 import concurrent.futures
+from contextlib import ExitStack, redirect_stdout
+import io
 import os
+import select
+import shlex
 import signal
 import socket
 import struct
 import subprocess
 import sys
+import tempfile
+import textwrap
 import time
 import unittest
+from unittest import mock
 
 
 HEADER_SIZE = 4
 SOCKET_TIMEOUT = 5
-ORBIT_BINARY = sys.argv.pop(1)
+STARTUP_TIMEOUT = 5
+SHUTDOWN_TIMEOUT = 5
+KILL_TIMEOUT = 2
+POLL_INTERVAL = 0.02
+LOG_LIMIT = 32 * 1024
+READY_MESSAGE = b"Starting proxying traffic..."
 CLOCK_TICKS_PER_SECOND = os.sysconf("SC_CLK_TCK")
 
 
@@ -35,13 +47,25 @@ def send_message(sock, payload):
 
 def recv_exact(sock, size):
     data = bytearray()
-    while len(data) < size:
-        chunk = sock.recv(size - len(data))
-        if not chunk:
-            raise RuntimeError(
-                f"connection closed after {len(data)} of {size} expected bytes arrived"
-            )
-        data.extend(chunk)
+    deadline = time.monotonic() + SOCKET_TIMEOUT
+    try:
+        while len(data) < size:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError
+            sock.settimeout(remaining)
+            chunk = sock.recv(size - len(data))
+            if not chunk:
+                raise RuntimeError(
+                    f"connection closed after {len(data)} of {size} expected bytes arrived"
+                )
+            data.extend(chunk)
+    except TimeoutError as error:
+        raise TimeoutError(
+            f"timed out after {SOCKET_TIMEOUT}s receiving {len(data)} of {size} expected bytes"
+        ) from error
+    finally:
+        sock.settimeout(SOCKET_TIMEOUT)
     return bytes(data)
 
 
@@ -57,90 +81,156 @@ def expect_eof(sock):
         raise AssertionError(f"expected EOF, received {data!r}")
 
 
-def set_up_listener():
-    listener = socket.socket()
-    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    listener.bind(("127.0.0.1", 0))
-    listener.listen()
-    listener.settimeout(SOCKET_TIMEOUT)
-    return listener
-
-
 def find_available_port():
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", 0))
         return probe.getsockname()[1]
 
 
-def connect_with_retry(port):
-    deadline = time.monotonic() + SOCKET_TIMEOUT
-    while time.monotonic() < deadline:
-        try:
-            sock = socket.create_connection(("127.0.0.1", port), timeout=0.2)
-            sock.settimeout(SOCKET_TIMEOUT)
-            return sock
-        except OSError:
-            time.sleep(0.02)
-    raise RuntimeError("proxy did not begin listening")
-
-
 class ProxyHarness:
-    def __init__(self, orbit_binary):
-        self.backend_listener = set_up_listener()
+    def __init__(self):
+        self.resources = ExitStack()
+        self.command = []
+        self.process = None
+        self.shutdown_requested = False
+        self.exit_checked = False
+
+    def start(self, orbit_command):
+        self.command = list(orbit_command)
+        self.log = self.resources.enter_context(tempfile.TemporaryFile())
+        self.resources.callback(self.stop_and_report)
+        self.backend_listener = self.resources.enter_context(socket.socket())
+        self.backend_listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.backend_listener.bind(("127.0.0.1", 0))
+        self.backend_listener.listen()
+        self.backend_listener.setblocking(False)
         backend_port = self.backend_listener.getsockname()[1]
         self.proxy_port = find_available_port()
-        self.sockets = []
-        self.output = None
-
+        self.command.extend([
+            "--listen-host", "127.0.0.1",
+            "--listen-port", str(self.proxy_port),
+            "--upstream", f"127.0.0.1:{backend_port}",
+            "--log-level", "info",
+        ])
         self.process = subprocess.Popen(
-            [
-                orbit_binary,
-                "--listen-host",
-                "127.0.0.1",
-                "--listen-port",
-                str(self.proxy_port),
-                "--upstream",
-                f"127.0.0.1:{backend_port}",
-            ],
-            stdout=subprocess.PIPE,
+            self.command,
+            stdout=self.log,
             stderr=subprocess.STDOUT,
-            text=True,
         )
+        self.wait_for_readiness()
+
+    def require_running(self, operation):
+        exit_code = self.process.poll()
+        if exit_code is not None:
+            raise RuntimeError(f"Orbit exited with status {exit_code} while {operation}")
+
+    def wait_for_readiness(self):
+        deadline = time.monotonic() + STARTUP_TIMEOUT
+        while (remaining := deadline - time.monotonic()) > 0:
+            self.require_running("starting")
+            if READY_MESSAGE in os.pread(self.log.fileno(), LOG_LIMIT, 0):
+                return
+            time.sleep(min(POLL_INTERVAL, remaining))
+        raise TimeoutError(f"Orbit did not report listener readiness within {STARTUP_TIMEOUT}s")
 
     def connect_session(self):
-        client = connect_with_retry(self.proxy_port)
-        backend, _ = self.backend_listener.accept()
-        backend.settimeout(SOCKET_TIMEOUT)
-        self.sockets.extend((client, backend))
-        return client, backend
+        self.require_running("connecting a client")
+        client = self.resources.enter_context(
+            socket.create_connection(("127.0.0.1", self.proxy_port), timeout=SOCKET_TIMEOUT)
+        )
+        deadline = time.monotonic() + SOCKET_TIMEOUT
+        while (remaining := deadline - time.monotonic()) > 0:
+            self.require_running("waiting for the upstream connection")
+            readable, _, _ = select.select(
+                [self.backend_listener], [], [], min(POLL_INTERVAL, remaining)
+            )
+            if readable:
+                try:
+                    backend, _ = self.backend_listener.accept()
+                except BlockingIOError:
+                    continue
+                self.resources.enter_context(backend)
+                backend.settimeout(SOCKET_TIMEOUT)
+                return client, backend
+        raise TimeoutError(f"backend did not receive Orbit's connection within {SOCKET_TIMEOUT}s")
 
-    def wait(self, timeout=SOCKET_TIMEOUT):
-        exit_code = self.process.wait(timeout=timeout)
-        self._collect_output()
-        return exit_code
+    def request_shutdown(self):
+        self.require_running("requesting shutdown")
+        self.process.terminate()
+        self.shutdown_requested = True
+
+    def wait_for_shutdown_request(self):
+        # Orbit blocks SIGTERM and consumes it through signalfd. Wait for the
+        # first request to leave the process-wide pending mask before sending another.
+        deadline = time.monotonic() + SHUTDOWN_TIMEOUT
+        sigterm_mask = 1 << (signal.SIGTERM - 1)
+        while (remaining := deadline - time.monotonic()) > 0:
+            self.require_running("waiting for Orbit to receive SIGTERM")
+            with open(f"/proc/{self.process.pid}/status") as status:
+                for line in status:
+                    if line.startswith("ShdPnd:"):
+                        if (int(line.split()[1], 16) & sigterm_mask) == 0:
+                            return
+                        break
+                else:
+                    raise RuntimeError("Orbit's /proc status has no ShdPnd field")
+            time.sleep(min(POLL_INTERVAL, remaining))
+        raise TimeoutError(f"Orbit did not consume SIGTERM within {SHUTDOWN_TIMEOUT}s")
+
+    def wait_for_clean_exit(self):
+        try:
+            exit_code = self.process.wait(timeout=SHUTDOWN_TIMEOUT)
+        except subprocess.TimeoutExpired as error:
+            raise TimeoutError(f"Orbit did not exit within {SHUTDOWN_TIMEOUT}s") from error
+        self.exit_checked = True
+        if exit_code != 0:
+            raise RuntimeError(f"Orbit exited with status {exit_code} during shutdown")
+
+    def stop_and_report(self):
+        try:
+            if self.process is None or self.exit_checked:
+                return
+            exit_code = self.process.poll()
+            if exit_code is not None and not self.shutdown_requested:
+                raise RuntimeError(f"Orbit exited unexpectedly with status {exit_code}")
+            if exit_code is None:
+                if not self.shutdown_requested:
+                    self.process.terminate()
+                try:
+                    exit_code = self.process.wait(timeout=SHUTDOWN_TIMEOUT)
+                except subprocess.TimeoutExpired:
+                    self.process.kill()
+                    try:
+                        self.process.wait(timeout=KILL_TIMEOUT)
+                    except subprocess.TimeoutExpired as error:
+                        raise TimeoutError(
+                            f"could not reap Orbit within {KILL_TIMEOUT}s of SIGKILL"
+                        ) from error
+                    raise TimeoutError(
+                        f"Orbit required SIGKILL after {SHUTDOWN_TIMEOUT}s of cleanup"
+                    )
+            if exit_code != 0:
+                raise RuntimeError(f"Orbit exited with status {exit_code} during cleanup")
+        finally:
+            self.report()
+
+    def report(self):
+        print(f"Orbit command: {shlex.join(self.command)}")
+        if self.process is not None:
+            print(f"Orbit PID: {self.process.pid}, exit status: {self.process.returncode}")
+        log_fd = self.log.fileno()
+        size = os.fstat(log_fd).st_size
+        print("Orbit stdout and stderr:")
+        if size <= LOG_LIMIT:
+            print(os.pread(log_fd, size, 0).decode(errors="replace"))
+        else:
+            half = LOG_LIMIT // 2
+            print(os.pread(log_fd, half, 0).decode(errors="replace"))
+            print(f"... omitted {size - LOG_LIMIT} bytes ...")
+            print(os.pread(log_fd, half, size - half).decode(errors="replace"))
 
     def close(self):
-        for sock in reversed(self.sockets):
-            try:
-                sock.close()
-            except OSError:
-                pass
-        self.backend_listener.close()
-
-        if self.process.poll() is None:
-            self.process.send_signal(signal.SIGTERM)
-            try:
-                self.process.wait(timeout=1)
-            except subprocess.TimeoutExpired:
-                self.process.kill()
-                self.process.wait()
-
-        if self.output is None:
-            self._collect_output()
-
-    def _collect_output(self):
-        self.output = self.process.stdout.read()
-        self.process.stdout.close()
+        self.resources.close()
 
 
 def finish_session(client, backend):
@@ -155,19 +245,10 @@ HANGUP_PAYLOAD = bytes(range(256)) * 512
 
 
 class ProxySessionIntegrationTest(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.orbit_binary = ORBIT_BINARY
-
     def setUp(self):
-        self.proxy = ProxyHarness(self.orbit_binary)
-
-    def tearDown(self):
-        self.proxy.close()
-
-    def assert_clean_exit(self):
-        exit_code = self.proxy.wait()
-        self.assertEqual(0, exit_code, self.proxy.output)
+        self.proxy = ProxyHarness()
+        self.addCleanup(self.proxy.close)
+        self.proxy.start([self.orbit_binary])
 
     def test_socket_failure_is_isolated_to_its_session(self):
         failed_client, failed_backend = self.proxy.connect_session()
@@ -188,8 +269,8 @@ class ProxySessionIntegrationTest(unittest.TestCase):
 
         failed_client.close()
         finish_session(healthy_client, healthy_backend)
-        self.proxy.process.send_signal(signal.SIGTERM)
-        self.assert_clean_exit()
+        self.proxy.request_shutdown()
+        self.proxy.wait_for_clean_exit()
 
     def test_session_churn_does_not_disturb_an_active_session(self):
         persistent_client, persistent_backend = self.proxy.connect_session()
@@ -211,8 +292,8 @@ class ProxySessionIntegrationTest(unittest.TestCase):
         self.assertEqual(b"persistent-response", recv_message(persistent_client))
 
         finish_session(persistent_client, persistent_backend)
-        self.proxy.process.send_signal(signal.SIGTERM)
-        self.assert_clean_exit()
+        self.proxy.request_shutdown()
+        self.proxy.wait_for_clean_exit()
 
     def test_client_half_close_is_propagated_after_data(self):
         client, backend = self.proxy.connect_session()
@@ -231,8 +312,8 @@ class ProxySessionIntegrationTest(unittest.TestCase):
         self.assertEqual(response, recv_exact(client, len(response)))
         expect_eof(client)
 
-        self.proxy.process.send_signal(signal.SIGTERM)
-        self.assert_clean_exit()
+        self.proxy.request_shutdown()
+        self.proxy.wait_for_clean_exit()
 
     def test_backend_half_close_keeps_client_to_backend_direction_open(self):
         client, backend = self.proxy.connect_session()
@@ -251,8 +332,8 @@ class ProxySessionIntegrationTest(unittest.TestCase):
         self.assertEqual(request, recv_exact(backend, len(request)))
         expect_eof(backend)
 
-        self.proxy.process.send_signal(signal.SIGTERM)
-        self.assert_clean_exit()
+        self.proxy.request_shutdown()
+        self.proxy.wait_for_clean_exit()
 
     def test_large_bidirectional_transfers_survive_backpressure(self):
         client, backend = self.proxy.connect_session()
@@ -272,8 +353,8 @@ class ProxySessionIntegrationTest(unittest.TestCase):
             send.result(timeout=SOCKET_TIMEOUT)
 
         finish_session(client, backend)
-        self.proxy.process.send_signal(signal.SIGTERM)
-        self.assert_clean_exit()
+        self.proxy.request_shutdown()
+        self.proxy.wait_for_clean_exit()
 
     def test_graceful_shutdown_waits_for_active_session(self):
         client, backend = self.proxy.connect_session()
@@ -281,9 +362,9 @@ class ProxySessionIntegrationTest(unittest.TestCase):
         send_message(client, b"request-before-shutdown")
         self.assertEqual(b"request-before-shutdown", recv_message(backend))
 
-        self.proxy.process.send_signal(signal.SIGTERM)
-        time.sleep(0.05)
-        self.assertIsNone(self.proxy.process.poll(), self.proxy.output)
+        self.proxy.request_shutdown()
+        self.proxy.wait_for_shutdown_request()
+        self.assertIsNone(self.proxy.process.poll())
 
         send_message(client, b"request-during-shutdown")
         self.assertEqual(b"request-during-shutdown", recv_message(backend))
@@ -291,7 +372,7 @@ class ProxySessionIntegrationTest(unittest.TestCase):
         self.assertEqual(b"response-during-shutdown", recv_message(client))
 
         finish_session(client, backend)
-        self.assert_clean_exit()
+        self.proxy.wait_for_clean_exit()
 
     def test_client_full_hangup_delivers_its_data_without_loss(self):
         # Drive the client socket into a full hangup (EPOLLHUP): the proxy half-closes the client
@@ -316,8 +397,8 @@ class ProxySessionIntegrationTest(unittest.TestCase):
         self.assertEqual(HANGUP_PAYLOAD, recv_exact(backend, len(HANGUP_PAYLOAD)))
         expect_eof(backend)
 
-        self.proxy.process.send_signal(signal.SIGTERM)
-        self.assert_clean_exit()
+        self.proxy.request_shutdown()
+        self.proxy.wait_for_clean_exit()
 
     def test_backend_full_hangup_delivers_its_data_without_loss(self):
         # Symmetric to the client-hangup case: the backend socket reaches a full hangup while the
@@ -337,8 +418,8 @@ class ProxySessionIntegrationTest(unittest.TestCase):
         self.assertEqual(HANGUP_PAYLOAD, recv_exact(client, len(HANGUP_PAYLOAD)))
         expect_eof(client)
 
-        self.proxy.process.send_signal(signal.SIGTERM)
-        self.assert_clean_exit()
+        self.proxy.request_shutdown()
+        self.proxy.wait_for_clean_exit()
 
     def test_hung_up_endpoint_does_not_keep_the_reactor_busy(self):
         # Guards against a regression in which a hung-up endpoint keeps producing events: EPOLLHUP
@@ -370,8 +451,8 @@ class ProxySessionIntegrationTest(unittest.TestCase):
         )
 
         expect_eof(backend)
-        self.proxy.process.send_signal(signal.SIGTERM)
-        self.assert_clean_exit()
+        self.proxy.request_shutdown()
+        self.proxy.wait_for_clean_exit()
 
     def test_second_shutdown_signal_force_closes_active_sessions(self):
         client, backend = self.proxy.connect_session()
@@ -379,15 +460,78 @@ class ProxySessionIntegrationTest(unittest.TestCase):
         send_message(client, b"request-before-hard-shutdown")
         self.assertEqual(b"request-before-hard-shutdown", recv_message(backend))
 
-        self.proxy.process.send_signal(signal.SIGTERM)
-        time.sleep(0.05)
-        self.assertIsNone(self.proxy.process.poll(), self.proxy.output)
+        self.proxy.request_shutdown()
+        self.proxy.wait_for_shutdown_request()
+        self.assertIsNone(self.proxy.process.poll())
 
-        self.proxy.process.send_signal(signal.SIGTERM)
-        self.assert_clean_exit()
+        self.proxy.request_shutdown()
+        self.proxy.wait_for_clean_exit()
         expect_eof(client)
         expect_eof(backend)
 
 
+class ProxyHarnessTest(unittest.TestCase):
+    def setUp(self):
+        self.proxy = ProxyHarness()
+        self.addCleanup(self.proxy.close)
+
+    def start_child(self, script):
+        self.proxy.start([sys.executable, "-u", "-c", textwrap.dedent(script)])
+
+    def test_early_exit_fails_even_with_zero_status(self):
+        with self.assertRaisesRegex(RuntimeError, "exited with status 0 while starting"):
+            self.start_child("print('startup failed')")
+        report = io.StringIO()
+        with redirect_stdout(report):
+            with self.assertRaisesRegex(RuntimeError, "exited unexpectedly with status 0"):
+                self.proxy.close()
+        self.assertIn("\nstartup failed\n", report.getvalue())
+        self.assertEqual(-1, self.proxy.backend_listener.fileno())
+        self.assertTrue(self.proxy.log.closed)
+
+    def test_nonzero_shutdown_retains_output_larger_than_a_pipe(self):
+        self.start_child("""
+            import os
+            import signal
+            import sys
+
+            def fail_shutdown(*_):
+                print("x" * (2 * 1024 * 1024))
+                print("shutdown failure", file=sys.stderr)
+                os._exit(86)
+
+            signal.signal(signal.SIGTERM, fail_shutdown)
+            print("Starting proxying traffic...")
+            while True:
+                signal.pause()
+        """)
+        self.proxy.request_shutdown()
+        with self.assertRaisesRegex(RuntimeError, "exited with status 86 during shutdown"):
+            self.proxy.wait_for_clean_exit()
+        report = io.StringIO()
+        with redirect_stdout(report):
+            self.proxy.close()
+        self.assertIn("exit status: 86", report.getvalue())
+        self.assertIn("bytes ...", report.getvalue())
+        self.assertIn("\nshutdown failure\n", report.getvalue())
+
+    def test_cleanup_kills_and_reaps_unresponsive_child(self):
+        self.start_child("""
+            import signal
+
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            print("Starting proxying traffic...")
+            while True:
+                signal.pause()
+        """)
+        with mock.patch.object(sys.modules[__name__], "SHUTDOWN_TIMEOUT", 0.1):
+            with self.assertRaisesRegex(TimeoutError, "required SIGKILL"):
+                self.proxy.close()
+        self.assertEqual(-signal.SIGKILL, self.proxy.process.returncode)
+        self.assertEqual(-1, self.proxy.backend_listener.fileno())
+        self.assertTrue(self.proxy.log.closed)
+
+
 if __name__ == "__main__":
-    unittest.main(verbosity=2)
+    ProxySessionIntegrationTest.orbit_binary = sys.argv.pop(1)
+    unittest.main(verbosity=2, buffer=True)

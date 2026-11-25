@@ -12,8 +12,8 @@ Orbit accepts options on the command line or through the corresponding environme
 Use `HOST:PORT` for DNS names and IPv4 addresses and `[ADDRESS]:PORT` for IPv6. A host must be nonempty. An upstream port must consist of decimal digits with a value from 1 through 65535. Parsing checks endpoint syntax. Resolution and binding take place during startup.
 
 ```sh
-./build/orbit --upstream 127.0.0.1:7000 --upstream '[2001:db8::1]:7000'
-ORBIT_UPSTREAMS='127.0.0.1:7000,[2001:db8::1]:7000' ./build/orbit
+./build/debug/orbit --upstream 127.0.0.1:7000 --upstream '[2001:db8::1]:7000'
+ORBIT_UPSTREAMS='127.0.0.1:7000,[2001:db8::1]:7000' ./build/debug/orbit
 ```
 
 All upstream entries are parsed in input order. Only the first configured endpoint is resolved and used at runtime. Each new connection can try later resolved addresses for that endpoint if earlier addresses fail. If resolution of the first endpoint fails, startup fails.
