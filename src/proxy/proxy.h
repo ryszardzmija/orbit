@@ -51,6 +51,8 @@ public:
     [[nodiscard]] Status<ProxyRuntimeError> start();
 
 private:
+    friend class ProxyReactorTest;
+
     constexpr static size_t block_size = 4096;
     constexpr static size_t high_watermark = block_size * 64;
     constexpr static size_t low_watermark = block_size * 48;
@@ -92,11 +94,13 @@ private:
     Status<std::error_code> unregisterReactorSource(detail::SourceId id);
 
     // Session lifecycle
-    Status<AddSessionError> addSession(FileDescriptor upstream_fd, FileDescriptor downstream_fd);
+    Result<detail::SessionId, AddSessionError> addSession(FileDescriptor upstream_fd,
+                                                          FileDescriptor downstream_fd);
     Status<std::error_code> closeSession(detail::SessionId session_id);
     void closeSessionAndLog(detail::SessionId session_id);
 
     // Event handlers
+    Status<FatalReactorError> dispatch(detail::ReadyEvent event);
     Status<FatalReactorError> handleEndpoint(detail::EndpointRegistration registration,
                                              uint32_t event_mask);
     Status<FatalReactorError> handleShutdownSignal(detail::ShutdownSignalRegistration);

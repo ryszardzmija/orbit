@@ -1,28 +1,18 @@
+#include <algorithm>
 #include <array>
 #include <cerrno>
 #include <string>
-#include <system_error>
 
 #include <gtest/gtest.h>
 #include <sys/socket.h>
 
 #include "proxy/detail/session/session_manager.h"
+#include "socket_pair.h"
 
 namespace orbit::proxy::detail {
 namespace {
 
-struct SocketPair {
-    FileDescriptor local;
-    FileDescriptor peer;
-};
-
-SocketPair socketPair() {
-    int fds[2];
-    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, fds) < 0) {
-        throw std::system_error(errno, std::system_category(), "socketpair");
-    }
-    return {FileDescriptor(fds[0]), FileDescriptor(fds[1])};
-}
+using test::socketPair;
 
 class HangupTest : public testing::TestWithParam<EndpointRole> {};
 
@@ -66,6 +56,7 @@ TEST_P(HangupTest, PausedQueuePreservesResidualInputUntilTheDestinationDrains) {
         ASSERT_EQ(SessionEventAction::KeepOpen, manager.handleReadable(id, role).action);
     }
     ASSERT_FALSE(source_interests().readable); // 12 queued, high watermark 9.
+    ASSERT_EQ(SessionEventAction::KeepOpen, manager.handleReadable(id, role).action); // Stale IN.
     ASSERT_EQ(SessionEventAction::KeepOpen, manager.handleHangup(id, role).action);
     EXPECT_TRUE(source_interests().edge_triggered);
     EXPECT_FALSE(manager.shouldRetire(id, role));

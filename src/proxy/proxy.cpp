@@ -175,24 +175,7 @@ Status<ProxyRuntimeError> ProxyReactor::start() {
         }
 
         for (const detail::ReadyEvent& event : *wait_result) {
-            auto registration = sources_.find(event.source_id);
-
-            if (!registration) {
-                continue;
-            }
-
-            auto handler_result = std::visit(
-                overloaded{
-                    [&](detail::EndpointRegistration r) { return handleEndpoint(r, event.events); },
-                    [&](detail::ListenerRegistration r) { return handleListener(r); },
-                    [&](detail::ShutdownSignalRegistration r) { return handleShutdownSignal(r); },
-                    [&](detail::ShutdownTimerRegistration r) { return handleShutdownTimer(r); },
-                    [&](detail::PendingDialRegistration r) {
-                        return handlePendingConnection(event.source_id, r);
-                    },
-                },
-                *registration);
-
+            auto handler_result = dispatch(event);
             if (!handler_result) {
                 spdlog::error("Error in reactor event handler: {}", handler_result.error().message);
                 return std::unexpected(ProxyRuntimeError{handler_result.error().message});
@@ -207,6 +190,26 @@ Status<ProxyRuntimeError> ProxyReactor::start() {
     return {};
 }
 
+Status<FatalReactorError> ProxyReactor::dispatch(detail::ReadyEvent event) {
+    auto registration = sources_.find(event.source_id);
+
+    if (!registration) {
+        return {};
+    }
+
+    return std::visit(
+        overloaded{
+            [&](detail::EndpointRegistration r) { return handleEndpoint(r, event.events); },
+            [&](detail::ListenerRegistration r) { return handleListener(r); },
+            [&](detail::ShutdownSignalRegistration r) { return handleShutdownSignal(r); },
+            [&](detail::ShutdownTimerRegistration r) { return handleShutdownTimer(r); },
+            [&](detail::PendingDialRegistration r) {
+                return handlePendingConnection(event.source_id, r);
+            },
+        },
+        *registration);
+}
+
 Status<std::error_code> ProxyReactor::closeSession(detail::SessionId session_id) {
     if (!session_manager_.contains(session_id)) {
         return {};
@@ -215,22 +218,12 @@ Status<std::error_code> ProxyReactor::closeSession(detail::SessionId session_id)
     detail::SessionSourceIds source_ids = session_manager_.sourceIds(session_id);
     std::optional<std::error_code> first_error;
 
-    // An endpoint that hung up is retired during interest synchronization, so only retire the
-    // endpoints that are still watched to avoid deregistering them twice.
-    if (poller_.isWatching(source_ids.downstream)) {
-        if (auto result = poller_.retire(source_ids.downstream); !result) {
-            first_error = result.error();
-        }
-        sources_.remove(source_ids.downstream);
-    }
-
-    if (poller_.isWatching(source_ids.upstream)) {
-        if (auto result = poller_.retire(source_ids.upstream); !result) {
-            if (!first_error) {
+    for (auto id : {source_ids.downstream, source_ids.upstream}) {
+        if (poller_.isWatching(id)) {
+            if (auto result = unregisterReactorSource(id); !result && !first_error) {
                 first_error = result.error();
             }
         }
-        sources_.remove(source_ids.upstream);
     }
 
     session_manager_.remove(session_id);
@@ -277,12 +270,9 @@ ProxyReactor::registerEndpoint(int fd, uint32_t initial_interests, detail::Sessi
 }
 
 Status<std::error_code> ProxyReactor::unregisterReactorSource(detail::SourceId id) {
-    if (auto result = poller_.remove(id); !result) {
-        return result;
-    }
-
+    auto result = poller_.retire(id);
     sources_.remove(id);
-    return {};
+    return result;
 }
 
 Result<detail::SourceId, std::error_code> ProxyReactor::registerListener(int fd) {
@@ -323,8 +313,8 @@ ProxyReactor::registerPendingConnection(detail::PendingConnection pending_connec
 
 // If everything succeeds both endpoints are registered and SessionManager assumes ownership of
 // their file descriptors. If registration fails, the reactor source changes are rolled back.
-Status<AddSessionError> ProxyReactor::addSession(FileDescriptor upstream_fd,
-                                                 FileDescriptor downstream_fd) {
+Result<detail::SessionId, AddSessionError> ProxyReactor::addSession(FileDescriptor upstream_fd,
+                                                                    FileDescriptor downstream_fd) {
     detail::SessionId session_id = session_manager_.allocateId();
     uint32_t initial_events = EPOLLIN | EPOLLRDHUP;
 
@@ -364,7 +354,7 @@ Status<AddSessionError> ProxyReactor::addSession(FileDescriptor upstream_fd,
                              .upstream = upstream_id,
                          });
 
-    return {};
+    return session_id;
 }
 
 Status<FatalReactorError> ProxyReactor::handleEndpoint(detail::EndpointRegistration registration,
@@ -406,7 +396,8 @@ Status<FatalReactorError> ProxyReactor::handleEndpoint(detail::EndpointRegistrat
         if (!result) {
             return std::unexpected(result.error());
         }
-        if (*result == EndpointEventOutcome::SessionClosed) {
+        if (*result == EndpointEventOutcome::SessionClosed ||
+            session_manager_.shouldRetire(session_id, registration.role)) {
             return {};
         }
     }
@@ -456,11 +447,7 @@ ProxyReactor::synchronizeEndpoint(detail::SessionId session_id, detail::Endpoint
         if (!poller_.isWatching(source_id)) {
             return {};
         }
-        if (auto result = poller_.retire(source_id); !result) {
-            return result;
-        }
-        sources_.remove(source_id);
-        return {};
+        return unregisterReactorSource(source_id);
     }
 
     return poller_.setInterests(source_id, getEventMask(interests));

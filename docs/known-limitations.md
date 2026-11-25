@@ -17,11 +17,8 @@ Source baseline is `e3aec7b`. A source-confirmed finding follows from the implem
 
 ## LIM-003 — A live event can outlast its read interest
 
-- **Classification and priority** — Suspected defect, high.
-- **Source and evidence** — [`ProxyReactor::start` and `handleEndpoint`](../src/proxy/proxy.cpp) look up the source and session but use the copied event mask for dispatch. [`SessionManager::handleHangup` and `getInterests`](../src/proxy/detail/session/session_manager.cpp) can mark one endpoint write-closed, retire it from epoll and remove the other endpoint's readable interest. `handleReadable` calls [`Forwarder::forward`](../src/proxy/detail/forwarding.cpp) without rechecking the destination's write state.
-- **Conditions and impact** — One endpoint hangs up and the session remains alive to flush queued data to the other endpoint. A following event in the same batch for that still-registered endpoint may include an older readable flag. The read can target a retired peer, queue bytes for an undeliverable direction or fail a direct send and close the session before all surviving output flushes. The fd is still owned by the same session.
-- **Verification** — Plausible source path. The actual batch ordering and downstream outcome have no targeted test or runtime reproduction.
-- **Follow-up** — In M1.2, check current direction eligibility at dispatch, with explicit handling for error and hangup flags. Use a controlled batch regression to verify that an outdated readable flag cannot interrupt the surviving direction.
+- **Disposition** — Resolved in M1.2. Every event resolves its value identity in the current registry. Directional I/O checks current eligibility, and retirement or session teardown ends dispatch of the remaining flags. Error and full hangup have explicit precedence.
+- **Verification** — Controlled dispatch tests retain an old event across actual numeric fd reuse, retire a source while its peer still owns queued output, and deliver stale readable and writable flags across hangup and teardown.
 
 ## LIM-004 — Pending dials have no application deadline
 
@@ -60,8 +57,8 @@ Source baseline is `e3aec7b`. A source-confirmed finding follows from the implem
 - **Classification and priority** — Architectural risk, low.
 - **Source and evidence** — [`EpollPoller::add`](../src/proxy/detail/epoll/epoll_poller.cpp) stores a `SourceId` in `epoll_event.data.u64`. [`ReactorSources::find` and `remove`](../src/proxy/detail/sources/reactor_sources.cpp) and [`ProxyReactor::closeSession`](../src/proxy/proxy.cpp) make a retired source unresolvable, protecting against ordinary numeric fd reuse. [`MonotonicIdGenerator::getNextId`](../src/proxy/detail/id/generator.h) increments a `uint64_t` without wrap handling. Source, session and pending IDs use independent instances.
 - **Conditions and impact** — A reused fd gets a fresh source ID during ordinary operation. If a generator traverses its 64-bit space, a subsequent ID may alias a live registration or a retained identity. The current lifetime of readiness batches and size of the ID space make wrap a low priority. Future delayed work can extend the lifetime of identities.
-- **Verification** — Source-confirmed fd reuse protection and absent wrap policy. No ordinary fd reuse defect was established. The churn integration test gives indirect coverage and does not control fd reuse or inject stale events.
-- **Follow-up** — In M1.2, test source invalidation and old events around teardown. Preserve ID-lifetime rules when adding timers, cancellation and scheduled work. Document generator exhaustion when extending identity APIs.
+- **Verification** — Source-confirmed fd reuse protection and absent wrap policy. M1.2 confirmed ordinary fd reuse protection with a reused fd and a previous registration’s event.
+- **Follow-up** — The generator still wraps after the full 64-bit space. M1.2 retained its existing lifetime assumption. Preserve identity checks for scheduled work.
 
 ## LIM-009 — Reactor work budgets are incomplete
 
@@ -83,10 +80,10 @@ Source baseline is `e3aec7b`. A source-confirmed finding follows from the implem
 ## LIM-011 — Fault and readiness tests leave gaps
 
 - **Classification and priority** — Testing gap, high.
-- **Source and evidence** — [GoogleTest units](../tests/CMakeLists.txt) cover syntax, address formatting and queue logic. [Loopback integration](../tests/integration/proxy_sessions_test.py) covers established traffic, one upstream reset, churn, half-close, ordinary full hangup, idle CPU and signal escalation. The large-transfer test does not observe exact buffer occupancy or control partial syscall results. M1.1 adds controlled saturated hangups in both directions. Remaining gaps include a stale ready batch, pending dial failures and address fallback deterministically, pending shutdown, timer-only escalation, fd exhaustion, registration rollback faults or live IPv6 forwarding.
+- **Source and evidence** — [GoogleTest units](../tests/CMakeLists.txt) cover syntax, address formatting and queue logic. [Loopback integration](../tests/integration/proxy_sessions_test.py) covers established traffic, one upstream reset, churn, half-close, ordinary full hangup, idle CPU and signal escalation. The large-transfer test does not observe exact buffer occupancy or control partial syscall results. M1.1 adds controlled saturated hangups in both directions. M1.2 adds controlled stale batches and fd reuse. Remaining gaps include pending dial failures and address fallback deterministically, pending shutdown, timer-only escalation, fd exhaustion, registration rollback faults or live IPv6 forwarding.
 - **Conditions and impact** — Regressions in rare event combinations and failures can pass the existing suite. The harness still uses deliberate delays for reset, slow-reader and idle-CPU scenarios. Orbit's CLI rejects port zero, so the bind-after-release window for its listener still exists. It can cause a startup failure if another process takes the port.
 - **Verification** — Confirmed by test inventory. Churn and transfer cases are useful indirect coverage with limited control over the targeted state.
-- **Follow-up** — Add controlled stale-event coverage in M1.2. Select deterministic fault and timeout coverage when modifying the other paths. See LIM-016 for the M0.2 harness fixes.
+- **Follow-up** — Select deterministic fault and timeout coverage when modifying the other paths. See LIM-016 for the M0.2 harness fixes.
 
 ## LIM-012 — Configuration and README overstated current guarantees
 
