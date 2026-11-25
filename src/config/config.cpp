@@ -114,6 +114,7 @@ std::expected<Config, ConfigError> parseConfig(int argc, char** argv) {
     std::vector<std::string> upstream_values;
 
     auto connect_ms = std::to_string(config.timeouts.connect.count());
+    auto idle_ms = std::to_string(config.timeouts.idle.count());
 
     CLI::App app("orbit - a TCP reverse proxy");
     app.set_version_flag("--version", "orbit 0.1.0");
@@ -147,10 +148,16 @@ std::expected<Config, ConfigError> parseConfig(int argc, char** argv) {
         ->envname("ORBIT_CONNECT_TIMEOUT_MS")
         ->capture_default_str();
 
+    app.add_option("--idle-timeout-ms", idle_ms,
+                   "Established session idle timeout in milliseconds (0 disables)")
+        ->envname("ORBIT_IDLE_TIMEOUT_MS")
+        ->capture_default_str();
+
     try {
         app.parse(argc, argv);
 
         config.timeouts.connect = parseTimeout(connect_ms, "--connect-timeout-ms", 1);
+        config.timeouts.idle = parseTimeout(idle_ms, "--idle-timeout-ms", 0);
 
         config.upstreams.reserve(upstream_values.size());
         for (const std::string& upstream_value : upstream_values) {

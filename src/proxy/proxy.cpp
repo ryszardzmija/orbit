@@ -91,6 +91,9 @@ ProxyReactor::create(const net::ListenSocketAddress& listen_address,
     if (timeouts.connect.count() < 1 || timeouts.connect > TimeoutConfig::maximum) {
         return std::unexpected(ProxyCreateError{"Invalid connection timeout"});
     }
+    if (timeouts.idle.count() < 0 || timeouts.idle > TimeoutConfig::maximum) {
+        return std::unexpected(ProxyCreateError{"Invalid idle timeout"});
+    }
     auto poller_create_result = detail::EpollPoller::create();
     if (!poller_create_result) {
         return std::unexpected(ProxyCreateError{poller_create_result.error().message()});
@@ -202,6 +205,9 @@ Status<std::error_code> ProxyReactor::closeSession(detail::SessionId session_id)
         return {};
     }
 
+    if (timeouts_.idle.count() > 0) {
+        deadlines_.cancel({detail::DeadlineKind::Idle, session_id});
+    }
     detail::SessionSourceIds source_ids = session_manager_.sourceIds(session_id);
     std::optional<std::error_code> first_error;
 
@@ -377,6 +383,10 @@ Result<detail::SessionId, AddSessionError> ProxyReactor::addSession(FileDescript
                              .upstream = upstream_id,
                          });
 
+    if (timeouts_.idle.count() > 0) {
+        deadlines_.schedule({detail::DeadlineKind::Idle, session_id},
+                            detail::DeadlineClock::now() + timeouts_.idle);
+    }
     return session_id;
 }
 
@@ -388,16 +398,23 @@ Status<FatalReactorError> ProxyReactor::handleEndpoint(detail::EndpointRegistrat
         return {};
     }
 
+    std::optional<detail::IdleDeadline> idle_deadline;
+    if (timeouts_.idle.count() > 0) {
+        auto at = deadlines_.scheduledAt({detail::DeadlineKind::Idle, session_id});
+        idle_deadline.emplace(at.value(), timeouts_.idle);
+    }
+    auto* idle = idle_deadline ? &*idle_deadline : nullptr;
+
     using SessionEventHandler = detail::SessionEventResult (detail::SessionManager::*)(
-        detail::SessionId, detail::EndpointRole);
+        detail::SessionId, detail::EndpointRole, detail::IdleDeadline*);
 
     // Error and full hangup supersede ordinary readiness in the same notification.
     // A full hangup has its own bounded read and cannot accept queued output.
     if (event_mask & (EPOLLERR | EPOLLHUP)) {
         auto result = (event_mask & EPOLLERR)
                           ? session_manager_.handleError(session_id, registration.role)
-                          : session_manager_.handleHangup(session_id, registration.role);
-        if (auto applied = applySessionEventResult(session_id, result); !applied) {
+                          : session_manager_.handleHangup(session_id, registration.role, idle);
+        if (auto applied = applySessionEventResult(session_id, result, idle); !applied) {
             return std::unexpected(applied.error());
         }
         return {};
@@ -415,7 +432,7 @@ Status<FatalReactorError> ProxyReactor::handleEndpoint(detail::EndpointRegistrat
         }
 
         auto result = applySessionEventResult(
-            session_id, (session_manager_.*handler)(session_id, registration.role));
+            session_id, (session_manager_.*handler)(session_id, registration.role, idle), idle);
         if (!result) {
             return std::unexpected(result.error());
         }
@@ -430,16 +447,22 @@ Status<FatalReactorError> ProxyReactor::handleEndpoint(detail::EndpointRegistrat
 
 Result<ProxyReactor::EndpointEventOutcome, FatalReactorError>
 ProxyReactor::applySessionEventResult(detail::SessionId session_id,
-                                      const detail::SessionEventResult& event_result) {
+                                      const detail::SessionEventResult& event_result,
+                                      detail::IdleDeadline* idle) {
     if (event_result.error) {
         spdlog::error("Error in session {}: {}", session_id, *event_result.error);
     }
 
-    if (event_result.action == detail::SessionEventAction::Close) {
+    if (event_result.action == detail::SessionEventAction::Close || (idle && idle->expired())) {
         closeSessionAndLog(session_id);
         return EndpointEventOutcome::SessionClosed;
     }
 
+    if (idle) {
+        if (auto at = idle->takeRefresh()) {
+            deadlines_.schedule({detail::DeadlineKind::Idle, session_id}, *at);
+        }
+    }
     if (auto result = synchronizeSessionInterests(session_id); !result) {
         return std::unexpected(FatalReactorError{result.error().message()});
     }
@@ -518,16 +541,20 @@ Status<std::error_code> ProxyReactor::synchronizeTimer() {
 }
 
 Status<std::error_code> ProxyReactor::expireDeadlines(detail::Deadline now) {
+    // A burst of earlier idle expirations must not defer a due process shutdown.
+    if (shutdown_state_ == ShutdownState::GracefullyStopping &&
+        deadlines_.due(shutdown_deadline, now)) {
+        return handleShutdownRequest();
+    }
     for (int i = 0; i < max_expirations_per_dispatch; ++i) {
         auto key = deadlines_.popDue(now);
         if (!key) {
             break;
         }
-        if (key->kind == detail::DeadlineKind::Shutdown) {
-            if (shutdown_state_ == ShutdownState::GracefullyStopping) {
-                return handleShutdownRequest();
-            }
-        } else if (pending_connections_.contains(key->id)) {
+        if (key->kind == detail::DeadlineKind::Idle) {
+            closeSessionAndLog(key->id);
+        } else if (key->kind == detail::DeadlineKind::Connect &&
+                   pending_connections_.contains(key->id)) {
             auto pending = takePending(key->id);
             if (!pending) {
                 return std::unexpected(pending.error());

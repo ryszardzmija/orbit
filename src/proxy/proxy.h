@@ -124,7 +124,8 @@ private:
     // Session state synchronization
     Result<EndpointEventOutcome, FatalReactorError>
     applySessionEventResult(detail::SessionId session_id,
-                            const detail::SessionEventResult& event_result);
+                            const detail::SessionEventResult& event_result,
+                            detail::IdleDeadline* idle);
     Status<std::error_code> synchronizeSessionInterests(detail::SessionId session_id);
     Status<std::error_code> synchronizeEndpoint(detail::SessionId session_id,
                                                 detail::EndpointRole role, detail::SourceId source_id,

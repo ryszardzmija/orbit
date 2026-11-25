@@ -17,7 +17,7 @@ PendingDataSender PendingDataSender::create(size_t capacity) {
     return PendingDataSender(capacity);
 }
 
-Status<SendError> PendingDataSender::sendPending(SessionEndpoint& destination) {
+Status<SendError> PendingDataSender::sendPending(SessionEndpoint& destination, IdleDeadline* idle) {
     assert(destination.state.send_buffer != nullptr);
 
     size_t bytes_buffered =
@@ -34,6 +34,9 @@ Status<SendError> PendingDataSender::sendPending(SessionEndpoint& destination) {
     }
 
     size_t bytes_written = send_result.value().bytes_sent;
+    if (idle) {
+        idle->recordTransfer(bytes_written);
+    }
     destination.state.send_buffer->consume(bytes_written);
 
     return {};

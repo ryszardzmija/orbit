@@ -5,6 +5,7 @@
 #include <string>
 
 #include "common/status.h"
+#include "proxy/detail/session/idle_deadline.h"
 #include "proxy/detail/session/session_state.h"
 
 namespace orbit::proxy::detail {
@@ -17,7 +18,7 @@ class PendingDataSender {
 public:
     static PendingDataSender create(size_t capacity);
 
-    Status<SendError> sendPending(SessionEndpoint& destination);
+    Status<SendError> sendPending(SessionEndpoint& destination, IdleDeadline* idle);
 
 private:
     explicit PendingDataSender(size_t capacity);

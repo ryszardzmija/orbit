@@ -6,6 +6,7 @@
 #include <string>
 
 #include "common/status.h"
+#include "proxy/detail/session/idle_deadline.h"
 #include "proxy/detail/session/session_state.h"
 
 namespace orbit::proxy::detail {
@@ -25,7 +26,8 @@ class Forwarder {
 public:
     static Forwarder create(size_t capacity);
 
-    Status<ForwardError> forward(SessionEndpoint& source, SessionEndpoint& destination);
+    Status<ForwardError> forward(SessionEndpoint& source, SessionEndpoint& destination,
+                                 IdleDeadline* idle);
 
 private:
     explicit Forwarder(size_t capacity);

@@ -9,6 +9,7 @@ namespace orbit {
 struct TimeoutConfig {
     static constexpr std::chrono::milliseconds maximum{std::numeric_limits<int32_t>::max()};
     std::chrono::milliseconds connect{std::chrono::seconds(10)};
+    std::chrono::milliseconds idle{0};
 };
 
 } // namespace orbit
