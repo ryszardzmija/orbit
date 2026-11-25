@@ -22,12 +22,16 @@ connections, and active sessions. Each client is paired with its upstream socket
 streams to make progress without dedicating a thread to each connection.
 
 Data is forwarded directly when possible. If one side cannot keep up, Orbit buffers pending data
-and pauses reads until the buffer drains, applying backpressure rather than allowing unbounded
-queueing. Routine socket and forwarding failures are isolated to the affected session, while
-failures that compromise reactor state remain fatal.
+and normally pauses reads until the queue falls to its low watermark. Watermarks guide flow control.
+A hard send or receive error closes the affected session. Some dial and reactor failures end the
+process.
 
 On shutdown, Orbit stops accepting new clients and gives established sessions time to finish before
 forcing remaining connections closed.
+
+See the [architecture](docs/architecture.md) for the event loop, connection lifecycle and shutdown
+behavior, the [engineering invariants](docs/invariants.md) for correctness requirements, and
+[known limitations](docs/known-limitations.md) for the current gaps.
 
 ## Building
 
@@ -76,3 +80,4 @@ currently forwards connections through the first configured upstream.
 Orbit listens on `0.0.0.0:8080` by default and logs at `info` level; these can be changed with
 `--listen-host`, `--listen-port`, and `--log-level`. Options can also be set through corresponding
 `ORBIT_` environment variables. `ORBIT_UPSTREAMS` accepts a comma-separated list of upstreams.
+See [configuration](docs/config.md) for validation rules and the full option reference.
