@@ -75,7 +75,7 @@ std::optional<std::error_code> getFirstFatalError(const std::vector<std::error_c
 }
 
 uint32_t getEventMask(const detail::EndpointInterests& interests) {
-    uint32_t event_mask = 0;
+    uint32_t event_mask = interests.edge_triggered ? EPOLLET : 0;
     if (interests.readable) {
         event_mask |= EPOLLIN;
     }
@@ -378,26 +378,22 @@ Status<FatalReactorError> ProxyReactor::handleEndpoint(detail::EndpointRegistrat
     using SessionEventHandler = detail::SessionEventResult (detail::SessionManager::*)(
         detail::SessionId, detail::EndpointRole);
 
-    // Each ready epoll event is dispatched to the matching SessionManager handler, in priority
-    // order. EPOLLIN runs first so an endpoint is always drained before any teardown decision,
-    // and EPOLLERR runs before EPOLLHUP so an abrupt failure tears the session down rather than
-    // attempting a graceful hangup drain.
-    static constexpr std::array<std::pair<uint32_t, SessionEventHandler>, 5> handlers = {{
-        // There is at least one byte in the kernel receive buffer of the socket or EOF has been
-        // reached. Registered by default since data arrives unpredictably and we always want to
-        // try to forward it if possible.
+    // Error and full hangup supersede ordinary readiness in the same notification.
+    // A full hangup has its own bounded read and cannot accept queued output.
+    if (event_mask & (EPOLLERR | EPOLLHUP)) {
+        auto result = (event_mask & EPOLLERR)
+                          ? session_manager_.handleError(session_id, registration.role)
+                          : session_manager_.handleHangup(session_id, registration.role);
+        if (auto applied = applySessionEventResult(session_id, result); !applied) {
+            return std::unexpected(applied.error());
+        }
+        return {};
+    }
+
+    static constexpr std::array<std::pair<uint32_t, SessionEventHandler>, 3> handlers = {{
         {EPOLLIN, &detail::SessionManager::handleReadable},
-        // There is space in the kernel send buffer, or send() can accept some bytes. This is
-        // registered only while the endpoint has pending outbound data.
         {EPOLLOUT, &detail::SessionManager::handleWritable},
-        // The peer closed its outbound side. SessionManager records the state and propagates the
-        // half-close after all buffered inbound data has been forwarded.
         {EPOLLRDHUP, &detail::SessionManager::handlePeerHalfClosed},
-        // A socket-level error occurred. The session cannot continue and is torn down.
-        {EPOLLERR, &detail::SessionManager::handleError},
-        // The connection hung up. SessionManager preserves any remaining inbound data, stops
-        // writing to the socket, and closes the session once the surviving direction has drained.
-        {EPOLLHUP, &detail::SessionManager::handleHangup},
     }};
 
     for (const auto& [event_flag, handler] : handlers) {
@@ -455,10 +451,7 @@ Status<std::error_code>
 ProxyReactor::synchronizeEndpoint(detail::SessionId session_id, detail::EndpointRole role,
                                   detail::SourceId source_id,
                                   const detail::EndpointInterests& interests) {
-    // A hung-up endpoint can produce no further useful events, but EPOLLHUP is reported
-    // unconditionally, so leaving it registered would spin the reactor. Retire it from the poller
-    // while keeping the session alive so the surviving direction can finish flushing. Retirement
-    // is permanent, so a source already retired by an earlier sync is simply skipped.
+    // After residual EOF the source no longer needs even an edge-triggered watch.
     if (session_manager_.shouldRetire(session_id, role)) {
         if (!poller_.isWatching(source_id)) {
             return {};
