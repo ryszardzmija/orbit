@@ -7,5 +7,4 @@ target_link_libraries(config_tests PRIVATE
     GTest::gtest_main
 )
 
-include(GoogleTest)
-gtest_discover_tests(config_tests)
+orbit_discover_unit_tests(config_tests)

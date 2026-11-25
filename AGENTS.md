@@ -9,22 +9,22 @@ Build a resource-efficient, fault-tolerant Layer 4 TCP load balancer for Linux i
 - Read [architecture](docs/architecture.md), [engineering invariants](docs/invariants.md) and [known limitations](docs/known-limitations.md) before changing the data plane. See [configuration](docs/config.md) for the operator interface.
 - Start at [`src/main.cpp`](src/main.cpp). The reactor and its helpers live in [`src/proxy/`](src/proxy/), with sockets and resolution in [`src/net/`](src/net/). Configuration, shared ownership types, logging and signal masking live in [`src/config/`](src/config/), [`src/common/`](src/common/), [`src/logging/`](src/logging/) and [`src/signal/`](src/signal/).
 - GoogleTest suites live under [`tests/config/`](tests/config/), [`tests/net/`](tests/net/) and [`tests/proxy/`](tests/proxy/). The Python loopback harness lives in [`tests/integration/`](tests/integration/).
-- Build rules live in [`CMakeLists.txt`](CMakeLists.txt) and module CMake files. [`ci.yaml`](.github/workflows/ci.yaml) defines the Debug build and test baseline. Follow the repository's [`.clang-format`](.clang-format) and existing C++ conventions.
+- Build rules live in [`CMakeLists.txt`](CMakeLists.txt) and module CMake files. See [development](docs/development.md) for the CI matrix, toolchains and failure diagnostics. Follow the repository's [`.clang-format`](.clang-format) and existing C++ conventions.
 
 ## Build and validation
 
-Use Linux, a C++23 compiler and standard library, CMake 3.28 or newer, Ninja, and Python 3 when testing. CMake fetches pinned dependencies. The Debug configure, build and both test selections below were exercised in M0.1.
+Use the `debug`, `release` and `sanitizers` presets for the CI configurations. Build before running CTest. Run applicable configurations, including the combined ASan/UBSan suite for runtime changes.
 
 ```sh
-cmake -S . -B build -G Ninja -DORBIT_BUILD_TESTS=ON -DCMAKE_BUILD_TYPE=Debug
-cmake --build build
-ctest --test-dir build -LE '^integration$' --output-on-failure
-ctest --test-dir build -L '^integration$' --output-on-failure
-ctest --test-dir build --output-on-failure
+cmake --preset debug
+cmake --build --preset debug
+ctest --preset debug -L '^unit$'
+ctest --preset debug -L '^integration$'
+ctest --preset debug
 git diff --check
 ```
 
-Run the first two CTest selections for unit and integration results individually, or use the unfiltered CI command for both. The integration test needs loopback TCP and access to `/proc/<pid>/stat`.
+Substitute `release` or `sanitizers` in all three command types to validate those configurations. The loopback suite needs access to its Orbit child's `/proc/<pid>/stat` and `/proc/<pid>/status`. The sanitizer suite requires an environment that permits LeakSanitizer's process inspection.
 
 ## Engineering principles
 
@@ -43,7 +43,7 @@ Implement only the assigned task. Inspect the relevant sources, invariants and t
 
 ## Testing requirements
 
-Add regression tests for verified defects and tests for new behavior and its relevant failure paths. Prefer deterministic synchronization over arbitrary sleeps. Run applicable existing tests. Preserve the intent and coverage of existing tests. Report failures and checks you could not run.
+Add regression tests for verified defects and tests for new behavior and its relevant failure paths. Prefer observable synchronization and bound socket operations, polling and subprocess waits. Register cleanup as resources are acquired and preserve child exit status and output on failure. Preserve the intent and coverage of existing tests. Report the validation commands attempted, which checks passed or failed, and why any applicable check could not run.
 
 ## Documentation requirements
 

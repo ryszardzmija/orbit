@@ -7,6 +7,11 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+option(ORBIT_ENABLE_SANITIZERS "Enable AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
+if (ORBIT_ENABLE_SANITIZERS)
+    include(cmake/Sanitizers.cmake)
+endif()
+
 include(FetchContent)
 
 FetchContent_Declare(
@@ -39,7 +44,16 @@ FetchContent_Declare(
     SYSTEM
     EXCLUDE_FROM_ALL
 )
-FetchContent_MakeAvailable(abseil)
+block(SCOPE_FOR VARIABLES)
+    if (ORBIT_ENABLE_SANITIZERS)
+        # Abseil's compiled hash-table code and Orbit must agree on the ASan-dependent layout.
+        string(JOIN " " abseil_compile_flags ${orbit_sanitizer_compile_flags})
+        string(JOIN " " abseil_link_flags ${orbit_sanitizer_link_flags})
+        string(APPEND CMAKE_CXX_FLAGS " ${abseil_compile_flags}")
+        string(APPEND CMAKE_SHARED_LINKER_FLAGS " ${abseil_link_flags}")
+    endif()
+    FetchContent_MakeAvailable(abseil)
+endblock()
 
 add_subdirectory(src/proxy)
 add_subdirectory(src/config)
@@ -56,7 +70,13 @@ target_include_directories(orbit PRIVATE src)
 target_link_libraries(orbit PRIVATE proxy config logging net common signal spdlog::spdlog CLI11::CLI11)
 target_compile_options(orbit PRIVATE -Wall -Wextra -Wpedantic)
 
-option(ORBIT_BUILD_TESTS "Build Unit Tests" OFF)
+if (ORBIT_ENABLE_SANITIZERS)
+    foreach(target IN ITEMS orbit proxy config logging net signal)
+        target_link_libraries(${target} PRIVATE orbit_sanitizers)
+    endforeach()
+endif()
+
+option(ORBIT_BUILD_TESTS "Build and register Orbit tests" OFF)
 
 if (ORBIT_BUILD_TESTS)
     FetchContent_Declare(
