@@ -45,14 +45,14 @@ std::expected<void, std::error_code> disarmTimer(int fd) {
     return {};
 }
 
-std::expected<void, std::error_code> drainTimerFd(int fd) {
+std::expected<bool, std::error_code> drainTimerFd(int fd) {
     uint64_t expirations = 0;
 
     while (true) {
         ssize_t n = read(fd, &expirations, sizeof(expirations));
 
         if (n == sizeof(expirations)) {
-            continue;
+            return expirations != 0;
         }
 
         if (n == -1 && errno == EINTR) {
@@ -60,7 +60,7 @@ std::expected<void, std::error_code> drainTimerFd(int fd) {
         }
 
         if (n == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-            return {};
+            return false;
         }
 
         if (n == -1) {

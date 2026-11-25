@@ -1,4 +1,5 @@
 add_executable(proxy_tests
+    shutdown_signal_test.cpp
     send_buffer_test.cpp
     session_manager_test.cpp
     reactor_test.cpp
