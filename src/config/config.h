@@ -7,6 +7,8 @@
 
 #include <spdlog/common.h>
 
+#include "config/timeouts.h"
+
 namespace orbit {
 
 struct UpstreamConfig {
@@ -25,6 +27,7 @@ struct Config {
     std::vector<UpstreamConfig> upstreams;
     spdlog::level::level_enum log_level = spdlog::level::level_enum::info;
     SendBufferConfig send_buffer;
+    TimeoutConfig timeouts;
 };
 
 struct ConfigError {

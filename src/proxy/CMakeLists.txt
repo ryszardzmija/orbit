@@ -6,6 +6,7 @@ add_library(proxy
     detail/pending_data_sender.cpp
     detail/session/session_manager.cpp
     detail/signal_fd.cpp
+    detail/deadlines.cpp
     detail/timer_fd.cpp
     detail/resolved_upstream.cpp
     detail/upstream_dialer.cpp

@@ -32,11 +32,9 @@ parseArguments(std::initializer_list<std::string> input_arguments) {
 class ConfigTest : public testing::Test {
 protected:
     void SetUp() override {
-        constexpr std::array<const char*, 4> environment_variables{
-            "ORBIT_LISTEN_HOST",
-            "ORBIT_LISTEN_PORT",
-            "ORBIT_UPSTREAMS",
-            "ORBIT_LOG_LEVEL",
+        constexpr std::array<const char*, 5> environment_variables{
+            "ORBIT_LISTEN_HOST", "ORBIT_LISTEN_PORT",        "ORBIT_UPSTREAMS",
+            "ORBIT_LOG_LEVEL",   "ORBIT_CONNECT_TIMEOUT_MS",
         };
 
         for (const char* variable : environment_variables) {
@@ -149,4 +147,32 @@ TEST_F(ConfigTest, RejectsInvalidUpstreams) {
         ASSERT_FALSE(result);
         EXPECT_NE(0, result.error().exit_code);
     }
+}
+
+TEST_F(ConfigTest, ConnectTimeoutDefaultsAndBoundaries) {
+    auto defaults = parseArguments({"--upstream", "backend:1"});
+    ASSERT_TRUE(defaults);
+    EXPECT_EQ(10000, defaults->timeouts.connect.count());
+    for (auto ms : {1, 2147483647}) {
+        auto result =
+            parseArguments({"--upstream", "backend:1", "--connect-timeout-ms", std::to_string(ms)});
+        ASSERT_TRUE(result);
+        EXPECT_EQ(ms, result->timeouts.connect.count());
+    }
+}
+
+TEST_F(ConfigTest, RejectsInvalidConnectTimeoutFromCliOrEnvironment) {
+    for (auto invalid : {"0", "-1", "1s", "0.5", "2147483648", "999999999999999999999"}) {
+        SCOPED_TRACE(invalid);
+        EXPECT_FALSE(parseArguments({"--upstream", "backend:1", "--connect-timeout-ms", invalid}));
+        ASSERT_EQ(0, setenv("ORBIT_CONNECT_TIMEOUT_MS", invalid, 1));
+        EXPECT_FALSE(parseArguments({"--upstream", "backend:1"}));
+    }
+    auto override = parseArguments({"--upstream", "backend:1", "--connect-timeout-ms", "7"});
+    ASSERT_TRUE(override);
+    EXPECT_EQ(7, override->timeouts.connect.count());
+    ASSERT_EQ(0, setenv("ORBIT_CONNECT_TIMEOUT_MS", "17", 1));
+    auto env = parseArguments({"--upstream", "backend:1"});
+    ASSERT_TRUE(env);
+    EXPECT_EQ(17, env->timeouts.connect.count());
 }

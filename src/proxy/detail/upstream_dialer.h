@@ -1,10 +1,10 @@
 #pragma once
 
 #include <expected>
+#include <optional>
 #include <string>
 #include <system_error>
 #include <variant>
-#include <vector>
 
 #include "net/dialer.h"
 #include "proxy/detail/pending_connection.h"
@@ -17,6 +17,7 @@ struct UpstreamDialConnected {
     FileDescriptor upstream_connection_fd;
     net::SocketAddress accepted_address;
     net::SocketAddress upstream_address;
+    Deadline deadline;
 };
 
 struct UpstreamDialInProgress {
@@ -27,7 +28,7 @@ using UpstreamDialResult = std::variant<UpstreamDialConnected, UpstreamDialInPro
 
 struct UpstreamDialError {
     std::string error_messages;
-    std::vector<std::error_code> error_codes;
+    std::optional<std::error_code> socket_creation_error;
 };
 
 struct UpstreamDialerCreateError {
@@ -40,13 +41,15 @@ public:
     create(const net::ResolutionEndpoint& upstream_address);
 
     std::expected<UpstreamDialResult, UpstreamDialError>
-    dial(FileDescriptor accepted_connection, const net::SocketAddress& accepted_address);
+    dial(FileDescriptor accepted_connection, const net::SocketAddress& accepted_address,
+         Deadline deadline);
     std::expected<UpstreamDialResult, UpstreamDialError>
     advanceDialAttempt(PendingConnection pending_connection);
 
     const net::ResolutionEndpoint& upstreamEndpoint() const;
 
 private:
+    friend class UpstreamDialerTest;
     explicit UpstreamDialer(detail::ResolvedUpstream resolved_upstream);
 
     void addError(PendingConnection& pending_connection, net::DialFailedOp failed_op,

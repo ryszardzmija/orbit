@@ -4,6 +4,6 @@ namespace orbit::proxy::detail {
 
 struct ShutdownSignalRegistration {};
 
-struct ShutdownTimerRegistration {};
+struct TimerRegistration {};
 
 } // namespace orbit::proxy::detail

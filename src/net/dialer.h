@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <expected>
 #include <system_error>
 
@@ -21,6 +22,7 @@ struct DialSuccess {
 enum class DialFailedOp {
     Socket,
     Connect,
+    Deadline,
 };
 
 struct DialError {
@@ -28,6 +30,7 @@ struct DialError {
     DialFailedOp failed_op;
 };
 
-std::expected<DialSuccess, DialError> dial(const SocketAddress& address);
+std::expected<DialSuccess, DialError> dial(const SocketAddress& address,
+                                           std::chrono::steady_clock::time_point deadline);
 
 } // namespace orbit::net

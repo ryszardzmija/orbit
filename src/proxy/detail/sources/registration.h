@@ -11,6 +11,5 @@ namespace orbit::proxy::detail {
 
 using ReactorRegistration =
     std::variant<EndpointRegistration, ListenerRegistration, ShutdownSignalRegistration,
-                 ShutdownTimerRegistration, PendingDialRegistration>;
-
+                 TimerRegistration, PendingDialRegistration>;
 }

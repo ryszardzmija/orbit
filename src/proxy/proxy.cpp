@@ -24,6 +24,8 @@ namespace orbit::proxy {
 
 namespace {
 
+constexpr detail::DeadlineKey shutdown_deadline{detail::DeadlineKind::Shutdown, 0};
+
 // Lets a set of lambdas be combined into a single callable for std::visit.
 template <class... Ts>
 struct overloaded : Ts... {
@@ -48,32 +50,6 @@ bool isRecoverableAcceptError(const std::error_code& error) {
     }
 }
 
-bool isFatalDialError(const std::error_code& error) {
-    switch (error.value()) {
-    case EADDRINUSE:
-    case EAGAIN:
-    case EALREADY:
-    case ECONNREFUSED:
-    case EISCONN:
-    case ENETUNREACH:
-    case EHOSTUNREACH:
-    case ETIMEDOUT:
-        return false;
-    default:
-        return true;
-    }
-}
-
-std::optional<std::error_code> getFirstFatalError(const std::vector<std::error_code>& codes) {
-    for (const auto& code : codes) {
-        if (isFatalDialError(code)) {
-            return code;
-        }
-    }
-
-    return std::nullopt;
-}
-
 uint32_t getEventMask(const detail::EndpointInterests& interests) {
     uint32_t event_mask = interests.edge_triggered ? EPOLLET : 0;
     if (interests.readable) {
@@ -91,7 +67,8 @@ uint32_t getEventMask(const detail::EndpointInterests& interests) {
 } // namespace
 
 ProxyReactor::ProxyReactor(detail::EpollPoller poller, FileDescriptor shutdown_signal_fd,
-                           FileDescriptor shutdown_timer_fd, detail::UpstreamDialer upstream_dialer)
+                           FileDescriptor timer_fd, detail::UpstreamDialer upstream_dialer,
+                           TimeoutConfig timeouts)
     : poller_(std::move(poller)),
       session_manager_(detail::SessionManagerOptions{
           .send_buffer =
@@ -104,12 +81,16 @@ ProxyReactor::ProxyReactor(detail::EpollPoller poller, FileDescriptor shutdown_s
           .sender_buffer_capacity = sender_buf_cap,
       }),
       shutdown_signal_fd_(std::move(shutdown_signal_fd)),
-      shutdown_timer_fd_(std::move(shutdown_timer_fd)),
+      timer_fd_(std::move(timer_fd)),
+      timeouts_(timeouts),
       upstream_dialer_(std::move(upstream_dialer)) {}
 
 Result<ProxyReactor, ProxyCreateError>
 ProxyReactor::create(const net::ListenSocketAddress& listen_address,
-                     const net::ResolutionEndpoint& upstream_address) {
+                     const net::ResolutionEndpoint& upstream_address, TimeoutConfig timeouts) {
+    if (timeouts.connect.count() < 1 || timeouts.connect > TimeoutConfig::maximum) {
+        return std::unexpected(ProxyCreateError{"Invalid connection timeout"});
+    }
     auto poller_create_result = detail::EpollPoller::create();
     if (!poller_create_result) {
         return std::unexpected(ProxyCreateError{poller_create_result.error().message()});
@@ -122,7 +103,7 @@ ProxyReactor::create(const net::ListenSocketAddress& listen_address,
     }
     FileDescriptor signal_fd = std::move(signalfd_create_result.value());
 
-    auto timerfd_create_result = detail::createShutdownTimerFd();
+    auto timerfd_create_result = detail::createTimerFd();
     if (!timerfd_create_result) {
         return std::unexpected(ProxyCreateError{timerfd_create_result.error().message()});
     }
@@ -141,7 +122,7 @@ ProxyReactor::create(const net::ListenSocketAddress& listen_address,
     net::Listener listener = std::move(listener_create_result.value());
 
     ProxyReactor reactor(std::move(poller), std::move(signal_fd), std::move(timer_fd),
-                         std::move(dialer));
+                         std::move(dialer), timeouts);
 
     auto listener_register_result = reactor.registerListener(listener.fd());
     if (!listener_register_result) {
@@ -158,7 +139,7 @@ ProxyReactor::create(const net::ListenSocketAddress& listen_address,
         return std::unexpected(ProxyCreateError{register_result.error().message()});
     }
 
-    if (auto register_result = reactor.registerShutdownTimerEvent(); !register_result) {
+    if (auto register_result = reactor.registerTimerEvent(); !register_result) {
         return std::unexpected(ProxyCreateError{register_result.error().message()});
     }
 
@@ -169,6 +150,9 @@ Status<ProxyRuntimeError> ProxyReactor::start() {
     spdlog::info("Starting proxying traffic...");
 
     while (!shouldStop()) {
+        if (auto armed = synchronizeTimer(); !armed) {
+            return std::unexpected(ProxyRuntimeError{armed.error().message()});
+        }
         auto wait_result = poller_.wait();
         if (!wait_result) {
             return std::unexpected(ProxyRuntimeError{wait_result.error().message()});
@@ -187,6 +171,9 @@ Status<ProxyRuntimeError> ProxyReactor::start() {
         }
     }
 
+    if (auto disarmed = synchronizeTimer(); !disarmed) {
+        return std::unexpected(ProxyRuntimeError{disarmed.error().message()});
+    }
     return {};
 }
 
@@ -202,7 +189,7 @@ Status<FatalReactorError> ProxyReactor::dispatch(detail::ReadyEvent event) {
             [&](detail::EndpointRegistration r) { return handleEndpoint(r, event.events); },
             [&](detail::ListenerRegistration r) { return handleListener(r); },
             [&](detail::ShutdownSignalRegistration r) { return handleShutdownSignal(r); },
-            [&](detail::ShutdownTimerRegistration r) { return handleShutdownTimer(r); },
+            [&](detail::TimerRegistration r) { return handleTimer(r); },
             [&](detail::PendingDialRegistration) {
                 return handlePendingConnection(event.source_id);
             },
@@ -227,6 +214,9 @@ Status<std::error_code> ProxyReactor::closeSession(detail::SessionId session_id)
     }
 
     session_manager_.remove(session_id);
+    if (shutdown_state_ == ShutdownState::GracefullyStopping && !hasActiveSessions()) {
+        deadlines_.cancel(shutdown_deadline);
+    }
 
     if (first_error) {
         return std::unexpected(first_error.value());
@@ -288,11 +278,10 @@ Result<detail::SourceId, std::error_code> ProxyReactor::registerShutdownSignalEv
                                  detail::ShutdownSignalRegistration{});
 }
 
-Result<detail::SourceId, std::error_code> ProxyReactor::registerShutdownTimerEvent() {
+Result<detail::SourceId, std::error_code> ProxyReactor::registerTimerEvent() {
     uint32_t initial_events = EPOLLIN;
 
-    return registerReactorSource(shutdown_timer_fd_.get(), initial_events,
-                                 detail::ShutdownTimerRegistration{});
+    return registerReactorSource(timer_fd_.get(), initial_events, detail::TimerRegistration{});
 }
 
 Result<detail::SourceId, std::error_code>
@@ -300,6 +289,8 @@ ProxyReactor::registerPendingConnection(detail::PendingConnection pending_connec
     auto registered = registerReactorSource(pending_connection.attempted_connection_fd->get(),
                                             EPOLLOUT, detail::PendingDialRegistration{});
     if (registered) {
+        deadlines_.schedule({detail::DeadlineKind::Connect, *registered},
+                            pending_connection.deadline);
         pending_connections_.emplace(*registered, std::move(pending_connection));
     }
     return registered;
@@ -308,6 +299,7 @@ ProxyReactor::registerPendingConnection(detail::PendingConnection pending_connec
 Result<detail::PendingConnection, std::error_code> ProxyReactor::takePending(detail::SourceId id) {
     auto it = pending_connections_.find(id);
     assert(it != pending_connections_.end());
+    deadlines_.cancel({detail::DeadlineKind::Connect, id});
     auto retired = unregisterReactorSource(id);
     auto pending = std::move(it->second);
     pending_connections_.erase(it);
@@ -331,7 +323,8 @@ Status<std::error_code> ProxyReactor::cancelPendingConnections() {
 // If everything succeeds both endpoints are registered and SessionManager assumes ownership of
 // their file descriptors. If registration fails, the reactor source changes are rolled back.
 Result<detail::SessionId, AddSessionError> ProxyReactor::addSession(FileDescriptor upstream_fd,
-                                                                    FileDescriptor downstream_fd) {
+                                                                    FileDescriptor downstream_fd,
+                                                                    detail::Deadline deadline) {
     detail::SessionId session_id = session_manager_.allocateId();
     uint32_t initial_events = EPOLLIN | EPOLLRDHUP;
 
@@ -364,6 +357,19 @@ Result<detail::SessionId, AddSessionError> ProxyReactor::addSession(FileDescript
         });
     }
     detail::SourceId upstream_id = upstream_register_result.value();
+
+    // Check at the ownership handoff as registration itself consumes dial budget.
+    if (detail::DeadlineClock::now() >= deadline) {
+        auto upstream = unregisterReactorSource(upstream_id);
+        auto downstream = unregisterReactorSource(downstream_id);
+        if (!upstream || !downstream) {
+            return std::unexpected(AddSessionError{
+                .message = (!upstream ? upstream.error() : downstream.error()).message(),
+                .status = RollbackStatus::Failure});
+        }
+        return std::unexpected(
+            AddSessionError{"Connection establishment timed out", RollbackStatus::Success});
+    }
 
     session_manager_.add(session_id, std::move(downstream_fd), std::move(upstream_fd),
                          detail::SessionSourceIds{
@@ -486,19 +492,49 @@ Status<FatalReactorError> ProxyReactor::handleShutdownSignal(detail::ShutdownSig
     return {};
 }
 
-Status<FatalReactorError> ProxyReactor::handleShutdownTimer(detail::ShutdownTimerRegistration) {
-    auto expired = detail::drainTimerFd(shutdown_timer_fd_.get());
+Status<FatalReactorError> ProxyReactor::handleTimer(detail::TimerRegistration) {
+    auto expired = detail::drainTimerFd(timer_fd_.get());
     if (!expired) {
         return std::unexpected(FatalReactorError{expired.error().message()});
     }
-    if (!*expired || shutdown_state_ != ShutdownState::GracefullyStopping) {
-        return {};
+    if (*expired) {
+        armed_deadline_.reset();
+        if (auto result = expireDeadlines(detail::DeadlineClock::now()); !result) {
+            return std::unexpected(FatalReactorError{result.error().message()});
+        }
     }
+    return {};
+}
 
-    if (auto shutdown_request_result = handleShutdownRequest(); !shutdown_request_result) {
-        return std::unexpected(FatalReactorError{shutdown_request_result.error().message()});
+Status<std::error_code> ProxyReactor::synchronizeTimer() {
+    auto next = deadlines_.next();
+    if (next != armed_deadline_) {
+        if (auto result = detail::setTimer(timer_fd_.get(), next); !result) {
+            return result;
+        }
+        armed_deadline_ = next;
     }
+    return {};
+}
 
+Status<std::error_code> ProxyReactor::expireDeadlines(detail::Deadline now) {
+    for (int i = 0; i < max_expirations_per_dispatch; ++i) {
+        auto key = deadlines_.popDue(now);
+        if (!key) {
+            break;
+        }
+        if (key->kind == detail::DeadlineKind::Shutdown) {
+            if (shutdown_state_ == ShutdownState::GracefullyStopping) {
+                return handleShutdownRequest();
+            }
+        } else if (pending_connections_.contains(key->id)) {
+            auto pending = takePending(key->id);
+            if (!pending) {
+                return std::unexpected(pending.error());
+            }
+            spdlog::debug("Upstream connection establishment timed out");
+        }
+    }
     return {};
 }
 
@@ -524,8 +560,9 @@ Status<FatalReactorError> ProxyReactor::handleListener(detail::ListenerRegistrat
 
         spdlog::info("Client {} connected", net::formatAddress(accept_success.remote));
 
+        auto deadline = detail::DeadlineClock::now() + timeouts_.connect;
         auto dial_result =
-            upstream_dialer_.dial(std::move(accept_success.fd), accept_success.remote);
+            upstream_dialer_.dial(std::move(accept_success.fd), accept_success.remote, deadline);
         if (!dial_result) {
             if (auto error_result = handleDialError(std::move(dial_result.error()));
                 !error_result) {
@@ -565,8 +602,9 @@ Status<FatalReactorError> ProxyReactor::handleDialResult(detail::UpstreamDialRes
                      net::formatAddress(connected->upstream_address),
                      net::formatAddress(connected->accepted_address));
 
-        if (auto session_add_result = addSession(std::move(connected->upstream_connection_fd),
-                                                 std::move(connected->accepted_connection_fd));
+        if (auto session_add_result =
+                addSession(std::move(connected->upstream_connection_fd),
+                           std::move(connected->accepted_connection_fd), connected->deadline);
             !session_add_result) {
 
             if (session_add_result.error().status == RollbackStatus::Failure) {
@@ -587,12 +625,18 @@ Status<FatalReactorError> ProxyReactor::handleDialResult(detail::UpstreamDialRes
                      net::formatAddress(connected->upstream_address));
 
     } else if (auto* in_progress = std::get_if<detail::UpstreamDialInProgress>(&dial_result)) {
+        if (detail::DeadlineClock::now() >= in_progress->pending_connection.deadline) {
+            spdlog::debug("Upstream connection establishment timed out");
+            return {};
+        }
         net::SocketAddress accepted_address = in_progress->pending_connection.accepted_address;
 
         if (auto register_result =
                 registerPendingConnection(std::move(in_progress->pending_connection));
             !register_result) {
-            return std::unexpected(FatalReactorError{register_result.error().message()});
+            spdlog::error("Could not register upstream attempt: {}",
+                          register_result.error().message());
+            return {};
         }
 
         spdlog::debug("Pending connection for {} registered", net::formatAddress(accepted_address));
@@ -609,10 +653,9 @@ Status<FatalReactorError> ProxyReactor::handleDialError(detail::UpstreamDialErro
     spdlog::error("Connecting to {}:{} failed: {}", upstream_endpoint.hostname,
                   upstream_endpoint.port, dial_error.error_messages);
 
-    std::optional<std::error_code> fatal_error = getFirstFatalError(dial_error.error_codes);
-    if (fatal_error) {
-        return std::unexpected(
-            FatalReactorError{std::format("Dial failed: {}", fatal_error->message())});
+    if (dial_error.socket_creation_error) {
+        return std::unexpected(FatalReactorError{
+            std::format("Dial failed: {}", dial_error.socket_creation_error->message())});
     }
 
     return {};
@@ -621,10 +664,9 @@ Status<FatalReactorError> ProxyReactor::handleDialError(detail::UpstreamDialErro
 Status<std::error_code> ProxyReactor::handleShutdownRequest() {
     switch (shutdown_state_) {
     case ShutdownState::Running:
-        if (auto timer_arming_result =
-                detail::armTimer(shutdown_timer_fd_.get(), graceful_shutdown_timeout_s);
-            !timer_arming_result) {
-            return timer_arming_result;
+        if (hasActiveSessions()) {
+            deadlines_.schedule(shutdown_deadline,
+                                detail::DeadlineClock::now() + graceful_shutdown_timeout);
         }
         if (auto unregister_listener_result =
                 unregisterReactorSource(active_listener_->listener_id);
@@ -635,10 +677,7 @@ Status<std::error_code> ProxyReactor::handleShutdownRequest() {
         shutdown_state_ = ShutdownState::GracefullyStopping;
         return cancelPendingConnections();
     case ShutdownState::GracefullyStopping:
-        if (auto timer_disarming_result = detail::disarmTimer(shutdown_timer_fd_.get());
-            !timer_disarming_result) {
-            return timer_disarming_result;
-        }
+        deadlines_.cancel(shutdown_deadline);
         shutdown_state_ = ShutdownState::HardStopping;
         performHardStop();
         break;

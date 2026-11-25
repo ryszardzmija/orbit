@@ -1,0 +1,43 @@
+#include "proxy/detail/deadlines.h"
+
+namespace orbit::proxy::detail {
+
+void Deadlines::schedule(DeadlineKey key, Deadline at) {
+    auto [it, inserted] = times_.try_emplace(key, at);
+    if (inserted) {
+        ordered_.emplace(at, key);
+    } else if (it->second != at) {
+        auto entry = ordered_.extract({it->second, key});
+        entry.value().first = at;
+        ordered_.insert(std::move(entry));
+        it->second = at;
+    }
+}
+
+void Deadlines::cancel(DeadlineKey key) {
+    auto it = times_.find(key);
+    if (it != times_.end()) {
+        ordered_.erase({it->second, key});
+        times_.erase(it);
+    }
+}
+
+std::optional<Deadline> Deadlines::next() const {
+    if (ordered_.empty()) {
+        return std::nullopt;
+    }
+    return ordered_.begin()->first;
+}
+
+std::optional<DeadlineKey> Deadlines::popDue(Deadline now) {
+    auto it = ordered_.begin();
+    if (it == ordered_.end() || it->first > now) {
+        return std::nullopt;
+    }
+    auto key = it->second;
+    ordered_.erase(it);
+    times_.erase(key);
+    return key;
+}
+
+} // namespace orbit::proxy::detail

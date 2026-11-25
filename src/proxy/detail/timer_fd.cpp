@@ -1,6 +1,6 @@
 #include "proxy/detail/timer_fd.h"
 
-#include <cassert>
+#include <algorithm>
 #include <cerrno>
 #include <cstdint>
 #include <expected>
@@ -13,7 +13,7 @@
 
 namespace orbit::proxy::detail {
 
-std::expected<FileDescriptor, std::error_code> createShutdownTimerFd() {
+std::expected<FileDescriptor, std::error_code> createTimerFd() {
     int fd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
     if (fd == -1) {
         return std::unexpected(std::error_code(errno, std::system_category()));
@@ -22,23 +22,19 @@ std::expected<FileDescriptor, std::error_code> createShutdownTimerFd() {
     return FileDescriptor(fd);
 }
 
-std::expected<void, std::error_code> armTimer(int fd, int seconds) {
-    assert(seconds > 0);
-
-    itimerspec spec = {};
-    spec.it_value.tv_sec = seconds;
-
-    if (int result = timerfd_settime(fd, 0, &spec, nullptr); result == -1) {
-        return std::unexpected(std::error_code(errno, std::system_category()));
+std::expected<void, std::error_code> setTimer(int fd, std::optional<Deadline> at) {
+    itimerspec spec{};
+    if (at) {
+        // Linux libstdc++ steady_clock and the timerfd both use CLOCK_MONOTONIC.
+        // An all-zero it_value disarms the timer, even in absolute mode.
+        auto ns =
+            std::max(std::chrono::nanoseconds(1),
+                     std::chrono::duration_cast<std::chrono::nanoseconds>(at->time_since_epoch()));
+        auto seconds = std::chrono::duration_cast<std::chrono::seconds>(ns);
+        spec.it_value.tv_sec = seconds.count();
+        spec.it_value.tv_nsec = (ns - seconds).count();
     }
-
-    return {};
-}
-
-std::expected<void, std::error_code> disarmTimer(int fd) {
-    itimerspec spec = {};
-
-    if (int result = timerfd_settime(fd, 0, &spec, nullptr); result == -1) {
+    if (timerfd_settime(fd, TFD_TIMER_ABSTIME, &spec, nullptr) == -1) {
         return std::unexpected(std::error_code(errno, std::system_category()));
     }
 
