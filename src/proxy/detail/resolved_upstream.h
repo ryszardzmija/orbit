@@ -20,6 +20,7 @@ public:
     const std::vector<net::SocketAddress>& candidates() const;
 
 private:
+    friend class UpstreamDialerTest;
     ResolvedUpstream(const net::ResolutionEndpoint& configured_endpoint,
                      std::vector<net::SocketAddress> candidates);
 

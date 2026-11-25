@@ -94,11 +94,26 @@ std::expected<UpstreamConfig, UpstreamParseError> parseUpstream(std::string_view
     };
 }
 
+std::chrono::milliseconds parseTimeout(const std::string& text, const char* option,
+                                       uint32_t minimum_ms) {
+    uint32_t ms = 0;
+    auto [end, ec] = std::from_chars(text.data(), text.data() + text.size(), ms);
+    if (ec != std::errc{} || end != text.data() + text.size() || ms < minimum_ms ||
+        ms > TimeoutConfig::maximum.count()) {
+        throw CLI::ValidationError(option, "expected decimal milliseconds between " +
+                                               std::to_string(minimum_ms) + " and " +
+                                               std::to_string(TimeoutConfig::maximum.count()));
+    }
+    return std::chrono::milliseconds(ms);
+}
+
 } // namespace
 
 std::expected<Config, ConfigError> parseConfig(int argc, char** argv) {
     Config config;
     std::vector<std::string> upstream_values;
+
+    auto connect_ms = std::to_string(config.timeouts.connect.count());
 
     CLI::App app("orbit - a TCP reverse proxy");
     app.set_version_flag("--version", "orbit 0.1.0");
@@ -127,8 +142,15 @@ std::expected<Config, ConfigError> parseConfig(int argc, char** argv) {
         ->transform(CLI::CheckedTransformer(level_map, CLI::ignore_case))
         ->default_str("info");
 
+    app.add_option("--connect-timeout-ms", connect_ms,
+                   "Overall upstream connection timeout in milliseconds")
+        ->envname("ORBIT_CONNECT_TIMEOUT_MS")
+        ->capture_default_str();
+
     try {
         app.parse(argc, argv);
+
+        config.timeouts.connect = parseTimeout(connect_ms, "--connect-timeout-ms", 1);
 
         config.upstreams.reserve(upstream_values.size());
         for (const std::string& upstream_value : upstream_values) {

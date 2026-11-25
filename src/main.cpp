@@ -37,7 +37,8 @@ int main(int argc, char** argv) {
         orbit::net::ResolutionEndpoint{
             .hostname = upstream.host,
             .port = upstream.port,
-        });
+        },
+        config.timeouts);
 
     if (!reactor_create_result) {
         spdlog::error("Failed to initialize event loop: {}", reactor_create_result.error().message);

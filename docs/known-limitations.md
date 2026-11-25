@@ -22,11 +22,8 @@ Source baseline is `e3aec7b`. A source-confirmed finding follows from the implem
 
 ## LIM-004 — Pending dials have no application deadline
 
-- **Classification and priority** — Functional limitation, high.
-- **Source and evidence** — [`PendingConnection`](../src/proxy/detail/pending_connection.h) has an attempted fd and address index but no deadline. [`registerPendingConnection`](../src/proxy/proxy.cpp) registers only the attempted upstream for readiness. The timer is used for process shutdown. [`advanceDialAttempt`](../src/proxy/detail/upstream_dialer.cpp) runs only when that source dispatches.
-- **Conditions and impact** — A slow or unreachable destination can occupy an accepted fd and a dial fd until Linux completes or fails the connect, or Orbit exits. A slow first candidate delays later addresses. An early client disconnect has no dedicated pending-side observation or cancellation.
-- **Verification** — Source-confirmed absence of application deadlines and client-side watches. OS timing depends on system and network behavior and was not measured.
-- **Follow-up** — Define an overall dial budget and any per-attempt budget, cancellation and ownership semantics before M1 relies on address or upstream retry. Account for time already spent when advancing candidates.
+- **Disposition** — M1.4 bounds the entire establishment sequence with a configurable 10-second default. A single monotonic timer serves all pending dials and graceful shutdown. Readiness at or after expiration cannot promote an attempt. The M1-A02 correction also checks the original deadline immediately before `connect()`. A controlled loopback regression verifies cleanup when the deadline expires during fallback socket creation.
+- **Remaining scope** — A client disconnect has no dedicated pending watch, so Orbit can retain both sockets for the rest of the finite budget. A slow first address can use that whole budget. Tests exercise controlled fallback, ready-versus-expired ordering and timer-driven cleanup.
 
 ## LIM-005 — Admission and application buffer limits are absent
 
@@ -76,7 +73,7 @@ Source baseline is `e3aec7b`. A source-confirmed finding follows from the implem
 ## LIM-011 — Fault and readiness tests leave gaps
 
 - **Classification and priority** — Testing gap, high.
-- **Source and evidence** — [GoogleTest units](../tests/CMakeLists.txt) cover syntax, address formatting and queue logic. [Loopback integration](../tests/integration/proxy_sessions_test.py) covers established traffic, one upstream reset, churn, half-close, ordinary full hangup, idle CPU and signal escalation. The large-transfer test does not observe exact buffer occupancy or control partial syscall results. M1.1 adds controlled saturated hangups in both directions. M1.2 adds controlled stale batches and fd reuse. M1.3 covers pending cancellation, timer escalation and terminal write-shutdown failure. Remaining gaps include pending dial failures and address fallback deterministically, fd exhaustion, registration rollback faults or live IPv6 forwarding.
+- **Source and evidence** — [GoogleTest units](../tests/CMakeLists.txt) cover syntax, address formatting and queue logic. [Loopback integration](../tests/integration/proxy_sessions_test.py) covers established traffic, one upstream reset, churn, half-close, ordinary full hangup, idle CPU and signal escalation. The large-transfer test does not observe exact buffer occupancy or control partial syscall results. M1.1 adds controlled saturated hangups in both directions. M1.2 adds controlled stale batches and fd reuse. M1.3 covers pending cancellation, timer escalation and terminal write-shutdown failure. M1.4 covers address fallback, registration failure, timer cleanup and deadline races. Remaining gaps include fd exhaustion, kernel DEL failure and live IPv6 forwarding.
 - **Conditions and impact** — Regressions in rare event combinations and failures can pass the existing suite. The harness still uses deliberate delays for reset, slow-reader and idle-CPU scenarios. Orbit's CLI rejects port zero, so the bind-after-release window for its listener still exists. It can cause a startup failure if another process takes the port.
 - **Verification** — Confirmed by test inventory. Churn and transfer cases are useful indirect coverage with limited control over the targeted state.
 - **Follow-up** — Select deterministic fault and timeout coverage when modifying the other paths. See LIM-016 for the M0.2 harness fixes.
@@ -92,8 +89,8 @@ Source baseline is `e3aec7b`. A source-confirmed finding follows from the implem
 ## LIM-013 — Resource exhaustion can stop the reactor
 
 - **Classification and priority** — Architectural risk, high.
-- **Source and evidence** — [`isRecoverableAcceptError` and `isFatalDialError`](../src/proxy/proxy.cpp) classify `EMFILE` and `ENFILE` as fatal via their default paths. The terminal dial classification checks every accumulated errno and discards the socket/connect distinction, even though [`tryCandidatesFrom`](../src/proxy/detail/upstream_dialer.cpp) uses that distinction to stop on socket creation failure. A final error list with an errno such as `EADDRNOTAVAIL` is also fatal. The fd and heap paths have no admission fallback or overload recovery mechanism.
-- **Conditions and impact** — Hitting process-wide or system-wide fd limits on accept or dial can end the reactor and close unrelated streams. Exhaustion of local addresses or outbound ports can also be process-fatal if a dial ends with the corresponding error. Allocation failures from containers and buffers have no explicit catch path.
+- **Source and evidence** — `EMFILE` and `ENFILE` remain process-fatal on accept or upstream socket creation. Connect and SO_ERROR failures are local after M1.4. A failed pending ADD is also local. The fd and heap paths have no admission fallback or overload recovery mechanism.
+- **Conditions and impact** — Exhausting available descriptors or failing a heap allocation can still end the process and close independent sessions.
 - **Verification** — Source-confirmed status routing. Resource exhaustion and allocation failure were not induced in validation.
 - **Follow-up** — Establish overload behavior before expanding upstream fan-out. Review the terminal dial error policy by syscall and errno, and add tests for isolation and cleanup under recoverable resource pressure.
 

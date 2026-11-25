@@ -1,17 +1,21 @@
+#include <algorithm>
 #include <cerrno>
+#include <fcntl.h>
 #include <optional>
 #include <stdexcept>
+#include <vector>
 
 #include <gtest/gtest.h>
 #include <poll.h>
 #include <sys/epoll.h>
 #include <sys/socket.h>
-#include <sys/timerfd.h>
 
 #include "proxy/proxy.h"
 #include "socket_pair.h"
 
 namespace orbit::proxy {
+
+using namespace std::chrono_literals;
 
 // Drive the same one-event dispatcher used by start(), with a controlled batch order.
 class ProxyReactorTest : public testing::Test {
@@ -23,7 +27,8 @@ protected:
     }
 
     detail::SessionSourceIds install(test::SocketPair& downstream, test::SocketPair& upstream) {
-        auto added = reactor->addSession(std::move(upstream.local), std::move(downstream.local));
+        auto added = reactor->addSession(std::move(upstream.local), std::move(downstream.local),
+                                         detail::Deadline::max());
         if (!added) {
             throw std::runtime_error(added.error().message);
         }
@@ -33,12 +38,14 @@ protected:
     auto dispatch(detail::ReadyEvent event) { return reactor->dispatch(event); }
     bool registered(detail::SourceId id) const { return reactor->sources_.find(id).has_value(); }
 
-    detail::SourceId installPending(test::SocketPair& client, test::SocketPair& attempt) {
+    detail::SourceId installPending(test::SocketPair& client, test::SocketPair& attempt,
+                                    detail::Deadline at = detail::DeadlineClock::now() + 10s) {
         auto added = reactor->registerPendingConnection({
             .accepted_connection_fd = std::move(client.local),
             .accepted_address = {},
             .attempted_connection_fd = std::move(attempt.local),
             .attempted_address_idx = 0,
+            .deadline = at,
         });
         if (!added) {
             throw std::system_error(added.error());
@@ -49,8 +56,26 @@ protected:
     auto shutdownRequest() { return reactor->handleShutdownRequest(); }
     auto listenerId() const { return reactor->active_listener_->listener_id; }
     bool stopped() const { return reactor->shouldStop(); }
-    int timerFd() const { return reactor->shutdown_timer_fd_.get(); }
-    auto handleTimer() { return reactor->handleShutdownTimer({}); }
+    int timerFd() const { return reactor->timer_fd_.get(); }
+    auto handleTimer() { return reactor->handleTimer({}); }
+
+    auto currentSessionSources() const {
+        auto ids = reactor->session_manager_.ids();
+        if (ids.empty()) {
+            throw std::runtime_error("Expected an established session");
+        }
+        return reactor->session_manager_.sourceIds(*ids.begin());
+    }
+    auto dialResult(detail::UpstreamDialResult result) {
+        return reactor->handleDialResult(std::move(result));
+    }
+    auto nextDeadline() const { return reactor->deadlines_.next(); }
+    auto expire(detail::Deadline now) { return reactor->expireDeadlines(now); }
+    void shortenGrace() {
+        reactor->deadlines_.schedule({detail::DeadlineKind::Shutdown, 0},
+                                     detail::DeadlineClock::now() + 1ms);
+    }
+    auto arm() { return reactor->synchronizeTimer(); }
 
     std::optional<ProxyReactor> reactor;
 };
@@ -181,9 +206,8 @@ TEST_F(ProxyReactorTest, GracefulShutdownCancelsPendingsAndTimerEscalatesEstabli
     ASSERT_EQ(1, recv(client.peer.get(), &byte, 1, 0));
     EXPECT_EQ('g', byte);
     // Expire the real one-shot timer without waiting 30 seconds.
-    itimerspec soon{};
-    soon.it_value.tv_nsec = 1;
-    ASSERT_EQ(0, timerfd_settime(timerFd(), 0, &soon, nullptr));
+    shortenGrace();
+    ASSERT_TRUE(arm());
     pollfd timer{timerFd(), POLLIN, 0};
     ASSERT_EQ(1, poll(&timer, 1, 1000));
     ASSERT_TRUE(handleTimer());
@@ -192,6 +216,110 @@ TEST_F(ProxyReactorTest, GracefulShutdownCancelsPendingsAndTimerEscalatesEstabli
     EXPECT_FALSE(registered(ids.upstream));
     EXPECT_EQ(0, recv(client.peer.get(), &byte, 1, 0));
     EXPECT_EQ(0, recv(backend.peer.get(), &byte, 1, 0));
+}
+
+TEST_F(ProxyReactorTest, ExpiredBudgetBeatsAlreadyWritableCompletion) {
+    auto client = test::socketPair();
+    auto attempt = test::socketPair();
+    auto pending = installPending(client, attempt, detail::DeadlineClock::now());
+    // SO_ERROR on this connected socket is zero. Its copied completion precedes the timer.
+    ASSERT_TRUE(dispatch({pending, EPOLLOUT}));
+    EXPECT_FALSE(registered(pending));
+    EXPECT_FALSE(nextDeadline());
+    char byte;
+    EXPECT_EQ(0, recv(client.peer.get(), &byte, 1, 0));
+    EXPECT_EQ(0, recv(attempt.peer.get(), &byte, 1, 0));
+}
+
+TEST_F(ProxyReactorTest, SuccessfulPromotionCancelsDialDeadlineAndRetainsHalfClosedRequest) {
+    auto client = test::socketPair();
+    auto attempt = test::socketPair();
+    ASSERT_EQ(1, send(client.peer.get(), "q", 1, 0));
+    ASSERT_EQ(0, shutdown(client.peer.get(), SHUT_WR));
+    auto pending = installPending(client, attempt);
+    ASSERT_TRUE(nextDeadline());
+    ASSERT_TRUE(dispatch({pending, EPOLLOUT}));
+    EXPECT_FALSE(nextDeadline());
+    EXPECT_FALSE(registered(pending));
+    ASSERT_TRUE(expire(detail::DeadlineClock::now() + 20s));
+    auto live = currentSessionSources();
+    ASSERT_TRUE(dispatch({live.downstream, EPOLLIN}));
+    ASSERT_TRUE(dispatch({live.downstream, EPOLLIN}));
+    char byte;
+    ASSERT_EQ(1, recv(attempt.peer.get(), &byte, 1, 0));
+    EXPECT_EQ('q', byte);
+    EXPECT_EQ(0, recv(attempt.peer.get(), &byte, 1, 0));
+    ASSERT_EQ(1, send(attempt.peer.get(), "r", 1, 0));
+    ASSERT_TRUE(dispatch({live.upstream, EPOLLIN}));
+    ASSERT_EQ(1, recv(client.peer.get(), &byte, 1, 0));
+    EXPECT_EQ('r', byte);
+}
+
+TEST_F(ProxyReactorTest, StalledAttemptExpiresWithoutDisturbingEstablishedTraffic) {
+    auto client = test::socketPair();
+    auto backend = test::socketPair();
+    auto live = install(client, backend);
+    auto waiting = test::socketPair();
+    auto attempt = test::socketPair();
+    auto id = installPending(waiting, attempt, detail::DeadlineClock::now() + 2ms);
+    ASSERT_TRUE(arm());
+    pollfd timer{timerFd(), POLLIN, 0};
+    ASSERT_EQ(1, poll(&timer, 1, 1000));
+    ASSERT_TRUE(handleTimer());
+    EXPECT_FALSE(nextDeadline());
+    EXPECT_FALSE(registered(id));
+    ASSERT_TRUE(dispatch({id, EPOLLOUT}));
+    char byte;
+    EXPECT_EQ(0, recv(waiting.peer.get(), &byte, 1, 0));
+    EXPECT_EQ(0, recv(attempt.peer.get(), &byte, 1, 0));
+    ASSERT_EQ(1, send(client.peer.get(), "a", 1, 0));
+    ASSERT_TRUE(dispatch({live.downstream, EPOLLIN}));
+    ASSERT_EQ(1, recv(backend.peer.get(), &byte, 1, 0));
+    EXPECT_EQ('a', byte);
+}
+
+TEST_F(ProxyReactorTest, ExpiredConnectedHandoffReleasesBothRegisteredEndpoints) {
+    auto client = test::socketPair();
+    auto backend = test::socketPair();
+    ASSERT_TRUE(dialResult(detail::UpstreamDialConnected{
+        std::move(client.local), std::move(backend.local), {}, {}, detail::DeadlineClock::now()}));
+    EXPECT_FALSE(nextDeadline());
+    char byte;
+    EXPECT_EQ(0, recv(client.peer.get(), &byte, 1, 0));
+    EXPECT_EQ(0, recv(backend.peer.get(), &byte, 1, 0));
+    ASSERT_TRUE(shutdownRequest());
+    EXPECT_TRUE(stopped());
+}
+
+TEST_F(ProxyReactorTest, RegistrationFailureReleasesClientAndDialDeadline) {
+    auto waiting = test::socketPair();
+    int fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+    ASSERT_GE(fd, 0);
+    auto at = detail::DeadlineClock::now() + 10s;
+    ASSERT_TRUE(dialResult(detail::UpstreamDialInProgress{
+        {std::move(waiting.local), {}, FileDescriptor(fd), 0, at, {}}}));
+    EXPECT_FALSE(nextDeadline());
+    char byte;
+    EXPECT_EQ(0, recv(waiting.peer.get(), &byte, 1, 0));
+}
+
+TEST_F(ProxyReactorTest, ExpirationBurstLeavesDueWorkArmedForAnotherTurn) {
+    std::vector<detail::SourceId> ids;
+    auto at = detail::DeadlineClock::now();
+    for (int i = 0; i < 65; ++i) {
+        auto waiting = test::socketPair();
+        auto attempt = test::socketPair();
+        ids.push_back(installPending(waiting, attempt, at));
+    }
+    ASSERT_TRUE(expire(at));
+    ASSERT_EQ(1, std::ranges::count_if(ids, [&](auto id) { return registered(id); }));
+    ASSERT_EQ(at, nextDeadline());
+    ASSERT_TRUE(arm());
+    pollfd timer{timerFd(), POLLIN, 0};
+    ASSERT_EQ(1, poll(&timer, 1, 1000));
+    ASSERT_TRUE(handleTimer());
+    EXPECT_FALSE(nextDeadline());
+    EXPECT_EQ(0, std::ranges::count_if(ids, [&](auto id) { return registered(id); }));
 }
 
 } // namespace orbit::proxy
