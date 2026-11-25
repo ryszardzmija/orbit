@@ -9,6 +9,7 @@ Build a resource-efficient, fault-tolerant Layer 4 TCP load balancer for Linux i
 - Read [architecture](docs/architecture.md), [engineering invariants](docs/invariants.md) and [known limitations](docs/known-limitations.md) before changing the data plane. See [configuration](docs/config.md) for the operator interface.
 - Start at [`src/main.cpp`](src/main.cpp). The reactor and its helpers live in [`src/proxy/`](src/proxy/), with sockets and resolution in [`src/net/`](src/net/). Configuration, shared ownership types, logging and signal masking live in [`src/config/`](src/config/), [`src/common/`](src/common/), [`src/logging/`](src/logging/) and [`src/signal/`](src/signal/).
 - GoogleTest suites live under [`tests/config/`](tests/config/), [`tests/net/`](tests/net/) and [`tests/proxy/`](tests/proxy/). The Python loopback harness lives in [`tests/integration/`](tests/integration/).
+- For instructions on running Release loopback benchmarks, see [Benchmarks](benchmarks/README.md).
 - Build rules live in [`CMakeLists.txt`](CMakeLists.txt) and module CMake files. See [development](docs/development.md) for the CI matrix, toolchains and failure diagnostics. Follow the repository's [`.clang-format`](.clang-format) and existing C++ conventions.
 
 ## Build and validation

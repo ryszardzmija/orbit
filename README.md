@@ -47,6 +47,11 @@ ctest --preset debug
 The [development guide](docs/development.md) covers tool installation, the `release` and
 `sanitizers` presets, test selection and CI diagnostics.
 
+## Benchmarks
+
+The loopback benchmarks measure TCP throughput, echo latency and idle connection resource use
+with a Release build. [Benchmark instructions](benchmarks/README.md)
+
 ## Trying it out
 
 You can try the proxy without a ShaleDB server by putting `cat` behind `socat` as a simple
