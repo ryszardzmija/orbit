@@ -8,13 +8,13 @@
 namespace orbit::proxy::detail {
 
 struct EndpointState {
+    // A full hangup releases undeliverable output. The fd can still supply residual input.
     std::unique_ptr<SendBuffer> send_buffer;
     bool peer_half_closed;
     bool half_close_sent;
     bool done_reading;
-    // Set when the socket reports a hangup (EPOLLHUP): the connection is fully torn down, so we
-    // can no longer write to it and any data still buffered for it is undeliverable.
-    bool write_closed;
+    bool hungUp() const { return !send_buffer; }
+    bool canWrite() const { return !hungUp() && !half_close_sent; }
 };
 
 struct SessionEndpoint {

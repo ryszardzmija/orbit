@@ -4,11 +4,8 @@ Source baseline is `e3aec7b`. A source-confirmed finding follows from the implem
 
 ## LIM-001 — Full hangup drain bypasses buffer admission
 
-- **Classification and priority** — Confirmed defect, high.
-- **Source and evidence** — [`SessionManager::handleHangup`](../src/proxy/detail/session/session_manager.cpp) calls [`Forwarder::drain`](../src/proxy/detail/forwarding.cpp) whenever the other endpoint is eligible for writes by session state. The drain loops over receives and appends every chunk without checking admission. [`SendBuffer::write`](../src/proxy/detail/buffer/send_buffer.cpp) asserts `Accepting`, appends the entire chunk and may transition to `Paused`. Linux can report HUP even with `EPOLLIN` disabled. [`epoll_ctl(2)`](https://man7.org/linux/man-pages/man2/epoll_ctl.2.html).
-- **Conditions and impact** — The hung-up endpoint has residual input and the surviving destination is already paused, or the drain crosses the high watermark with additional input still available. The next append to a paused queue fails the assertion in Debug, taking down the process. With assertions disabled, additional appends can extend occupancy beyond the ordinary one-chunk watermark overshoot.
-- **Verification** — Source-confirmed contract violation. The existing client and backend full-hangup tests exercise payload delivery and EOF without establishing saturation at hangup. The assertion and release-build impact were not reproduced during this audit.
-- **Follow-up** — In M1.1, define how the reactor defers reads of residual data while preserving byte order, EOF propagation and progress. A change that simply exits the drain still reaches the caller's unconditional `done_reading` and retirement. Leaving a hung-up fd registered without a progression policy can repeatedly report HUP. Add a deterministic regression that establishes a paused destination during hangup and checks bounded queue admission, payload delivery, EOF and idle reactor behavior after the destination resumes. Cover both directions.
+- **Disposition** — Resolved in M1.1. The former unbounded drain could append to a paused queue and then mark unread input consumed. All residual reads now share ordinary admission, with one chunk per drain step and continuation through destination writes.
+- **Verification** — Both endpoint roles are covered with a saturated socket, a verified paused queue, and more bytes left in the source socket than fit in one receive. The test verifies ordered delivery and EOF after resumption. A separate test drives would-block before residual data arrives.
 
 ## LIM-002 — Only the first configured upstream is used
 
@@ -69,8 +66,8 @@ Source baseline is `e3aec7b`. A source-confirmed finding follows from the implem
 ## LIM-009 — Reactor work budgets are incomplete
 
 - **Classification and priority** — Architectural risk, medium.
-- **Source and evidence** — [`ProxyReactor::handleListener`](../src/proxy/proxy.cpp) caps accept iterations at 16, and [`EpollPoller::wait`](../src/proxy/detail/epoll/epoll_poller.h) takes up to 1,024 events. A normal [`Forwarder::forward`](../src/proxy/detail/forwarding.cpp) and [`PendingDataSender::sendPending`](../src/proxy/detail/pending_data_sender.cpp) process one 4 KiB chunk each, apart from interrupted syscall retries. The hangup drain loops until would-block, EOF or error. [`UpstreamDialer::tryCandidatesFrom`](../src/proxy/detail/upstream_dialer.cpp) can scan all remaining candidates inside a handler.
-- **Conditions and impact** — Residual hangup input, repeated accepts with many failing addresses, or a large ready batch can delay other ready sessions and shutdown handling. Accept iteration count does not bound the duration of the dial work done inside each iteration. The code has no handler time budget or service-latency guarantee.
+- **Source and evidence** — [`ProxyReactor::handleListener`](../src/proxy/proxy.cpp) caps accept iterations at 16, and [`EpollPoller::wait`](../src/proxy/detail/epoll/epoll_poller.h) takes up to 1,024 events. A normal [`Forwarder::forward`](../src/proxy/detail/forwarding.cpp) and [`PendingDataSender::sendPending`](../src/proxy/detail/pending_data_sender.cpp) process one 4 KiB chunk each, apart from interrupted syscall retries. M1.1 bounds residual reads to one chunk per handler. [`UpstreamDialer::tryCandidatesFrom`](../src/proxy/detail/upstream_dialer.cpp) can scan all remaining candidates inside a handler.
+- **Conditions and impact** — Repeated accepts with many failing addresses, or a large ready batch can delay other ready sessions and shutdown handling. Accept iteration count does not bound the duration of the dial work done inside each iteration. The code has no handler time budget or service-latency guarantee.
 - **Verification** — Source-confirmed work bounds and unbudgeted paths. Starvation duration and throughput impact remain unmeasured.
 - **Follow-up** — M0.3 measures single-connection echo latency. Measure mixed-workload latency and drain, dial and accept costs before selecting fairness budgets.
 
@@ -86,10 +83,10 @@ Source baseline is `e3aec7b`. A source-confirmed finding follows from the implem
 ## LIM-011 — Fault and readiness tests leave gaps
 
 - **Classification and priority** — Testing gap, high.
-- **Source and evidence** — [GoogleTest units](../tests/CMakeLists.txt) cover syntax, address formatting and queue logic. [Loopback integration](../tests/integration/proxy_sessions_test.py) covers established traffic, one upstream reset, churn, half-close, ordinary full hangup, idle CPU and signal escalation. The large-transfer test does not observe exact buffer occupancy or control partial syscall results. Tests do not drive a saturated hangup, a stale ready batch, pending dial failures and address fallback deterministically, pending shutdown, timer-only escalation, fd exhaustion, registration rollback faults or live IPv6 forwarding.
+- **Source and evidence** — [GoogleTest units](../tests/CMakeLists.txt) cover syntax, address formatting and queue logic. [Loopback integration](../tests/integration/proxy_sessions_test.py) covers established traffic, one upstream reset, churn, half-close, ordinary full hangup, idle CPU and signal escalation. The large-transfer test does not observe exact buffer occupancy or control partial syscall results. M1.1 adds controlled saturated hangups in both directions. Remaining gaps include a stale ready batch, pending dial failures and address fallback deterministically, pending shutdown, timer-only escalation, fd exhaustion, registration rollback faults or live IPv6 forwarding.
 - **Conditions and impact** — Regressions in rare event combinations and failures can pass the existing suite. The harness still uses deliberate delays for reset, slow-reader and idle-CPU scenarios. Orbit's CLI rejects port zero, so the bind-after-release window for its listener still exists. It can cause a startup failure if another process takes the port.
 - **Verification** — Confirmed by test inventory. Churn and transfer cases are useful indirect coverage with limited control over the targeted state.
-- **Follow-up** — Add saturated hangup coverage in M1.1 and controlled stale-event coverage in M1.2. Select deterministic fault and timeout coverage when modifying the other paths. See LIM-016 for the M0.2 harness fixes.
+- **Follow-up** — Add controlled stale-event coverage in M1.2. Select deterministic fault and timeout coverage when modifying the other paths. See LIM-016 for the M0.2 harness fixes.
 
 ## LIM-012 — Configuration and README overstated current guarantees
 

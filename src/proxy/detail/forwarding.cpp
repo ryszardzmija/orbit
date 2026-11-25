@@ -43,7 +43,9 @@ Status<ForwardError> Forwarder::forward(SessionEndpoint& source, SessionEndpoint
 
     // We can try to send the data directly only if the send buffer is empty since otherwise
     // the data would be reordered.
-    if (destination.state.send_buffer->empty()) {
+    // Queue residual input even for an empty destination. Its level-triggered writable
+    // event continues the drain after this single receive.
+    if (!source.state.hungUp() && destination.state.send_buffer->empty()) {
         auto send_result =
             net::trySend(destination.fd.get(), std::span<uint8_t>(buf_.get(), bytes_read));
         if (!send_result) {
@@ -63,30 +65,6 @@ Status<ForwardError> Forwarder::forward(SessionEndpoint& source, SessionEndpoint
     }
 
     return {};
-}
-
-Status<ForwardError> Forwarder::drain(SessionEndpoint& source, SessionEndpoint& destination) {
-    while (true) {
-        auto recv_result =
-            net::tryRecv(source.fd.get(), std::span<uint8_t>(buf_.get(), capacity_));
-        if (!recv_result) {
-            return std::unexpected(ForwardError{
-                .message = recv_result.error().message(),
-                .failed_op = FailedOp::Recv,
-            });
-        }
-
-        if (recv_result.value().status == net::RecvStatus::Eof) {
-            source.state.done_reading = true;
-            return {};
-        }
-
-        if (recv_result.value().status == net::RecvStatus::WouldBlock) {
-            return {};
-        }
-
-        bufferData(destination, recv_result.value().bytes_received);
-    }
 }
 
 void Forwarder::bufferData(SessionEndpoint& destination, size_t bytes_read) {

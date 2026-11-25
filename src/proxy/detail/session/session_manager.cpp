@@ -35,7 +35,7 @@ bool shouldHalfClose(const SessionEndpoint& source, const SessionEndpoint& desti
 
 Status<std::error_code> halfCloseIfReady(const SessionEndpoint& source,
                                          SessionEndpoint& destination) {
-    if (!shouldHalfClose(source, destination) || destination.state.half_close_sent) {
+    if (!destination.state.canWrite() || !shouldHalfClose(source, destination)) {
         return {};
     }
 
@@ -48,14 +48,14 @@ Status<std::error_code> halfCloseIfReady(const SessionEndpoint& source,
 }
 
 bool isHungUp(const Session& session) {
-    return session.downstream.state.write_closed || session.upstream.state.write_closed;
+    return session.downstream.state.hungUp() || session.upstream.state.hungUp();
 }
 
 // Whether the source->destination stream has nothing left to deliver: either the destination has
 // hung up (its buffered data is undeliverable), or we have read everything from the source and
 // flushed it all to the destination.
 bool directionComplete(const SessionEndpoint& source, const SessionEndpoint& destination) {
-    return destination.state.write_closed ||
+    return destination.state.hungUp() ||
            (source.state.done_reading && destination.state.send_buffer->empty());
 }
 
@@ -136,15 +136,18 @@ SessionInterests SessionManager::interests(SessionId id) const {
 }
 
 bool SessionManager::shouldRetire(SessionId id, EndpointRole role) const {
-    // handleHangup() always marks the endpoint done_reading once it sets write_closed, so a
-    // write-closed endpoint can neither be written to nor read from again.
-    return getEndpoint(getSession(id), role).state.write_closed;
+    const auto& endpoint = getEndpoint(getSession(id), role);
+    return endpoint.state.hungUp() && endpoint.state.done_reading;
 }
 
 SessionEventResult SessionManager::handleReadable(SessionId id, EndpointRole role) {
     Session& session = getSession(id);
     SessionEndpoint& source = getEndpoint(session, role);
     SessionEndpoint& destination = getOtherEndpoint(session, role);
+
+    if (!getInterests(source, destination).readable) {
+        return keepOpen();
+    }
 
     if (auto result = forwarder_.forward(source, destination); !result) {
         return closeSession("Forwarding failed: " + result.error().message);
@@ -162,8 +165,18 @@ SessionEventResult SessionManager::handleWritable(SessionId id, EndpointRole rol
     SessionEndpoint& destination = getEndpoint(session, role);
     SessionEndpoint& source = getOtherEndpoint(session, role);
 
+    if (!getInterests(destination, source).writable) {
+        return keepOpen();
+    }
+
     if (auto result = sender_.sendPending(destination); !result) {
         return closeSession("Sending pending outbound data failed: " + result.error().message);
+    }
+
+    if (source.state.hungUp() && getInterests(source, destination).readable) {
+        // One queued send frees admission. Take at most one more residual chunk.
+        return handleReadable(id, role == EndpointRole::Upstream ? EndpointRole::Downstream
+                                                                 : EndpointRole::Upstream);
     }
 
     if (auto result = halfCloseIfReady(source, destination); !result) {
@@ -190,24 +203,12 @@ SessionEventResult SessionManager::handlePeerHalfClosed(SessionId id, EndpointRo
 SessionEventResult SessionManager::handleHangup(SessionId id, EndpointRole role) {
     Session& session = getSession(id);
     SessionEndpoint& hungup = getEndpoint(session, role);
-    SessionEndpoint& other = getOtherEndpoint(session, role);
-
-    hungup.state.write_closed = true;
-    // The connection is fully torn down, so the peer will not send anything more either.
+    hungup.state.send_buffer.reset();
     hungup.state.peer_half_closed = true;
-
-    // Forward whatever the hung-up peer already sent us so it still reaches the other endpoint,
-    // unless that endpoint has also hung up and can no longer receive it.
-    if (!other.state.write_closed) {
-        if (auto result = forwarder_.drain(hungup, other); !result) {
-            return closeSession("Draining hung-up endpoint failed: " + result.error().message);
-        }
+    if (shouldClose(session)) {
+        return closeSession();
     }
-    // We will never read from this socket again: the connection is gone, so anything not already
-    // drained is lost regardless. Recording this lets the endpoint be retired from the poller.
-    hungup.state.done_reading = true;
-
-    return shouldClose(session) ? closeSession() : keepOpen();
+    return handleReadable(id, role);
 }
 
 SessionEventResult SessionManager::handleError(SessionId id, EndpointRole role) {
@@ -230,7 +231,6 @@ SessionEndpoint SessionManager::getInitialSessionEndpoint(FileDescriptor fd) con
         .peer_half_closed = false,
         .half_close_sent = false,
         .done_reading = false,
-        .write_closed = false,
     };
 
     SessionEndpoint session_endpoint = {
@@ -280,11 +280,12 @@ EndpointInterests SessionManager::getInterests(const SessionEndpoint& endpoint,
     return EndpointInterests{
         // Stop reading once the destination has hung up: anything we read could only be forwarded
         // to a socket that can no longer receive it.
-        .readable = !endpoint.state.done_reading && !other.state.write_closed &&
+        .readable = !endpoint.state.done_reading && other.state.canWrite() &&
                     other.state.send_buffer->status() == SendBuffer::BufferStatus::Accepting,
         // Never attempt to write to a hung-up socket.
-        .writable = !endpoint.state.write_closed && !endpoint.state.send_buffer->empty(),
+        .writable = endpoint.state.canWrite() && !endpoint.state.send_buffer->empty(),
         .peer_half_close = !endpoint.state.peer_half_closed,
+        .edge_triggered = endpoint.state.hungUp(),
     };
 }
 

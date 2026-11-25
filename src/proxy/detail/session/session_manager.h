@@ -33,6 +33,7 @@ struct EndpointInterests {
     bool readable;
     bool writable;
     bool peer_half_close;
+    bool edge_triggered;
 };
 
 struct SessionInterests {
@@ -66,9 +67,7 @@ public:
     SessionSourceIds sourceIds(SessionId id) const;
     SessionInterests interests(SessionId id) const;
 
-    // Whether an endpoint should be retired from the poller: it has hung up and can therefore
-    // produce no further useful events. Leaving it registered would spin the reactor because
-    // EPOLLHUP is reported unconditionally.
+    // The session retains ownership after its source registration is retired.
     bool shouldRetire(SessionId id, EndpointRole role) const;
 
     SessionEventResult handleReadable(SessionId id, EndpointRole role);
