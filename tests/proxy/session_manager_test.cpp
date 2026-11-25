@@ -111,5 +111,20 @@ TEST(SessionManagerTest, WouldBlockAfterHangupKeepsInputEligibleForANewEdge) {
     EXPECT_EQ(0, recv(dest.peer.get(), &byte, 1, 0));
 }
 
+TEST(SessionManagerTest, TerminalWriteShutdownFailureClosesTheSession) {
+    SessionManager manager({{4, 8, 4}, 4, 4});
+    auto client = socketPair();
+    // An unconnected TCP socket deterministically returns ENOTCONN for SHUT_WR.
+    int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    ASSERT_GE(fd, 0);
+    auto id = manager.allocateId();
+    manager.add(id, std::move(client.local), FileDescriptor(fd), {1, 2});
+    ASSERT_EQ(0, shutdown(client.peer.get(), SHUT_WR));
+    auto result = manager.handleReadable(id, EndpointRole::Downstream);
+    EXPECT_EQ(SessionEventAction::Close, result.action);
+    ASSERT_TRUE(result.error);
+    EXPECT_NE(std::string::npos, result.error->find(std::system_category().message(ENOTCONN)));
+}
+
 } // namespace
 } // namespace orbit::proxy::detail

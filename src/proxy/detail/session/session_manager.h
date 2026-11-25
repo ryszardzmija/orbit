@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <optional>
+#include <ranges>
 #include <string>
 
 #include <absl/container/flat_hash_map.h>
@@ -63,7 +64,7 @@ public:
 
     bool contains(SessionId id) const;
     bool empty() const;
-    SessionId firstId() const;
+    auto ids() const { return std::views::keys(sessions_); }
     SessionSourceIds sourceIds(SessionId id) const;
     SessionInterests interests(SessionId id) const;
 

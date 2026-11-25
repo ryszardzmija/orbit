@@ -3,8 +3,10 @@
 #include <stdexcept>
 
 #include <gtest/gtest.h>
+#include <poll.h>
 #include <sys/epoll.h>
 #include <sys/socket.h>
+#include <sys/timerfd.h>
 
 #include "proxy/proxy.h"
 #include "socket_pair.h"
@@ -30,6 +32,25 @@ protected:
 
     auto dispatch(detail::ReadyEvent event) { return reactor->dispatch(event); }
     bool registered(detail::SourceId id) const { return reactor->sources_.find(id).has_value(); }
+
+    detail::SourceId installPending(test::SocketPair& client, test::SocketPair& attempt) {
+        auto added = reactor->registerPendingConnection({
+            .accepted_connection_fd = std::move(client.local),
+            .accepted_address = {},
+            .attempted_connection_fd = std::move(attempt.local),
+            .attempted_address_idx = 0,
+        });
+        if (!added) {
+            throw std::system_error(added.error());
+        }
+        return *added;
+    }
+
+    auto shutdownRequest() { return reactor->handleShutdownRequest(); }
+    auto listenerId() const { return reactor->active_listener_->listener_id; }
+    bool stopped() const { return reactor->shouldStop(); }
+    int timerFd() const { return reactor->shutdown_timer_fd_.get(); }
+    auto handleTimer() { return reactor->handleShutdownTimer({}); }
 
     std::optional<ProxyReactor> reactor;
 };
@@ -100,6 +121,77 @@ TEST_F(ProxyReactorTest, StaleReadCannotInterruptSurvivingDirection) {
     ASSERT_TRUE(dispatch({ids.downstream, EPOLLIN | EPOLLHUP}));
     ASSERT_EQ(1, recv(dest.peer.get(), &byte, 1, 0));
     EXPECT_EQ('a', byte);
+}
+
+TEST_F(ProxyReactorTest, EofAlonePropagatesFinAndKeepsReverseStreamOpen) {
+    auto client = test::socketPair();
+    auto backend = test::socketPair();
+    auto ids = install(client, backend);
+    char byte;
+    ASSERT_EQ(0, shutdown(client.peer.get(), SHUT_WR));
+    ASSERT_TRUE(dispatch({ids.downstream, EPOLLIN}));
+    ASSERT_EQ(0, recv(backend.peer.get(), &byte, 1, 0));
+    ASSERT_EQ(1, send(backend.peer.get(), "r", 1, 0));
+    ASSERT_EQ(0, shutdown(backend.peer.get(), SHUT_WR));
+    ASSERT_TRUE(dispatch({ids.upstream, EPOLLIN}));
+    ASSERT_EQ(1, recv(client.peer.get(), &byte, 1, 0));
+    EXPECT_EQ('r', byte);
+    ASSERT_TRUE(dispatch({ids.upstream, EPOLLIN}));
+    EXPECT_EQ(0, recv(client.peer.get(), &byte, 1, 0));
+    EXPECT_FALSE(registered(ids.downstream));
+}
+
+TEST_F(ProxyReactorTest, PendingOnlyShutdownInvalidatesCompletionAndClosesBothSockets) {
+    auto client = test::socketPair();
+    auto attempt = test::socketPair();
+    auto id = installPending(client, attempt);
+    auto second_client = test::socketPair();
+    auto second_attempt = test::socketPair();
+    auto second = installPending(second_client, second_attempt);
+    auto listener = listenerId();
+    ASSERT_TRUE(shutdownRequest());
+    EXPECT_FALSE(registered(listener));
+    EXPECT_FALSE(registered(id));
+    EXPECT_FALSE(registered(second));
+    EXPECT_TRUE(stopped());
+    ASSERT_TRUE(dispatch({listener, EPOLLIN}));
+    ASSERT_TRUE(dispatch({id, EPOLLOUT}));
+    char byte;
+    EXPECT_EQ(0, recv(client.peer.get(), &byte, 1, 0));
+    EXPECT_EQ(0, recv(attempt.peer.get(), &byte, 1, 0));
+    EXPECT_EQ(0, recv(second_client.peer.get(), &byte, 1, 0));
+    EXPECT_EQ(0, recv(second_attempt.peer.get(), &byte, 1, 0));
+}
+
+TEST_F(ProxyReactorTest, GracefulShutdownCancelsPendingsAndTimerEscalatesEstablishedSession) {
+    auto client = test::socketPair();
+    auto backend = test::socketPair();
+    auto ids = install(client, backend);
+    auto waiting = test::socketPair();
+    auto attempt = test::socketPair();
+    auto pending = installPending(waiting, attempt);
+    ASSERT_TRUE(shutdownRequest());
+    ASSERT_TRUE(handleTimer()); // Copied timer readiness without an expiration.
+    EXPECT_FALSE(stopped());
+    EXPECT_FALSE(registered(pending));
+    ASSERT_TRUE(dispatch({pending, EPOLLOUT}));
+    ASSERT_EQ(1, send(backend.peer.get(), "g", 1, 0));
+    ASSERT_TRUE(dispatch({ids.upstream, EPOLLIN}));
+    char byte;
+    ASSERT_EQ(1, recv(client.peer.get(), &byte, 1, 0));
+    EXPECT_EQ('g', byte);
+    // Expire the real one-shot timer without waiting 30 seconds.
+    itimerspec soon{};
+    soon.it_value.tv_nsec = 1;
+    ASSERT_EQ(0, timerfd_settime(timerFd(), 0, &soon, nullptr));
+    pollfd timer{timerFd(), POLLIN, 0};
+    ASSERT_EQ(1, poll(&timer, 1, 1000));
+    ASSERT_TRUE(handleTimer());
+    EXPECT_TRUE(stopped());
+    EXPECT_FALSE(registered(ids.downstream));
+    EXPECT_FALSE(registered(ids.upstream));
+    EXPECT_EQ(0, recv(client.peer.get(), &byte, 1, 0));
+    EXPECT_EQ(0, recv(backend.peer.get(), &byte, 1, 0));
 }
 
 } // namespace orbit::proxy

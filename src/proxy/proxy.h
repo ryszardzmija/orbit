@@ -9,7 +9,6 @@
 #include "common/fd.h"
 #include "net/listener.h"
 #include "proxy/detail/active_listener.h"
-#include "proxy/detail/dial/connection_id.h"
 #include "proxy/detail/epoll/epoll_poller.h"
 #include "proxy/detail/pending_connection.h"
 #include "proxy/detail/session/session_id.h"
@@ -99,6 +98,9 @@ private:
     Status<std::error_code> closeSession(detail::SessionId session_id);
     void closeSessionAndLog(detail::SessionId session_id);
 
+    Result<detail::PendingConnection, std::error_code> takePending(detail::SourceId id);
+    Status<std::error_code> cancelPendingConnections();
+
     // Event handlers
     Status<FatalReactorError> dispatch(detail::ReadyEvent event);
     Status<FatalReactorError> handleEndpoint(detail::EndpointRegistration registration,
@@ -106,8 +108,7 @@ private:
     Status<FatalReactorError> handleShutdownSignal(detail::ShutdownSignalRegistration);
     Status<FatalReactorError> handleShutdownTimer(detail::ShutdownTimerRegistration);
     Status<FatalReactorError> handleListener(detail::ListenerRegistration);
-    Status<FatalReactorError> handlePendingConnection(detail::SourceId id,
-                                                      detail::PendingDialRegistration registration);
+    Status<FatalReactorError> handlePendingConnection(detail::SourceId id);
 
     // Handlers for handlePendingConnection()
     Status<FatalReactorError> handleDialResult(detail::UpstreamDialResult dial_result);
@@ -137,9 +138,7 @@ private:
     detail::SessionManager session_manager_;
     FileDescriptor shutdown_signal_fd_;
     FileDescriptor shutdown_timer_fd_;
-    absl::flat_hash_map<detail::PendingConnectionId, detail::PendingConnection>
-        pending_connections_;
-    detail::PendingConnectionIdGenerator pending_connection_id_generator_;
+    absl::flat_hash_map<detail::SourceId, detail::PendingConnection> pending_connections_;
     std::optional<detail::ActiveListener> active_listener_;
     detail::UpstreamDialer upstream_dialer_;
     ShutdownState shutdown_state_ = ShutdownState::Running;

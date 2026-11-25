@@ -38,11 +38,7 @@ Source baseline is `e3aec7b`. A source-confirmed finding follows from the implem
 
 ## LIM-006 — Pending dials have mixed graceful shutdown behavior
 
-- **Classification and priority** — Functional limitation, medium.
-- **Source and evidence** — [`handleShutdownRequest`, `shouldStop`, `handlePendingConnection` and `forceCloseAllSessions`](../src/proxy/proxy.cpp) remove the listener and count only sessions in `SessionManager`. Pending completion and candidate fallback have no shutdown-state guard. Hard stop explicitly removes established sessions, and pending fds survive until reactor destruction.
-- **Conditions and impact** — While an established session keeps graceful processing active, a pending dial can become established or advance candidates. When the established map becomes empty, the reactor can exit with pending dials still in the map, discarding them through destruction. Whether an already-ready dial is handled can depend on event order relative to the shutdown request or last session close.
-- **Verification** — Source-confirmed. The existing graceful and second-signal tests use established sessions.
-- **Follow-up** — In a shutdown correctness task, define and test whether graceful shutdown cancels, finishes, or includes pending attempts in the drain condition. Align promotion, lookup removal and cancellation before implementing scheduled dial deadlines.
+- **Disposition** — Resolved in M1.3. The first processed shutdown cancels every pending dial, invalidates its source, and stops admission. Established sessions alone drain until natural completion, a second signal or the 30-second deadline. Controlled tests exercise pending-only and mixed cases, late completions and timer escalation.
 
 ## LIM-007 — SendBufferConfig is disconnected from runtime
 
@@ -55,7 +51,7 @@ Source baseline is `e3aec7b`. A source-confirmed finding follows from the implem
 ## LIM-008 — Source identities have no wrap policy
 
 - **Classification and priority** — Architectural risk, low.
-- **Source and evidence** — [`EpollPoller::add`](../src/proxy/detail/epoll/epoll_poller.cpp) stores a `SourceId` in `epoll_event.data.u64`. [`ReactorSources::find` and `remove`](../src/proxy/detail/sources/reactor_sources.cpp) and [`ProxyReactor::closeSession`](../src/proxy/proxy.cpp) make a retired source unresolvable, protecting against ordinary numeric fd reuse. [`MonotonicIdGenerator::getNextId`](../src/proxy/detail/id/generator.h) increments a `uint64_t` without wrap handling. Source, session and pending IDs use independent instances.
+- **Source and evidence** — [`EpollPoller::add`](../src/proxy/detail/epoll/epoll_poller.cpp) stores a `SourceId` in `epoll_event.data.u64`. [`ReactorSources::find` and `remove`](../src/proxy/detail/sources/reactor_sources.cpp) and [`ProxyReactor::closeSession`](../src/proxy/proxy.cpp) make a retired source unresolvable, protecting against ordinary numeric fd reuse. [`MonotonicIdGenerator::getNextId`](../src/proxy/detail/id/generator.h) increments a `uint64_t` without wrap handling. Source and session IDs use independent instances. A pending attempt uses its registration ID.
 - **Conditions and impact** — A reused fd gets a fresh source ID during ordinary operation. If a generator traverses its 64-bit space, a subsequent ID may alias a live registration or a retained identity. The current lifetime of readiness batches and size of the ID space make wrap a low priority. Future delayed work can extend the lifetime of identities.
 - **Verification** — Source-confirmed fd reuse protection and absent wrap policy. M1.2 confirmed ordinary fd reuse protection with a reused fd and a previous registration’s event.
 - **Follow-up** — The generator still wraps after the full 64-bit space. M1.2 retained its existing lifetime assumption. Preserve identity checks for scheduled work.
@@ -80,7 +76,7 @@ Source baseline is `e3aec7b`. A source-confirmed finding follows from the implem
 ## LIM-011 — Fault and readiness tests leave gaps
 
 - **Classification and priority** — Testing gap, high.
-- **Source and evidence** — [GoogleTest units](../tests/CMakeLists.txt) cover syntax, address formatting and queue logic. [Loopback integration](../tests/integration/proxy_sessions_test.py) covers established traffic, one upstream reset, churn, half-close, ordinary full hangup, idle CPU and signal escalation. The large-transfer test does not observe exact buffer occupancy or control partial syscall results. M1.1 adds controlled saturated hangups in both directions. M1.2 adds controlled stale batches and fd reuse. Remaining gaps include pending dial failures and address fallback deterministically, pending shutdown, timer-only escalation, fd exhaustion, registration rollback faults or live IPv6 forwarding.
+- **Source and evidence** — [GoogleTest units](../tests/CMakeLists.txt) cover syntax, address formatting and queue logic. [Loopback integration](../tests/integration/proxy_sessions_test.py) covers established traffic, one upstream reset, churn, half-close, ordinary full hangup, idle CPU and signal escalation. The large-transfer test does not observe exact buffer occupancy or control partial syscall results. M1.1 adds controlled saturated hangups in both directions. M1.2 adds controlled stale batches and fd reuse. M1.3 covers pending cancellation, timer escalation and terminal write-shutdown failure. Remaining gaps include pending dial failures and address fallback deterministically, fd exhaustion, registration rollback faults or live IPv6 forwarding.
 - **Conditions and impact** — Regressions in rare event combinations and failures can pass the existing suite. The harness still uses deliberate delays for reset, slow-reader and idle-CPU scenarios. Orbit's CLI rejects port zero, so the bind-after-release window for its listener still exists. It can cause a startup failure if another process takes the port.
 - **Verification** — Confirmed by test inventory. Churn and transfer cases are useful indirect coverage with limited control over the targeted state.
 - **Follow-up** — Select deterministic fault and timeout coverage when modifying the other paths. See LIM-016 for the M0.2 harness fixes.
@@ -103,11 +99,7 @@ Source baseline is `e3aec7b`. A source-confirmed finding follows from the implem
 
 ## LIM-014 — Failed write shutdown may leave a session waiting
 
-- **Classification and priority** — Suspected defect, medium.
-- **Source and evidence** — [`halfCloseIfReady`, `shouldClose` and endpoint handlers](../src/proxy/detail/session/session_manager.cpp) leave `half_close_sent` unset on `shutdown(SHUT_WR)` failure and return a keep-open result with an error. Retry depends on a later relevant readiness event. The normal close predicate requires both successful write shutdowns, and there is no per-session timer.
-- **Conditions and impact** — If shutdown fails after input is consumed and the output queue is empty, the half-close can remain unpropagated until another relevant event, error, hangup or process shutdown. The event sequence matters, since a later HUP or ERR can still close the session.
-- **Verification** — The failed-syscall behavior is source-confirmed. A persistent wait after failure is plausible and unverified.
-- **Follow-up** — Investigate in a shutdown correctness task with controlled failure coverage. Define the retry or close policy and verify pending-data and session cleanup behavior.
+- **Disposition** — Resolved in M1.3. Actual input EOF and an empty destination queue suffice to propagate FIN. EINTR retries the syscall and a terminal failure closes the pair locally. Tests drive EOF without RDHUP and force ENOTCONN using an unconnected socket.
 
 ## LIM-015 — Invalid environment settings can revert to defaults
 

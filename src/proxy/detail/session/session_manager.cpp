@@ -20,61 +20,31 @@ namespace orbit::proxy::detail {
 
 namespace {
 
-Status<std::error_code> halfCloseConnection(int socket_fd) {
-    if (int result = shutdown(socket_fd, SHUT_WR); result == -1) {
-        return std::unexpected(std::error_code(errno, std::system_category()));
-    }
-
-    return {};
-}
-
-bool shouldHalfClose(const SessionEndpoint& source, const SessionEndpoint& destination) {
-    return source.state.peer_half_closed && source.state.done_reading &&
-           destination.state.send_buffer->empty();
-}
-
 Status<std::error_code> halfCloseIfReady(const SessionEndpoint& source,
                                          SessionEndpoint& destination) {
-    if (!destination.state.canWrite() || !shouldHalfClose(source, destination)) {
+    if (!destination.state.canWrite() || !source.state.done_reading ||
+        !destination.state.send_buffer->empty()) {
         return {};
     }
 
-    if (auto result = halfCloseConnection(destination.fd.get()); !result) {
-        return result;
+    while (shutdown(destination.fd.get(), SHUT_WR) == -1) {
+        if (errno != EINTR) {
+            return std::unexpected(std::error_code(errno, std::system_category()));
+        }
     }
     destination.state.half_close_sent = true;
-
     return {};
 }
 
-bool isHungUp(const Session& session) {
-    return session.downstream.state.hungUp() || session.upstream.state.hungUp();
-}
-
-// Whether the source->destination stream has nothing left to deliver: either the destination has
-// hung up (its buffered data is undeliverable), or we have read everything from the source and
-// flushed it all to the destination.
-bool directionComplete(const SessionEndpoint& source, const SessionEndpoint& destination) {
-    return destination.state.hungUp() ||
-           (source.state.done_reading && destination.state.send_buffer->empty());
-}
-
 bool shouldClose(const Session& session) {
-    // Once either side has hung up the half-close handshake can no longer complete on its own (a
-    // half-close cannot be propagated through a socket we can no longer write to), so the session
-    // is torn down as soon as both directions have delivered everything they still can.
-    if (isHungUp(session)) {
-        return directionComplete(session.downstream, session.upstream) &&
-               directionComplete(session.upstream, session.downstream);
-    }
-
-    return session.downstream.state.half_close_sent && session.upstream.state.half_close_sent;
+    // Each destination has either received its ordered FIN or hung up.
+    return !session.downstream.state.canWrite() && !session.upstream.state.canWrite();
 }
 
-SessionEventResult keepOpen(std::optional<std::string> error = std::nullopt) {
+SessionEventResult keepOpen() {
     return SessionEventResult{
         .action = SessionEventAction::KeepOpen,
-        .error = std::move(error),
+        .error = std::nullopt,
     };
 }
 
@@ -118,11 +88,6 @@ bool SessionManager::contains(SessionId id) const { return sessions_.contains(id
 
 bool SessionManager::empty() const { return sessions_.empty(); }
 
-SessionId SessionManager::firstId() const {
-    assert(!sessions_.empty() && "no sessions are managed");
-    return sessions_.begin()->first;
-}
-
 SessionSourceIds SessionManager::sourceIds(SessionId id) const {
     return getManagedSession(id).source_ids;
 }
@@ -154,7 +119,7 @@ SessionEventResult SessionManager::handleReadable(SessionId id, EndpointRole rol
     }
 
     if (auto result = halfCloseIfReady(source, destination); !result) {
-        return keepOpen("Half-closing connection failed: " + result.error().message());
+        return closeSession("Half-closing connection failed: " + result.error().message());
     }
 
     return shouldClose(session) ? closeSession() : keepOpen();
@@ -180,24 +145,15 @@ SessionEventResult SessionManager::handleWritable(SessionId id, EndpointRole rol
     }
 
     if (auto result = halfCloseIfReady(source, destination); !result) {
-        return keepOpen("Half-closing connection failed: " + result.error().message());
+        return closeSession("Half-closing connection failed: " + result.error().message());
     }
 
     return shouldClose(session) ? closeSession() : keepOpen();
 }
 
 SessionEventResult SessionManager::handlePeerHalfClosed(SessionId id, EndpointRole role) {
-    Session& session = getSession(id);
-    SessionEndpoint& source = getEndpoint(session, role);
-    SessionEndpoint& destination = getOtherEndpoint(session, role);
-
-    source.state.peer_half_closed = true;
-
-    if (auto result = halfCloseIfReady(source, destination); !result) {
-        return keepOpen("Half-closing connection failed: " + result.error().message());
-    }
-
-    return shouldClose(session) ? closeSession() : keepOpen();
+    getEndpoint(getSession(id), role).state.peer_half_closed = true;
+    return keepOpen();
 }
 
 SessionEventResult SessionManager::handleHangup(SessionId id, EndpointRole role) {
@@ -284,7 +240,7 @@ EndpointInterests SessionManager::getInterests(const SessionEndpoint& endpoint,
                     other.state.send_buffer->status() == SendBuffer::BufferStatus::Accepting,
         // Never attempt to write to a hung-up socket.
         .writable = endpoint.state.canWrite() && !endpoint.state.send_buffer->empty(),
-        .peer_half_close = !endpoint.state.peer_half_closed,
+        .peer_half_close = !endpoint.state.peer_half_closed && !endpoint.state.done_reading,
         .edge_triggered = endpoint.state.hungUp(),
     };
 }

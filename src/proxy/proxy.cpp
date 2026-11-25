@@ -203,8 +203,8 @@ Status<FatalReactorError> ProxyReactor::dispatch(detail::ReadyEvent event) {
             [&](detail::ListenerRegistration r) { return handleListener(r); },
             [&](detail::ShutdownSignalRegistration r) { return handleShutdownSignal(r); },
             [&](detail::ShutdownTimerRegistration r) { return handleShutdownTimer(r); },
-            [&](detail::PendingDialRegistration r) {
-                return handlePendingConnection(event.source_id, r);
+            [&](detail::PendingDialRegistration) {
+                return handlePendingConnection(event.source_id);
             },
         },
         *registration);
@@ -297,18 +297,35 @@ Result<detail::SourceId, std::error_code> ProxyReactor::registerShutdownTimerEve
 
 Result<detail::SourceId, std::error_code>
 ProxyReactor::registerPendingConnection(detail::PendingConnection pending_connection) {
-    uint32_t initial_events = EPOLLOUT;
-    int fd = pending_connection.attempted_connection_fd->get();
-    detail::PendingConnectionId id = pending_connection_id_generator_.getNextId();
-
-    pending_connections_.emplace(id, std::move(pending_connection));
-
-    auto register_result =
-        registerReactorSource(fd, initial_events, detail::PendingDialRegistration{id});
-    if (!register_result) {
-        pending_connections_.erase(id);
+    auto registered = registerReactorSource(pending_connection.attempted_connection_fd->get(),
+                                            EPOLLOUT, detail::PendingDialRegistration{});
+    if (registered) {
+        pending_connections_.emplace(*registered, std::move(pending_connection));
     }
-    return register_result;
+    return registered;
+}
+
+Result<detail::PendingConnection, std::error_code> ProxyReactor::takePending(detail::SourceId id) {
+    auto it = pending_connections_.find(id);
+    assert(it != pending_connections_.end());
+    auto retired = unregisterReactorSource(id);
+    auto pending = std::move(it->second);
+    pending_connections_.erase(it);
+    if (!retired) {
+        return std::unexpected(retired.error());
+    }
+    return pending;
+}
+
+Status<std::error_code> ProxyReactor::cancelPendingConnections() {
+    Status<std::error_code> status;
+    for (auto it = pending_connections_.begin(); it != pending_connections_.end();) {
+        auto id = (it++)->first; // takePending erases only this entry.
+        if (auto pending = takePending(id); !pending && status) {
+            status = std::unexpected(pending.error());
+        }
+    }
+    return status;
 }
 
 // If everything succeeds both endpoints are registered and SessionManager assumes ownership of
@@ -454,7 +471,7 @@ ProxyReactor::synchronizeEndpoint(detail::SessionId session_id, detail::Endpoint
 }
 
 Status<FatalReactorError> ProxyReactor::handleShutdownSignal(detail::ShutdownSignalRegistration) {
-    auto drain_result = detail::drainSignalFd(shutdown_signal_fd_.get());
+    auto drain_result = detail::readShutdownRequests(shutdown_signal_fd_.get());
     if (!drain_result) {
         return std::unexpected(FatalReactorError{drain_result.error().message()});
     }
@@ -470,8 +487,12 @@ Status<FatalReactorError> ProxyReactor::handleShutdownSignal(detail::ShutdownSig
 }
 
 Status<FatalReactorError> ProxyReactor::handleShutdownTimer(detail::ShutdownTimerRegistration) {
-    if (auto drain_result = detail::drainTimerFd(shutdown_timer_fd_.get()); !drain_result) {
-        return std::unexpected(FatalReactorError{drain_result.error().message()});
+    auto expired = detail::drainTimerFd(shutdown_timer_fd_.get());
+    if (!expired) {
+        return std::unexpected(FatalReactorError{expired.error().message()});
+    }
+    if (!*expired || shutdown_state_ != ShutdownState::GracefullyStopping) {
+        return {};
     }
 
     if (auto shutdown_request_result = handleShutdownRequest(); !shutdown_request_result) {
@@ -522,20 +543,15 @@ Status<FatalReactorError> ProxyReactor::handleListener(detail::ListenerRegistrat
     return {};
 }
 
-Status<FatalReactorError>
-ProxyReactor::handlePendingConnection(detail::SourceId id,
-                                      detail::PendingDialRegistration registration) {
-    auto it = pending_connections_.find(registration.pending_connection_id);
-    assert(it != pending_connections_.end());
-
-    detail::PendingConnection pending_connection = std::move(it->second);
-    pending_connections_.erase(registration.pending_connection_id);
-
-    if (auto unregister_result = unregisterReactorSource(id); !unregister_result) {
-        return std::unexpected(FatalReactorError{unregister_result.error().message()});
+Status<FatalReactorError> ProxyReactor::handlePendingConnection(detail::SourceId id) {
+    auto pending = takePending(id);
+    if (!pending) {
+        return std::unexpected(FatalReactorError{pending.error().message()});
     }
-
-    auto dial_result = upstream_dialer_.advanceDialAttempt(std::move(pending_connection));
+    if (shutdown_state_ != ShutdownState::Running) {
+        return {};
+    }
+    auto dial_result = upstream_dialer_.advanceDialAttempt(std::move(*pending));
     if (!dial_result) {
         return handleDialError(std::move(dial_result.error()));
     }
@@ -617,7 +633,7 @@ Status<std::error_code> ProxyReactor::handleShutdownRequest() {
         }
         active_listener_.reset();
         shutdown_state_ = ShutdownState::GracefullyStopping;
-        break;
+        return cancelPendingConnections();
     case ShutdownState::GracefullyStopping:
         if (auto timer_disarming_result = detail::disarmTimer(shutdown_timer_fd_.get());
             !timer_disarming_result) {
@@ -649,8 +665,9 @@ bool ProxyReactor::shouldStop() const {
 Status<std::error_code> ProxyReactor::forceCloseAllSessions() {
     std::optional<std::error_code> first_error;
 
-    while (!session_manager_.empty()) {
-        detail::SessionId session_id = session_manager_.firstId();
+    const auto ids = session_manager_.ids();
+    for (auto it = ids.begin(); it != ids.end();) {
+        const auto session_id = *it++; // Advance before closeSession erases the current owner.
 
         if (auto result = closeSession(session_id); !result) {
             spdlog::warn("Failed to close session {} during hard shutdown: {}", session_id,
