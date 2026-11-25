@@ -21,18 +21,21 @@ namespace orbit::proxy::detail {
 namespace {
 
 Status<std::error_code> halfCloseIfReady(const SessionEndpoint& source,
-                                         SessionEndpoint& destination) {
+                                         SessionEndpoint& destination, IdleDeadline* idle) {
     if (!destination.state.canWrite() || !source.state.done_reading ||
         !destination.state.send_buffer->empty()) {
         return {};
     }
 
-    while (shutdown(destination.fd.get(), SHUT_WR) == -1) {
+    while (!idle || idle->canStartIo()) {
+        if (shutdown(destination.fd.get(), SHUT_WR) == 0) {
+            destination.state.half_close_sent = true;
+            break;
+        }
         if (errno != EINTR) {
             return std::unexpected(std::error_code(errno, std::system_category()));
         }
     }
-    destination.state.half_close_sent = true;
     return {};
 }
 
@@ -105,58 +108,71 @@ bool SessionManager::shouldRetire(SessionId id, EndpointRole role) const {
     return endpoint.state.hungUp() && endpoint.state.done_reading;
 }
 
-SessionEventResult SessionManager::handleReadable(SessionId id, EndpointRole role) {
+SessionEventResult SessionManager::handleReadable(SessionId id, EndpointRole role,
+                                                  IdleDeadline* idle) {
     Session& session = getSession(id);
     SessionEndpoint& source = getEndpoint(session, role);
     SessionEndpoint& destination = getOtherEndpoint(session, role);
 
+    if (idle && !idle->canStartIo()) {
+        return closeSession();
+    }
     if (!getInterests(source, destination).readable) {
         return keepOpen();
     }
 
-    if (auto result = forwarder_.forward(source, destination); !result) {
+    if (auto result = forwarder_.forward(source, destination, idle); !result) {
         return closeSession("Forwarding failed: " + result.error().message);
     }
 
-    if (auto result = halfCloseIfReady(source, destination); !result) {
+    if (auto result = halfCloseIfReady(source, destination, idle); !result) {
         return closeSession("Half-closing connection failed: " + result.error().message());
     }
 
     return shouldClose(session) ? closeSession() : keepOpen();
 }
 
-SessionEventResult SessionManager::handleWritable(SessionId id, EndpointRole role) {
+SessionEventResult SessionManager::handleWritable(SessionId id, EndpointRole role,
+                                                  IdleDeadline* idle) {
     Session& session = getSession(id);
     SessionEndpoint& destination = getEndpoint(session, role);
     SessionEndpoint& source = getOtherEndpoint(session, role);
 
+    if (idle && !idle->canStartIo()) {
+        return closeSession();
+    }
     if (!getInterests(destination, source).writable) {
         return keepOpen();
     }
 
-    if (auto result = sender_.sendPending(destination); !result) {
+    if (auto result = sender_.sendPending(destination, idle); !result) {
         return closeSession("Sending pending outbound data failed: " + result.error().message);
     }
 
     if (source.state.hungUp() && getInterests(source, destination).readable) {
-        // One queued send frees admission. Take at most one more residual chunk.
-        return handleReadable(id, role == EndpointRole::Upstream ? EndpointRole::Downstream
-                                                                 : EndpointRole::Upstream);
+        auto source_role =
+            role == EndpointRole::Upstream ? EndpointRole::Downstream : EndpointRole::Upstream;
+        return handleReadable(id, source_role, idle);
     }
 
-    if (auto result = halfCloseIfReady(source, destination); !result) {
+    if (auto result = halfCloseIfReady(source, destination, idle); !result) {
         return closeSession("Half-closing connection failed: " + result.error().message());
     }
 
     return shouldClose(session) ? closeSession() : keepOpen();
 }
 
-SessionEventResult SessionManager::handlePeerHalfClosed(SessionId id, EndpointRole role) {
+SessionEventResult SessionManager::handlePeerHalfClosed(SessionId id, EndpointRole role,
+                                                        IdleDeadline* idle) {
+    if (idle && !idle->canStartIo()) {
+        return closeSession();
+    }
     getEndpoint(getSession(id), role).state.peer_half_closed = true;
     return keepOpen();
 }
 
-SessionEventResult SessionManager::handleHangup(SessionId id, EndpointRole role) {
+SessionEventResult SessionManager::handleHangup(SessionId id, EndpointRole role,
+                                                IdleDeadline* idle) {
     Session& session = getSession(id);
     SessionEndpoint& hungup = getEndpoint(session, role);
     hungup.state.send_buffer.reset();
@@ -164,7 +180,7 @@ SessionEventResult SessionManager::handleHangup(SessionId id, EndpointRole role)
     if (shouldClose(session)) {
         return closeSession();
     }
-    return handleReadable(id, role);
+    return handleReadable(id, role, idle);
 }
 
 SessionEventResult SessionManager::handleError(SessionId id, EndpointRole role) {

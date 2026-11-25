@@ -12,6 +12,7 @@
 #include "proxy/detail/buffer/send_buffer_options.h"
 #include "proxy/detail/forwarding.h"
 #include "proxy/detail/pending_data_sender.h"
+#include "proxy/detail/session/idle_deadline.h"
 #include "proxy/detail/session/session_id.h"
 #include "proxy/detail/session/session_registration.h"
 #include "proxy/detail/session/session_state.h"
@@ -71,10 +72,13 @@ public:
     // The session retains ownership after its source registration is retired.
     bool shouldRetire(SessionId id, EndpointRole role) const;
 
-    SessionEventResult handleReadable(SessionId id, EndpointRole role);
-    SessionEventResult handleWritable(SessionId id, EndpointRole role);
-    SessionEventResult handlePeerHalfClosed(SessionId id, EndpointRole role);
-    SessionEventResult handleHangup(SessionId id, EndpointRole role);
+    SessionEventResult handleReadable(SessionId id, EndpointRole role,
+                                      IdleDeadline* idle = nullptr);
+    SessionEventResult handleWritable(SessionId id, EndpointRole role,
+                                      IdleDeadline* idle = nullptr);
+    SessionEventResult handlePeerHalfClosed(SessionId id, EndpointRole role,
+                                            IdleDeadline* idle = nullptr);
+    SessionEventResult handleHangup(SessionId id, EndpointRole role, IdleDeadline* idle = nullptr);
     SessionEventResult handleError(SessionId id, EndpointRole role);
 
 private:

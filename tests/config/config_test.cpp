@@ -32,9 +32,9 @@ parseArguments(std::initializer_list<std::string> input_arguments) {
 class ConfigTest : public testing::Test {
 protected:
     void SetUp() override {
-        constexpr std::array<const char*, 5> environment_variables{
+        constexpr std::array environment_variables{
             "ORBIT_LISTEN_HOST", "ORBIT_LISTEN_PORT",        "ORBIT_UPSTREAMS",
-            "ORBIT_LOG_LEVEL",   "ORBIT_CONNECT_TIMEOUT_MS",
+            "ORBIT_LOG_LEVEL",   "ORBIT_CONNECT_TIMEOUT_MS", "ORBIT_IDLE_TIMEOUT_MS",
         };
 
         for (const char* variable : environment_variables) {
@@ -175,4 +175,26 @@ TEST_F(ConfigTest, RejectsInvalidConnectTimeoutFromCliOrEnvironment) {
     auto env = parseArguments({"--upstream", "backend:1"});
     ASSERT_TRUE(env);
     EXPECT_EQ(17, env->timeouts.connect.count());
+}
+
+TEST_F(ConfigTest, IdleTimeoutDefaultsBoundariesAndEnvironment) {
+    auto defaults = parseArguments({"--upstream", "backend:1"});
+    ASSERT_TRUE(defaults);
+    EXPECT_EQ(0, defaults->timeouts.idle.count());
+    ASSERT_EQ(0, setenv("ORBIT_IDLE_TIMEOUT_MS", "23000", 1));
+    auto env = parseArguments({"--upstream", "backend:1"});
+    ASSERT_TRUE(env);
+    EXPECT_EQ(23000, env->timeouts.idle.count());
+    for (auto ms : {0, 1, 2147483647}) {
+        auto result =
+            parseArguments({"--upstream", "backend:1", "--idle-timeout-ms", std::to_string(ms)});
+        ASSERT_TRUE(result);
+        EXPECT_EQ(ms, result->timeouts.idle.count());
+    }
+    for (auto invalid : {"-1", "0.1", "1ms", "2147483648", "999999999999999999999"}) {
+        SCOPED_TRACE(invalid);
+        EXPECT_FALSE(parseArguments({"--upstream", "backend:1", "--idle-timeout-ms", invalid}));
+        ASSERT_EQ(0, setenv("ORBIT_IDLE_TIMEOUT_MS", invalid, 1));
+        EXPECT_FALSE(parseArguments({"--upstream", "backend:1"}));
+    }
 }

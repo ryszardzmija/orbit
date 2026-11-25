@@ -22,6 +22,19 @@ void Deadlines::cancel(DeadlineKey key) {
     }
 }
 
+std::optional<Deadline> Deadlines::scheduledAt(DeadlineKey key) const {
+    auto it = times_.find(key);
+    if (it == times_.end()) {
+        return std::nullopt;
+    }
+    return it->second;
+}
+
+bool Deadlines::due(DeadlineKey key, Deadline now) const {
+    auto at = scheduledAt(key);
+    return at && *at <= now;
+}
+
 std::optional<Deadline> Deadlines::next() const {
     if (ordered_.empty()) {
         return std::nullopt;

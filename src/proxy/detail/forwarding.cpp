@@ -18,7 +18,8 @@ Forwarder Forwarder::create(size_t capacity) {
     return Forwarder(capacity);
 }
 
-Status<ForwardError> Forwarder::forward(SessionEndpoint& source, SessionEndpoint& destination) {
+Status<ForwardError> Forwarder::forward(SessionEndpoint& source, SessionEndpoint& destination,
+                                        IdleDeadline* idle) {
     assert(destination.state.send_buffer != nullptr);
     assert(destination.state.send_buffer->status() == SendBuffer::BufferStatus::Accepting);
 
@@ -40,12 +41,18 @@ Status<ForwardError> Forwarder::forward(SessionEndpoint& source, SessionEndpoint
     }
 
     size_t bytes_read = recv_result.value().bytes_received;
+    if (idle && !idle->recordTransfer(bytes_read)) {
+        return {};
+    }
 
     // We can try to send the data directly only if the send buffer is empty since otherwise
     // the data would be reordered.
     // Queue residual input even for an empty destination. Its level-triggered writable
     // event continues the drain after this single receive.
     if (!source.state.hungUp() && destination.state.send_buffer->empty()) {
+        if (idle && !idle->canStartIo()) {
+            return {};
+        }
         auto send_result =
             net::trySend(destination.fd.get(), std::span<uint8_t>(buf_.get(), bytes_read));
         if (!send_result) {
@@ -57,6 +64,9 @@ Status<ForwardError> Forwarder::forward(SessionEndpoint& source, SessionEndpoint
         }
 
         size_t bytes_written = send_result.value().bytes_sent;
+        if (idle && !idle->recordTransfer(bytes_written)) {
+            return {};
+        }
         if (bytes_written != bytes_read) {
             storeUnsent(destination, bytes_read, bytes_written);
         }

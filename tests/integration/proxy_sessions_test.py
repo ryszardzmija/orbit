@@ -470,6 +470,20 @@ class ProxySessionIntegrationTest(unittest.TestCase):
         expect_eof(backend)
 
 
+class IdleExpirationIntegrationTest(unittest.TestCase):
+    def test_configured_idle_timeout_closes_established_tcp_pair(self):
+        proxy = ProxyHarness()
+        self.addCleanup(proxy.close)
+        proxy.start([self.orbit_binary, "--idle-timeout-ms", "250"])
+        client, backend = proxy.connect_session()
+        send_message(client, b"established")
+        self.assertEqual(b"established", recv_message(backend))
+        expect_eof(client)
+        expect_eof(backend)
+        proxy.request_shutdown()
+        proxy.wait_for_clean_exit()
+
+
 class ProxyHarnessTest(unittest.TestCase):
     def setUp(self):
         self.proxy = ProxyHarness()
@@ -533,5 +547,7 @@ class ProxyHarnessTest(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    ProxySessionIntegrationTest.orbit_binary = sys.argv.pop(1)
+    orbit_binary = sys.argv.pop(1)
+    ProxySessionIntegrationTest.orbit_binary = orbit_binary
+    IdleExpirationIntegrationTest.orbit_binary = orbit_binary
     unittest.main(verbosity=2, buffer=True)

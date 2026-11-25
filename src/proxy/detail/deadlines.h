@@ -13,7 +13,7 @@ namespace orbit::proxy::detail {
 using DeadlineClock = std::chrono::steady_clock;
 using Deadline = DeadlineClock::time_point;
 
-enum class DeadlineKind { Shutdown, Connect };
+enum class DeadlineKind { Shutdown, Connect, Idle };
 
 struct DeadlineKey {
     DeadlineKind kind;
@@ -26,6 +26,8 @@ class Deadlines {
 public:
     void schedule(DeadlineKey key, Deadline at);
     void cancel(DeadlineKey key);
+    std::optional<Deadline> scheduledAt(DeadlineKey key) const;
+    bool due(DeadlineKey key, Deadline now) const;
     std::optional<Deadline> next() const;
     std::optional<DeadlineKey> popDue(Deadline now);
 
