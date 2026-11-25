@@ -1,7 +1,7 @@
 # Orbit
 
 <div align="center">
-  <img src="assets/logo.png" alt="Orbit Logo" width="300"/>
+  <img src="assets/logo.png" alt="Orbit logo" width="300"/>
   <p>
     <a href="https://github.com/ryszardzmija/orbit/actions/workflows/ci.yaml">
       <img src="https://github.com/ryszardzmija/orbit/actions/workflows/ci.yaml/badge.svg" alt="CI"/>
@@ -9,59 +9,39 @@
   </p>
 </div>
 
-## Overview
+Orbit is a TCP reverse proxy for Linux. It provides a client-facing address for a backend
+service and relays traffic in both directions, so applications can keep using their existing
+protocols.
 
-Orbit is intended to become a gateway to ShaleDB, a Dynamo-like distributed key-value store. For
-now, it is a transparent TCP reverse proxy: clients connect to Orbit and Orbit forwards their byte
-streams to the first configured upstream server without interpreting the protocol (before load balancing is implemented).
+Orbit uses Linux `epoll` to handle concurrent connections. It manages traffic flow when clients
+or upstreams read slowly and supports graceful shutdown, giving active connections time to
+finish.
 
-## Design
+The project is evolving into a resource-efficient, fault-tolerant Layer 4 TCP load balancer.
+Development priorities include distributing connections across upstreams, handling upstream
+failures, and keeping resource use predictable under load.
 
-Orbit uses nonblocking sockets and a single `epoll` reactor to manage the listener, upstream
-connections, and active sessions. Each client is paired with its upstream socket, allowing many
-streams to make progress without dedicating a thread to each connection.
+## Getting started
 
-Data is forwarded directly when possible. If one side cannot keep up, Orbit buffers pending data
-and normally pauses reads until the queue falls to its low watermark. Watermarks guide flow control.
-A hard send or receive error closes the affected session. Some dial and reactor failures end the
-process.
-
-On shutdown, Orbit stops accepting new clients and gives established sessions time to finish before
-forcing remaining connections closed.
-
-See the [architecture](docs/architecture.md) for the event loop, connection lifecycle and shutdown
-behavior, the [engineering invariants](docs/invariants.md) for correctness requirements, and
-[known limitations](docs/known-limitations.md) for the current gaps.
-
-## Building
-
-On Linux, the `debug` preset uses GCC 15, CMake 3.28 or newer, Ninja, Git and Python 3.10 or
-newer. CMake fetches the pinned dependencies during configuration.
+Orbit is written in C++23. To build it on Linux, use GCC 15, CMake 3.28 or newer, Ninja, Git,
+and Python 3.10 or newer. CMake fetches pinned dependencies from GitHub during the first
+configure. The echo example also requires `socat`.
 
 ```sh
+git clone https://github.com/ryszardzmija/orbit.git
+cd orbit
 cmake --preset debug
 cmake --build --preset debug
-ctest --preset debug
 ```
 
-The [development guide](docs/development.md) covers tool installation, the `release` and
-`sanitizers` presets, test selection and CI diagnostics.
-
-## Benchmarks
-
-The loopback benchmarks measure TCP throughput, echo latency and idle connection resource use
-with a Release build. [Benchmark instructions](benchmarks/README.md)
-
-## Trying it out
-
-You can try the proxy without a ShaleDB server by putting `cat` behind `socat` as a simple
-echoing upstream. In one terminal, start the upstream:
+In one terminal, start a TCP echo server on loopback.
 
 ```sh
-socat -v TCP-LISTEN:7000,reuseaddr,fork EXEC:/bin/cat
+socat TCP4-LISTEN:7000,bind=127.0.0.1,reuseaddr,fork EXEC:/bin/cat
 ```
 
-Start Orbit in another terminal:
+In a second terminal, run Orbit from the repository root. The listen options set where clients
+connect. Use `--upstream HOST:PORT` to point Orbit to the echo server.
 
 ```sh
 ./build/debug/orbit \
@@ -70,22 +50,35 @@ Start Orbit in another terminal:
   --upstream 127.0.0.1:7000
 ```
 
-Then send a message through the proxy:
+From a third terminal, send a line to Orbit. You should see `hello through orbit` echoed back.
 
 ```sh
 printf 'hello through orbit\n' | socat - TCP:127.0.0.1:8080
 ```
 
-You should see the same line returned through the proxy. Running the client command from more than
-one terminal is also a quick way to try multiple simultaneous sessions.
+Orbit currently uses the first configured upstream. Find all options and environment variables
+in the [configuration reference](docs/config.md).
 
-## Configuration
+## Testing
 
-At least one upstream is required. Pass an endpoint as `--upstream HOST:PORT`, using
-`--upstream [ADDRESS]:PORT` for IPv6, and repeat the option to configure multiple upstreams. Orbit
-currently forwards connections through the first configured upstream.
+CTest runs GoogleTest unit tests and Python integration tests that exercise the proxy over
+loopback TCP. CI also runs the suite with AddressSanitizer and UndefinedBehaviorSanitizer.
+After building, run the Debug suite from the repository root.
 
-Orbit listens on `0.0.0.0:8080` by default and logs at `info` level; these can be changed with
-`--listen-host`, `--listen-port`, and `--log-level`. Options can also be set through corresponding
-`ORBIT_` environment variables. `ORBIT_UPSTREAMS` accepts a comma-separated list of upstreams.
-See [configuration](docs/config.md) for validation rules and the full option reference.
+```sh
+ctest --preset debug
+```
+
+## Performance
+
+The Release loopback benchmarks compare direct TCP connections with connections through Orbit
+for throughput and echo round-trip latency. They also measure Orbit's CPU and resident memory
+under load, and track memory and open file descriptors as idle sessions accumulate. The
+methodology and commands are in the [benchmark guide](benchmarks/README.md).
+
+## Documentation
+
+- [Architecture](docs/architecture.md)
+- [Engineering invariants](docs/invariants.md)
+- [Development guide](docs/development.md)
+- [Known limitations](docs/known-limitations.md)
