@@ -8,6 +8,7 @@
 
 #include "common/fd.h"
 #include "common/steady_time_source.h"
+#include "config/resources.h"
 #include "config/timeouts.h"
 #include "net/listener.h"
 #include "net/socket_io.h"
@@ -48,16 +49,13 @@ class ProxyReactor {
 public:
     static Result<ProxyReactor, ProxyCreateError>
     create(const net::ListenSocketAddress& listen_address,
-           const net::ResolutionEndpoint& upstream_address, TimeoutConfig timeouts = {});
+           const net::ResolutionEndpoint& upstream_address, TimeoutConfig timeouts = {},
+           ResourceConfig resources = {});
 
     [[nodiscard]] Status<ProxyRuntimeError> start();
 
 private:
     friend class ProxyReactorTest;
-
-    constexpr static size_t block_size = 4096;
-    constexpr static size_t high_watermark = block_size * 64;
-    constexpr static size_t low_watermark = block_size * 48;
 
     constexpr static size_t forwarder_buf_cap = 4096;
     constexpr static size_t sender_buf_cap = 4096;
@@ -80,13 +78,14 @@ private:
 
     ProxyReactor(detail::EpollPoller poller, FileDescriptor shutdown_signal_fd,
                  FileDescriptor timer_fd, detail::UpstreamDialer upstream_dialer,
-                 TimeoutConfig timeouts, SteadyTimeSource time_source,
+                 TimeoutConfig timeouts, ResourceConfig resources, SteadyTimeSource time_source,
                  net::StreamOperations stream_operations);
 
     static Result<ProxyReactor, ProxyCreateError>
     createImpl(const net::ListenSocketAddress& listen_address,
                const net::ResolutionEndpoint& upstream_address, TimeoutConfig timeouts,
-               SteadyTimeSource time_source, net::StreamOperations stream_operations);
+               ResourceConfig resources, SteadyTimeSource time_source,
+               net::StreamOperations stream_operations);
 
     // Resource registration
     Result<detail::SourceId, std::error_code> registerEndpoint(int fd, uint32_t initial_events,

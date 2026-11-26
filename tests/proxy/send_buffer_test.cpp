@@ -1,6 +1,7 @@
 #include "proxy/detail/buffer/send_buffer.h"
 
 #include <cstddef>
+#include <limits>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -81,15 +82,40 @@ TEST_F(SendBufferTest, CorrectlyConsumesDataAcrossMultipleBlocks) {
     EXPECT_EQ(std::string(block_size * 2, 'a'), result);
 }
 
-TEST_F(SendBufferTest, WriteCanExceedHighWatermarkInSingleCall) {
-    std::string data((max_blocks + 1) * block_size, 'a');
+TEST_F(SendBufferTest, RejectsAnOversizedWriteWithoutChangingTheQueue) {
+    const std::string prefix = "prefix";
+    ASSERT_TRUE(send_buffer.write(asBytes(prefix)));
+    const std::string oversized(high_watermark - prefix.size() + 1, 'a');
+    EXPECT_FALSE(send_buffer.write(asBytes(oversized)));
+    EXPECT_EQ(prefix.size(), send_buffer.size());
+    EXPECT_EQ(high_watermark - prefix.size(), send_buffer.remainingCapacity());
+    EXPECT_EQ(block_size, send_buffer.allocatedCapacity());
+    std::string result(prefix.size(), 'b');
+    EXPECT_EQ(prefix.size(), send_buffer.copy(asBytes(result)));
+    EXPECT_EQ(prefix, result);
+}
 
-    send_buffer.write(asBytes(data));
-    std::string result(data.size(), 'b');
-    size_t bytes_copied = send_buffer.copy(asBytes(result));
+TEST_F(SendBufferTest, CountsHeadSlackAndReclaimsThePartialLastBlock) {
+    const std::string full(high_watermark, 'a');
+    ASSERT_TRUE(send_buffer.write(asBytes(full)));
+    EXPECT_EQ(high_watermark, send_buffer.allocatedCapacity());
+    send_buffer.consume(1);
+    EXPECT_EQ(0u, send_buffer.remainingCapacity());
+    EXPECT_FALSE(send_buffer.write(asBytes(full).first(1)));
 
-    EXPECT_EQ(data.size(), bytes_copied);
-    EXPECT_EQ(data, result);
+    send_buffer.consume(high_watermark - low_watermark - 1);
+    EXPECT_EQ(high_watermark - low_watermark, send_buffer.remainingCapacity());
+    send_buffer.consume(1);
+    ASSERT_TRUE(send_buffer.write(asBytes(full).first(high_watermark - low_watermark + 1)));
+    EXPECT_EQ(high_watermark, send_buffer.size());
+    EXPECT_EQ(high_watermark + block_size, send_buffer.allocatedCapacity());
+    send_buffer.consume(high_watermark);
+    EXPECT_EQ(0u, send_buffer.allocatedCapacity());
+    EXPECT_EQ(high_watermark, send_buffer.remainingCapacity());
+    ASSERT_TRUE(send_buffer.write(asBytes(full).first(1)));
+    EXPECT_EQ(block_size, send_buffer.allocatedCapacity());
+    send_buffer.consume(1);
+    EXPECT_EQ(0u, send_buffer.allocatedCapacity());
 }
 
 TEST_F(SendBufferTest, BufferPreservesInputDataOrdering) {
@@ -207,4 +233,9 @@ TEST_F(SendBufferTest, BufferConstructionFailsForLowWatermarkEqualToHighWatermar
 
 TEST_F(SendBufferTest, BufferConstructionFailsForLowWatermarkGreaterThanHighWatermark) {
     EXPECT_THROW(SendBuffer(block_size, high_watermark, high_watermark + 1), std::invalid_argument);
+}
+
+TEST_F(SendBufferTest, RejectsAnUnrepresentableBlockCapacity) {
+    EXPECT_THROW(SendBuffer(block_size, std::numeric_limits<size_t>::max(), 0),
+                 std::invalid_argument);
 }

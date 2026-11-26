@@ -2,6 +2,7 @@
 
 #include <array>
 #include <charconv>
+#include <cstdlib>
 #include <limits>
 #include <string>
 #include <string_view>
@@ -107,6 +108,25 @@ std::chrono::milliseconds parseTimeout(const std::string& text, const char* opti
     return std::chrono::milliseconds(ms);
 }
 
+size_t parseResource(const CLI::Option& option, std::string_view text, size_t minimum,
+                     size_t maximum) {
+    // CLI11 skips empty environment values. A supplied resource value, even empty, is validated.
+    if (option.count() == 0) {
+        if (const char* supplied = std::getenv(option.get_envname().c_str())) {
+            text = supplied;
+        }
+    }
+    size_t value = 0;
+    auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);
+    if (error != std::errc{} || end != text.data() + text.size() || value < minimum ||
+        value > maximum) {
+        throw CLI::ValidationError(option.get_name(), "expected a decimal integer between " +
+                                                          std::to_string(minimum) + " and " +
+                                                          std::to_string(maximum));
+    }
+    return value;
+}
+
 } // namespace
 
 std::expected<Config, ConfigError> parseConfig(int argc, char** argv) {
@@ -115,6 +135,8 @@ std::expected<Config, ConfigError> parseConfig(int argc, char** argv) {
 
     auto connect_ms = std::to_string(config.timeouts.connect.count());
     auto idle_ms = std::to_string(config.timeouts.idle.count());
+    auto buffer_high = std::to_string(config.resources.buffer_high_watermark);
+    auto buffer_low = std::to_string(config.resources.buffer_low_watermark);
 
     CLI::App app("orbit - a TCP reverse proxy");
     app.set_version_flag("--version", "orbit 0.1.0");
@@ -153,11 +175,26 @@ std::expected<Config, ConfigError> parseConfig(int argc, char** argv) {
         ->envname("ORBIT_IDLE_TIMEOUT_MS")
         ->capture_default_str();
 
+    const auto* high_option = app.add_option("--buffer-high-watermark-bytes", buffer_high,
+                                             "Maximum queued payload bytes per direction")
+                                  ->envname("ORBIT_BUFFER_HIGH_WATERMARK_BYTES")
+                                  ->capture_default_str();
+    const auto* low_option =
+        app.add_option("--buffer-low-watermark-bytes", buffer_low,
+                       "Resume paused reads at or below this queue size in bytes")
+            ->envname("ORBIT_BUFFER_LOW_WATERMARK_BYTES")
+            ->capture_default_str();
+
     try {
         app.parse(argc, argv);
 
         config.timeouts.connect = parseTimeout(connect_ms, "--connect-timeout-ms", 1);
         config.timeouts.idle = parseTimeout(idle_ms, "--idle-timeout-ms", 0);
+        config.resources.buffer_high_watermark =
+            parseResource(*high_option, buffer_high, ResourceConfig::payload_block_size,
+                          ResourceConfig::max_directional_limit);
+        config.resources.buffer_low_watermark =
+            parseResource(*low_option, buffer_low, 0, config.resources.buffer_high_watermark - 1);
 
         config.upstreams.reserve(upstream_values.size());
         for (const std::string& upstream_value : upstream_values) {

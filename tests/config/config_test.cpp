@@ -33,8 +33,14 @@ class ConfigTest : public testing::Test {
 protected:
     void SetUp() override {
         constexpr std::array environment_variables{
-            "ORBIT_LISTEN_HOST", "ORBIT_LISTEN_PORT",        "ORBIT_UPSTREAMS",
-            "ORBIT_LOG_LEVEL",   "ORBIT_CONNECT_TIMEOUT_MS", "ORBIT_IDLE_TIMEOUT_MS",
+            "ORBIT_LISTEN_HOST",
+            "ORBIT_LISTEN_PORT",
+            "ORBIT_UPSTREAMS",
+            "ORBIT_LOG_LEVEL",
+            "ORBIT_CONNECT_TIMEOUT_MS",
+            "ORBIT_IDLE_TIMEOUT_MS",
+            "ORBIT_BUFFER_HIGH_WATERMARK_BYTES",
+            "ORBIT_BUFFER_LOW_WATERMARK_BYTES",
         };
 
         for (const char* variable : environment_variables) {
@@ -197,4 +203,35 @@ TEST_F(ConfigTest, IdleTimeoutDefaultsBoundariesAndEnvironment) {
         ASSERT_EQ(0, setenv("ORBIT_IDLE_TIMEOUT_MS", invalid, 1));
         EXPECT_FALSE(parseArguments({"--upstream", "backend:1"}));
     }
+}
+
+TEST_F(ConfigTest, ValidatesDirectionalWatermarksAfterCliAndEnvironmentSelection) {
+    const auto defaults = parseArguments({"--upstream", "backend:1"});
+    ASSERT_TRUE(defaults);
+    EXPECT_EQ(262144u, defaults->resources.buffer_high_watermark);
+    EXPECT_EQ(196608u, defaults->resources.buffer_low_watermark);
+
+    ASSERT_EQ(0, setenv("ORBIT_BUFFER_HIGH_WATERMARK_BYTES", "4096", 1));
+    ASSERT_EQ(0, setenv("ORBIT_BUFFER_LOW_WATERMARK_BYTES", "0", 1));
+    const auto minimum = parseArguments({"--upstream", "backend:1"});
+    ASSERT_TRUE(minimum);
+    EXPECT_EQ(4096u, minimum->resources.buffer_high_watermark);
+    EXPECT_EQ(0u, minimum->resources.buffer_low_watermark);
+
+    for (auto invalid : {"", "-1", "4095", "4096B", "16777217", "99999999999999999999999"}) {
+        SCOPED_TRACE(invalid);
+        ASSERT_EQ(0, setenv("ORBIT_BUFFER_HIGH_WATERMARK_BYTES", invalid, 1));
+        EXPECT_FALSE(parseArguments({"--upstream", "backend:1"}));
+        EXPECT_FALSE(
+            parseArguments({"--upstream", "backend:1", "--buffer-high-watermark-bytes", invalid}));
+    }
+    ASSERT_EQ(0, setenv("ORBIT_BUFFER_LOW_WATERMARK_BYTES", "16777216", 1));
+    EXPECT_FALSE(
+        parseArguments({"--upstream", "backend:1", "--buffer-high-watermark-bytes", "16777216"}));
+
+    const auto maximum = parseArguments({"--upstream", "backend:1", "--buffer-high-watermark-bytes",
+                                         "16777216", "--buffer-low-watermark-bytes", "16777215"});
+    ASSERT_TRUE(maximum);
+    EXPECT_EQ(16777216u, maximum->resources.buffer_high_watermark);
+    EXPECT_EQ(16777215u, maximum->resources.buffer_low_watermark);
 }

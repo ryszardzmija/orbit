@@ -55,22 +55,22 @@ TEST_P(HangupTest, PausedQueuePreservesResidualInputUntilTheDestinationDrains) {
         ASSERT_TRUE(source_interests().readable);
         ASSERT_EQ(SessionEventAction::KeepOpen, manager.handleReadable(id, role).action);
     }
-    ASSERT_FALSE(source_interests().readable); // 12 queued, high watermark 9.
+    ASSERT_FALSE(source_interests().readable); // Exactly 9 queued, including the short read.
     ASSERT_EQ(SessionEventAction::KeepOpen, manager.handleReadable(id, role).action); // Stale IN.
     ASSERT_EQ(SessionEventAction::KeepOpen, manager.handleHangup(id, role).action);
     EXPECT_TRUE(source_interests().edge_triggered);
     EXPECT_FALSE(manager.shouldRetire(id, role));
     auto residual = [&] { return recv(source_fd, scratch.data(), scratch.size(), MSG_PEEK); };
-    ASSERT_EQ(ssize_t(payload.size() - 12), residual());
+    ASSERT_EQ(ssize_t(payload.size() - 9), residual());
     for (size_t left = filler; left > 0;) {
         ssize_t n = recv(dest.peer.get(), scratch.data(), std::min(left, scratch.size()), 0);
         ASSERT_GT(n, 0);
         left -= n;
     }
     ASSERT_EQ(SessionEventAction::KeepOpen, manager.handleWritable(id, other).action);
-    ASSERT_EQ(ssize_t(payload.size() - 12), residual()); // Still above low watermark.
+    ASSERT_EQ(ssize_t(payload.size() - 9), residual()); // Still above low watermark.
     ASSERT_EQ(SessionEventAction::KeepOpen, manager.handleWritable(id, other).action);
-    ASSERT_EQ(ssize_t(payload.size() - 16), residual()); // One residual chunk this dispatch.
+    ASSERT_EQ(ssize_t(payload.size() - 13), residual()); // One residual chunk this dispatch.
 
     auto action = SessionEventAction::KeepOpen;
     for (size_t i = 0; i < payload.size() && action == SessionEventAction::KeepOpen; ++i) {

@@ -7,6 +7,7 @@
 
 #include <spdlog/common.h>
 
+#include "config/resources.h"
 #include "config/timeouts.h"
 
 namespace orbit {
@@ -16,17 +17,13 @@ struct UpstreamConfig {
     uint16_t port = 0;
 };
 
-struct SendBufferConfig {
-    uint32_t max_buffer_size = 64 * 1024;
-};
-
 struct Config {
     std::string listen_host = "0.0.0.0";
     uint16_t listen_port = 8080;
 
     std::vector<UpstreamConfig> upstreams;
     spdlog::level::level_enum log_level = spdlog::level::level_enum::info;
-    SendBufferConfig send_buffer;
+    ResourceConfig resources;
     TimeoutConfig timeouts;
 };
 

@@ -38,7 +38,7 @@ int main(int argc, char** argv) {
             .hostname = upstream.host,
             .port = upstream.port,
         },
-        config.timeouts);
+        config.timeouts, config.resources);
 
     if (!reactor_create_result) {
         spdlog::error("Failed to initialize event loop: {}", reactor_create_result.error().message);

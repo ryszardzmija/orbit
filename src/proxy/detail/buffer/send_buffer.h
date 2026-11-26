@@ -22,11 +22,15 @@ public:
 
     ~SendBuffer();
 
-    void write(std::span<const uint8_t> data);
+    // Rejects inadmissible writes without changing the queue.
+    bool write(std::span<const uint8_t> data);
     size_t copy(std::span<uint8_t> dest);
     void consume(size_t num_bytes);
     BufferStatus status() const;
     bool empty() const;
+    size_t size() const { return size_; }
+    size_t remainingCapacity() const;
+    size_t allocatedCapacity() const { return allocated_capacity_; }
 
 private:
     class ListNode {
@@ -62,6 +66,7 @@ private:
     std::unique_ptr<ListNode> head_ = nullptr;
     ListNode* tail_ = nullptr;
     size_t size_ = 0;
+    size_t allocated_capacity_ = 0;
     size_t read_pos_ = 0;
     size_t write_pos_ = 0;
     BufferStatus status_ = BufferStatus::Accepting;
