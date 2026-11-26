@@ -1,119 +1,91 @@
-# Known limitations and audit findings
+# Known limitations
 
-Source baseline is `e3aec7b`. A source-confirmed finding follows from the implementation. For suspected defects, the code exposes a plausible path and the runtime outcome still needs verification. The existing test suite exercises selected behavior without establishing the untested cases below. High priority findings can affect correctness or process availability. Medium priority findings narrow guarantees or complicate operation. Low priority findings have limited current impact. Milestone references indicate proposed sequencing.
-
-## LIM-001 — Full hangup drain bypasses buffer admission
-
-- **Disposition** — Resolved in M1.1. The former unbounded drain could append to a paused queue and then mark unread input consumed. All residual reads now share ordinary admission, with one chunk per drain step and continuation through destination writes.
-- **Verification** — Both endpoint roles are covered with a saturated socket, a verified paused queue, and more bytes left in the source socket than fit in one receive. The test verifies ordered delivery and EOF after resumption. A separate test drives would-block before residual data arrives.
+See the [engineering invariants](invariants.md) for the scope of Orbit's guarantees.
 
 ## LIM-002 — Only the first configured upstream is used
 
-- **Classification and priority** — Functional limitation, medium.
-- **Source and evidence** — [`parseConfig`](../src/config/config.cpp) accepts an ordered vector. [`main`](../src/main.cpp) selects `config.upstreams.front()`. [`UpstreamDialer::tryCandidatesFrom`](../src/proxy/detail/upstream_dialer.cpp) walks the addresses resolved for that endpoint.
-- **Conditions and impact** — Additional entries pass syntax validation but are neither resolved nor selected. A first-endpoint resolution failure aborts startup even if another entry would resolve. A first-endpoint outage leaves later configured endpoints unused.
-- **Verification** — Source-confirmed. `ConfigTest.PreservesRepeatedUpstreamOrder` verifies parsing. Runtime routing among configured entries has no integration coverage.
-- **Follow-up** — The later routing milestone should define selection, eligibility and accounting for new connections while keeping established sockets pinned. Define startup handling of partial resolution failures before enabling runtime routing.
+Orbit parses all configured endpoints and resolves the first at startup. It can try the
+resolved addresses of that endpoint when establishing a connection. Later endpoints
+remain unused, including after a resolution or connection failure. Orbit resolves
+addresses only at startup and does no active health checking. Established streams stay
+on their original socket pairs. See [upstream selection](architecture.md#upstream-selection-and-dialing).
 
-## LIM-003 — A live event can outlast its read interest
+## LIM-004 — A disconnected client can occupy a pending slot
 
-- **Disposition** — Resolved in M1.2. Every event resolves its value identity in the current registry. Directional I/O checks current eligibility, and retirement or session teardown ends dispatch of the remaining flags. Error and full hangup have explicit precedence.
-- **Verification** — Controlled dispatch tests retain an old event across actual numeric fd reuse, retire a source while its peer still owns queued output, and deliver stale readable and writable flags across hangup and teardown.
+Orbit watches the upstream socket during connection establishment. A client that
+disconnects during that phase can keep its admission and sockets until the dial
+completes, fails, is cancelled, or reaches the connect deadline. A slow first address
+can consume the entire deadline before another address is tried.
 
-## LIM-004 — Pending dials have no application deadline
+## LIM-008 — Source and session IDs can wrap
 
-- **Disposition** — M1.4 bounds the entire establishment sequence with a configurable 10-second default. A single monotonic timer serves pending dials, enabled idle deadlines and graceful shutdown. Readiness at or after expiration cannot promote an attempt. The M1-A02 correction also checks the original deadline immediately before `connect()`. A controlled loopback regression verifies cleanup when the deadline expires during fallback socket creation.
-- **Remaining scope** — A client disconnect has no dedicated pending watch, so Orbit can retain both sockets for the rest of the finite budget. A slow first address can use that whole budget. Tests exercise controlled fallback, ready-versus-expired ordering and timer-driven cleanup.
+The source and session ID generators each use a 64-bit counter without a wrap policy.
+New source IDs protect against stale events after ordinary fd reuse. A wrap can alias
+a live registration, session or retained identity. See [epoll registration and dispatch](architecture.md#epoll-registration-and-dispatch).
 
-## LIM-005 — Admission and application buffer limits are absent
+## LIM-009 — Work budgets bound operation counts
 
-- **M2.1 disposition** — Both directions enforce strict logical limits and account for allocated blocks. The sum of the two directional bounds limits the payload allocation attributable to one session.
-- **M2.2 disposition** — The reactor bounds total and pending admission and pauses acceptance at either limit. The total limit and the bound on each session together limit allocated payload capacity.
-- **M2.4 disposition** — An independent aggregate budget covers committed payload block capacity and reservations. Node overhead, process memory and kernel TCP queue usage are outside the payload budget. See [LIM-013](#lim-013--resource-exhaustion-can-stop-the-reactor) for resource failure handling and LIM-018 for the progress condition.
+The [per-turn limits](architecture.md#work-per-reactor-turn) give ready connections,
+deadlines and shutdown requests opportunities to run. Wall-clock service latency
+depends on readiness volume, scheduling, syscall cost, hash table maintenance,
+allocation and teardown. Startup name resolution can block. Maximum service latency
+under mixed traffic and the cost of dial and shutdown bursts remain unmeasured.
 
-## LIM-006 — Pending dials have mixed graceful shutdown behavior
+## LIM-010 — Runtime observability is limited to logs
 
-- **Disposition** — Resolved in M1.3. The first processed shutdown cancels every pending dial, invalidates its source, and stops admission. Established sessions alone drain until natural completion, a second signal or the 30-second deadline. Controlled tests exercise pending-only and mixed cases, late completions and timer escalation.
-
-## LIM-007 — SendBufferConfig is disconnected from runtime
-
-- **Disposition** — Resolved in M2.1. The old unused field was removed. Validated resource configuration supplies the high and low watermarks to both runtime queues.
-- **Verification** — Configuration tests cover numeric ranges, relationships and precedence. A controlled reactor test verifies the configured receive limit, hysteresis, partial-send FIFO and would-block behavior.
-
-## LIM-008 — Source identities have no wrap policy
-
-- **Classification and priority** — Architectural risk, low.
-- **Source and evidence** — [`EpollPoller::add`](../src/proxy/detail/epoll/epoll_poller.cpp) stores a `SourceId` in `epoll_event.data.u64`. [`ReactorSources::find` and `remove`](../src/proxy/detail/sources/reactor_sources.cpp) and [`ProxyReactor::closeSession`](../src/proxy/proxy.cpp) make a retired source unresolvable, protecting against ordinary numeric fd reuse. [`MonotonicIdGenerator::getNextId`](../src/proxy/detail/id/generator.h) increments a `uint64_t` without wrap handling. Source and session IDs use independent instances. A pending attempt uses its registration ID.
-- **Conditions and impact** — A reused fd gets a fresh source ID during ordinary operation. If a generator traverses its 64-bit space, a subsequent ID may alias a live registration or a retained identity. The current lifetime of readiness batches and size of the ID space make wrap a low priority. Future delayed work can extend the lifetime of identities.
-- **Verification** — Source-confirmed fd reuse protection and absent wrap policy. M1.2 confirmed ordinary fd reuse protection with a reused fd and a previous registration’s event.
-- **Follow-up** — The generator still wraps after the full 64-bit space. M1.2 retained its existing lifetime assumption. Preserve identity checks for scheduled work.
-
-## LIM-009 — Reactor work budgets are incomplete
-
-- **M2.5 disposition** — Readiness dispatch, interrupted I/O, candidate attempts and continuation processing have [work-count budgets](architecture.md#work-per-reactor-turn). Controlled tests cover sustained candidate failure, continued traffic, timer cancellation, interrupted operations and transitions to and from a runnable queue.
-- **M2-A01 and M2-A02 disposition** — Resolved in M2.6. Existing-socket completion queries share the deferred dial budget and can run during admission cooldown, while fresh socket attempts wait in their own FIFO. Accept permission failures use the shared timed backoff even if the listen backlog stays readable.
-- **Remaining scope** — Work counts provide service opportunities. Wall-clock latency still depends on readiness volume, scheduling, syscall cost, hash table maintenance, allocation and teardown. Startup name resolution can block. Mixed-workload latency and the costs of dial and shutdown bursts remain unmeasured.
-
-## LIM-010 — Logging is the runtime observability surface
-
-- **Classification and priority** — Functional limitation, medium.
-- **Source and evidence** — [`setUpLogger` and `LoggerGuard`](../src/logging/logger.cpp) provide configurable async stdout logging and a shutdown-time overrun warning. The reactor reports connected clients, dial and session setup, and errors. Neither [`ProxyReactor`](../src/proxy/proxy.cpp) nor [`SessionManager`](../src/proxy/detail/session/session_manager.cpp) exports connection, queue, latency, throughput or overload statistics. [The integration suite](../tests/integration/proxy_sessions_test.py) samples process CPU for an idle-HUP regression.
-- **Conditions and impact** — Under sustained load or logging queue overflow, logs give limited evidence about bottlenecks, occupancy, fairness or the causes of rejection. The idle CPU test provides no throughput or tail latency measurement.
-- **Verification** — Source and repository inventory. No performance claims were measured for this audit.
-- **Disposition** — M0.3 adds scripts for repeatable external measurements. [Loopback benchmarks](../benchmarks/README.md)
-- **Follow-up** — Define runtime connection, dial and buffer statistics.
+Orbit writes asynchronous logs to stdout and can report queue overruns at shutdown.
+The queue can drop older messages under load. Runtime occupancy, throughput, latency
+and overload metrics are unavailable. The [loopback benchmarks](../benchmarks/README.md)
+provide reproducible external measurements.
 
 ## LIM-011 — Fault and readiness tests leave gaps
 
-- **Classification and priority** — Testing gap, high.
-- **Source and evidence** — [GoogleTest units](../tests/CMakeLists.txt) and [loopback integration](../tests/integration/proxy_sessions_test.py) cover M1 forwarding, deadlines, hangup and shutdown. M2 adds controlled partial sends and exact occupancy checks, admission and fault tests, global allocation and resumption tests, mixed readiness batches and a Linux descriptor-limit regression. Direct system-wide pressure, kernel DEL failure and live IPv6 forwarding remain coverage gaps.
-- **M1-A01 disposition** — Resolved. The audit reproduced an expired idle session surviving when a later operation in the same notification refreshed its deadline. Controlled-clock tests verify separate I/O checks for combined readiness and deferred hangup reads, and test activity at the expiry boundary.
-- **M2-A03 and M2-A04 disposition** — Resolved in M2.6. Slow establishment preparation leaves the full idle interval available from handoff. Extraction retains both admission slots through descriptor disposal or transfer. Controlled tests cover equality at both deadlines and observe open, counted descriptors during expiry. [INV-SES-009](invariants.md#deadlines), [INV-SES-006](invariants.md#session-lifecycle)
-- **Conditions and impact** — Regressions in rare event combinations and failures can pass the existing suite. The harness still uses deliberate delays for reset, slow-reader and idle-CPU scenarios. Orbit's CLI rejects port zero, so the bind-after-release window for its listener still exists. It can cause a startup failure if another process takes the port.
-- **Verification** — Confirmed by test inventory. Churn and transfer cases are useful indirect coverage with limited control over the targeted state.
-- **Follow-up** — Select deterministic fault and timeout coverage when modifying the other paths. See LIM-016 for the M0.2 harness fixes.
+Controlled tests cover selected readiness, I/O and resource failures. Loopback TCP
+tests exercise IPv4 and include a process descriptor-limit regression. Coverage gaps
+include live IPv6 forwarding, system-wide resource pressure and unexpected kernel
+`EPOLL_CTL_DEL` errors. Some reset, slow-reader and idle-CPU scenarios still rely on
+timed delays. The integration harness releases a probe port before Orbit binds it, so
+a concurrent process can claim the port and cause startup to fail. See [test diagnostics](development.md#test-deadlines-and-diagnostics).
 
-## LIM-012 — Configuration and README overstated current guarantees
+## LIM-013 — Resource bounds and recovery have defined scope
 
-- **Classification and priority** — Documentation discrepancy, low.
-- **Source and evidence** — At the audit baseline, [`docs/config.md`](config.md) described load balancing over multiple upstreams. [`main`](../src/main.cpp) selects a single configured endpoint. The [README](../README.md) promised bounded queueing through backpressure and broadly described failure isolation. [`Forwarder::drain`](../src/proxy/detail/forwarding.cpp), [`SendBuffer::write`](../src/proxy/detail/buffer/send_buffer.cpp) and [`ProxyReactor::handleDialError`](../src/proxy/proxy.cpp) expose the exceptions.
-- **Conditions and impact** — Operators could assume additional endpoints participate in routing, watermarks cap memory, or every dial failure affects just one client.
-- **Verification** — Source-confirmed discrepancy at `e3aec7b`. The documentation changes in M0.1 resolve the discrepancy. The underlying limitations remain tracked in LIM-001, LIM-002, LIM-005 and LIM-013.
-- **Follow-up** — Revise the operator documentation with future forwarding or routing changes.
+Directional watermarks bound logical queued payload, the unsent bytes in a queue.
+Allocated payload capacity counts each live block at its full size. The global budget
+charges that capacity together with outstanding reservations for blocks a receive may
+need. Queue and waiter metadata, allocator overhead, scratch space, other process memory
+and kernel TCP memory fall outside the budget. Process RSS includes other resident
+pages and can remain elevated after blocks are freed.
 
-## LIM-013 — Resource exhaustion can stop the reactor
+Each admission owns at most two connection descriptors. The listener, epoll instance,
+timer, signal descriptor and other open files also count toward process and system
+descriptor limits. Persistent descriptor pressure keeps admission paused between retries.
 
-- **M2.3 disposition** — Timed admission retry handles descriptor and other specified kernel pressure on accept, dial and connection watch operations. Buffer allocation and connection setup recover at the boundaries documented in [failure handling](architecture.md#failure-handling). Injected faults and a Linux descriptor-limit regression exercise cleanup and continued established forwarding.
-- **Remaining scope** — Heap allocation failures in Abseil's `flat_hash_map`, other unsupported allocation failures, and reactor infrastructure or integrity errors can stop Orbit. Abseil's pinned `flat_hash_map` header explicitly states that the table lacks exception safety. The Linux OOM killer can end the process. A persistent descriptor shortage keeps admission paused between retries.
-
-## LIM-014 — Failed write shutdown may leave a session waiting
-
-- **Disposition** — Resolved in M1.3. Actual input EOF and an empty destination queue suffice to propagate FIN. M2.5 schedules interrupted FIN attempts on the shared timer. Terminal failures close the pair locally. Tests drive EOF without RDHUP, repeated interruption and ENOTCONN.
+Orbit recovers from the syscall errors and allocation failures listed in
+[failure handling](architecture.md#failure-handling). Abseil flat hash table mutations
+lack exception safety. Allocation failures there, unsupported heap failures and reactor
+infrastructure or integrity failures can stop the process. Linux can also terminate it
+under system memory pressure.
 
 ## LIM-015 — Invalid environment settings can revert to defaults
 
-- **Classification and priority** — Functional limitation, medium.
-- **Source and evidence** — [`parseConfig`](../src/config/config.cpp) attaches CLI11 validators to listen port and log level. In the [pinned CLI11 v2.6.2 implementation](https://github.com/CLIUtils/CLI11/blob/v2.6.2/include/CLI/impl/App_inl.hpp), `App::_process_env` adds a nonempty environment value only when it passes the option's validators. Upstream endpoint syntax is checked separately by Orbit after parsing.
-- **Conditions and impact** — With a setting absent from the CLI, an out-of-range `ORBIT_LISTEN_PORT` or invalid `ORBIT_LOG_LEVEL` can be discarded silently, leaving port 8080 or logging at `info`. An invalid explicit CLI value produces a diagnostic. An operator can see an unexpected listener port or log level during startup.
-- **Verification** — Source-confirmed. A Debug CLI smoke check with `ORBIT_LISTEN_PORT=0` and an invalid log level reached listener setup on port 8080. The same port supplied on the command line was rejected during parsing.
-- **Follow-up** — Decide whether to reject invalid environment values in a configuration task. Preserve explicit CLI precedence and add coverage for both input sources if changing validation.
-
-## LIM-016 — Integration cleanup could hide child failures or block
-
-- **Classification and priority** — Testing infrastructure defect, high, resolved in M0.2.
-- **Source and evidence** — The pre-M0.2 [harness](../tests/integration/proxy_sessions_test.py) waited on an Orbit child with an unread output pipe, ignored exit status in teardown and used an unbounded wait after killing the child. A startup or upstream-accept failure could also lose ownership of a partially initialized fixture.
-- **Disposition** — The harness now registers cleanup before startup, polls the existing readiness log and checks for early exits. It captures combined output in a temporary file and checks status on expected shutdown and cleanup. Regression cases exercise a zero-status early exit, a failing shutdown that writes 2 MiB of diagnostics, and bounded killing and reaping of an unresponsive child.
-- **Follow-up** — Preserve failure propagation and bounded resource ownership when adding integration cases. The remaining coverage and port limitations are listed in LIM-011.
+CLI11 skips values of `ORBIT_LISTEN_PORT` and `ORBIT_LOG_LEVEL` that fail their
+validators. When the corresponding CLI option is absent, Orbit can therefore start
+on the default port or at the default log level without a diagnostic. Explicit
+invalid CLI values fail validation. See [configuration](config.md).
 
 ## LIM-017 — GNU UBSan and Abseil are incompatible
 
-- **Classification and priority** — Toolchain compatibility limitation, medium.
-- **Source and evidence** — GCC 15.2.0 with `-fsanitize=address,undefined` reports a non-constant function-pointer comparison in the pinned Abseil hash policy header when compiling Orbit's proxy. [Abseil's upstream report](https://github.com/abseil/abseil-cpp/issues/1634).
-- **Disposition** — The sanitizer preset uses Clang 22. With mixed instrumentation, Orbit aborted during startup in Abseil's `CommonFields::set_capacity` because ASan changes the hash-table layout. The build now instruments Abseil in the same configuration as Orbit.
-- **Follow-up** — Recheck compiler and Abseil compatibility when changing either toolchain. Keep Abseil's compiled code and the Orbit code that uses its headers on matching sanitizer settings.
+GCC 15.2.0 with the combined ASan/UBSan flags rejects a function-pointer comparison
+in the pinned Abseil hash policy header. The sanitizer preset uses Clang 22 and
+instruments Abseil and Orbit together because ASan changes the hash-table layout.
+[Sanitizer reports](development.md#sanitizer-reports), [Abseil issue](https://github.com/abseil/abseil-cpp/issues/1634).
 
 ## LIM-018 — Forwarding progress depends on payload capacity becoming available
 
-- **Condition and impact** — All charged blocks can be held by destinations whose peers have stopped reading. An unrelated direction can then remain paused, including when its peer could accept an immediate send or when the source has reached EOF. Orbit needs capacity before attempting a receive because the result can include payload.
-- **Current behavior** — Existing tail space remains usable. Consumption, hangup and teardown release capacity, and FIFO scheduling gives eligible waiters opportunities as blocks become available. Established-session idle expiration can also release capacity if enabled.
-- **Remaining scope** — Application protocols can depend on a paused direction to trigger reads in another direction. A fully occupied budget can sustain such a dependency until the peers make progress or a session ends.
+If slow destinations hold every charged block, unrelated directions can wait even
+when their destinations are writable or their sources have reached EOF. A receive
+needs capacity in case it returns payload. Existing tail space remains usable.
+Consumption, hangup and teardown release capacity, and eligible waiters get FIFO
+read opportunities as blocks become available. Enabled idle expiry can also release
+capacity. An application that waits for traffic in a paused direction before reading
+elsewhere can remain stalled until a peer makes progress or a session ends.

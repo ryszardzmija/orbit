@@ -19,7 +19,7 @@ cmake --preset release
 cmake --build --preset release
 python3 -B benchmarks/throughput.py
 python3 -B benchmarks/latency.py
-python3 -B benchmarks/idle_connections.py
+ORBIT_MAX_CONNECTIONS=1000 python3 -B benchmarks/idle_connections.py
 ```
 
 Run the benchmarks sequentially on a quiet host. All endpoints bind to `127.0.0.1`.
@@ -27,6 +27,11 @@ The scripts launch their own Orbit with one upstream and `info` logging. Overrid
 the default `build/release/orbit` with `--orbit PATH`. Use `--help` for other options.
 Orbit and iPerf3 require nonzero listen ports, so another process could claim a port
 between the benchmark's port selection and bind. Rerun on a bind failure.
+
+For the idle benchmark, set `ORBIT_MAX_CONNECTIONS` to at least the largest requested
+session count. The default Orbit limit is 256. If setting it below 64, also set
+`ORBIT_MAX_PENDING_CONNECTIONS` at or below that limit. The idle benchmark opens
+one connection at a time. See the [configuration reference](../docs/config.md).
 
 ## Metrics
 

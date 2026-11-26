@@ -9,18 +9,13 @@
   </p>
 </div>
 
-Orbit is a TCP reverse proxy for Linux. It provides a client-facing address for a backend
-service and relays traffic in both directions, so applications can keep using their existing
-protocols.
+Orbit is a resource-efficient, fault-tolerant Layer 4 TCP load balancer for Linux. Its
+current runtime acts as a TCP reverse proxy to the first configured upstream, relaying
+byte streams in both directions without interpreting application protocols.
 
-Orbit uses Linux `epoll` to handle concurrent connections. It limits total and pending
-admission and shares a forwarding payload budget across connections. It manages traffic
-flow when peers read slowly and supports graceful shutdown, giving active connections
-time to finish.
-
-The project is evolving into a resource-efficient, fault-tolerant Layer 4 TCP load balancer.
-Development priorities include distributing connections across upstreams, handling upstream
-failures, and keeping resource use predictable under load.
+Orbit caps admitted connections and forwarding buffer capacity. It applies backpressure
+when peers read slowly, isolates connection-local failures, and gives established
+connections time to finish during graceful shutdown.
 
 ## Getting started
 
@@ -41,8 +36,8 @@ In one terminal, start a TCP echo server on loopback.
 socat TCP4-LISTEN:7000,bind=127.0.0.1,reuseaddr,fork EXEC:/bin/cat
 ```
 
-In a second terminal, run Orbit from the repository root. The listen options set where clients
-connect. Use `--upstream HOST:PORT` to point Orbit to the echo server.
+In a second terminal, run Orbit from the repository root. Listen on port 8080 and point the
+proxy to the echo server on port 7000.
 
 ```sh
 ./build/debug/orbit \
@@ -57,9 +52,6 @@ From a third terminal, send a line to Orbit. You should see `hello through orbit
 printf 'hello through orbit\n' | socat - TCP:127.0.0.1:8080
 ```
 
-Orbit currently uses the first configured upstream. Find all options and environment variables
-in the [configuration reference](docs/config.md).
-
 ## Testing
 
 CTest runs GoogleTest unit tests and Python integration tests that exercise the proxy over
@@ -70,16 +62,11 @@ After building, run the Debug suite from the repository root.
 ctest --preset debug
 ```
 
-## Performance
-
-The Release loopback benchmarks compare direct TCP connections with connections through Orbit
-for throughput and echo round-trip latency. They also measure Orbit's CPU and resident memory
-under load, and track memory and open file descriptors as idle sessions accumulate. The
-methodology and commands are in the [benchmark guide](benchmarks/README.md).
-
 ## Documentation
 
+- [Configuration reference](docs/config.md)
 - [Architecture](docs/architecture.md)
 - [Engineering invariants](docs/invariants.md)
 - [Development guide](docs/development.md)
 - [Known limitations](docs/known-limitations.md)
+- [Loopback benchmarks](benchmarks/README.md)

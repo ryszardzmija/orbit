@@ -1,6 +1,8 @@
 # Configuration
 
-Orbit accepts options on the command line or through the corresponding environment variables. An explicit command-line value takes precedence over that option's environment value. Invalid resource values, including empty values, fail startup. Empty environment values for other options are skipped. Values for `ORBIT_LISTEN_PORT` or `ORBIT_LOG_LEVEL` that fail their CLI11 validators are silently skipped, leaving the defaults. Invalid endpoint syntax in a supplied upstream list is a parsing error.
+Orbit accepts options on the command line or through the corresponding environment variables. An explicit command-line value takes precedence over the corresponding environment value. Orbit validates the selected timeouts, resource settings and upstream list after applying that precedence.
+
+An empty resource environment variable fails validation when its CLI option is absent. CLI11 ignores empty environment values for other options. It also skips values of `ORBIT_LISTEN_PORT` and `ORBIT_LOG_LEVEL` that fail their validators, leaving the defaults. Use `--help` to list options and `--version` to print the version.
 
 | Option | Environment variable | Default and validation |
 | --- | --- | --- |
@@ -25,13 +27,13 @@ ORBIT_UPSTREAMS='127.0.0.1:7000,[2001:db8::1]:7000' ./build/debug/orbit
 
 All upstream entries are parsed in input order. Only the first configured endpoint is resolved and used at runtime. Each new connection can try later resolved addresses for that endpoint if earlier addresses fail. If resolution of the first endpoint fails, startup fails.
 
-The connection timeout starts before the first upstream attempt. All resolved address candidates and deferred work share that monotonic deadline. Orbit checks it again after preparing each socket, immediately before `connect()`. Once it expires, Orbit drops the client and any prepared or pending upstream socket, even if a completion is ready in the same event batch. The timeout ends on session establishment. A pending client can half-close its request and wait for a response.
+The connect timeout covers the full upstream establishment sequence, including fallback and deferred work. Once the reactor observes expiry, it closes the client and any pending upstream socket. A pending client can half-close its request and wait for a response if establishment succeeds in time.
 
-When enabled, the idle interval starts on session establishment. A positive socket receive or send on either endpoint restarts the interval if Orbit observes it strictly before the current deadline. Readiness, would-block, EOF, queue operations and FIN propagation leave it unchanged. Expiration closes both sockets and discards remaining application-queued output. A socket call can complete across the deadline, and activity observed at or after expiry leaves the session due for closure. The same policy applies while a peer is half-closed, a destination is backpressured, or the reactor is draining established sessions.
+When enabled, the idle interval starts on session establishment. A positive socket receive or send on either endpoint restarts it when Orbit observes the transfer strictly before expiry. Expiration closes both sockets and discards queued output, including during half-close, backpressure or graceful shutdown. See [reactor deadlines](architecture.md#reactor-deadlines) for timing details.
 
-Graceful shutdown has a separate fixed 30-second deadline starting at the first processed shutdown request. An established session can reach its own idle deadline earlier. A second shutdown request forces closure immediately.
+Graceful shutdown has a separate fixed 30-second deadline starting at the first processed shutdown request. An established session can reach its own idle deadline earlier. Processing a second shutdown request forces closure.
 
-Choose the two watermarks together when lowering the high watermark below the default low watermark. The reactor allocates payload in 4 KiB blocks. See [forwarding and backpressure](architecture.md#forwarding-and-backpressure) for the bound on allocated capacity.
+When the high watermark is 192 KiB or less, set the low watermark below it. The reactor allocates payload in 4 KiB blocks. See [forwarding and backpressure](architecture.md#forwarding-and-backpressure) for the bound on allocated capacity.
 
 The defaults allow up to 512 connection-owned descriptors and limit how many clients can tie up that capacity in upstream establishment. Size the limits for the deployment's process and system descriptor budgets and allow headroom for non-connection descriptors. If lowering the total below 64, also lower the pending limit.
 

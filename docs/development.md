@@ -13,10 +13,11 @@ sudo apt-get install -y cmake g++-15 git ninja-build python3
 sudo apt-get install -y clang-22 libclang-rt-22-dev  # for sanitizers
 ```
 
-CMake FetchContent downloads the pinned spdlog, CLI11, Abseil and GoogleTest sources from
-GitHub on the first configure in each build directory. If outbound access is restricted,
-provide local checkouts of the same tags with CMake's `FETCHCONTENT_SOURCE_DIR_<NAME>`
-cache variables. Use `CMakeUserPresets.json` for local overrides.
+CMake FetchContent downloads the pinned dependencies on the first configure in each build
+directory. Offline builds can use local checkouts of the same tags through
+`FETCHCONTENT_SOURCE_DIR_SPDLOG`, `FETCHCONTENT_SOURCE_DIR_CLI11`,
+`FETCHCONTENT_SOURCE_DIR_ABSEIL` and `FETCHCONTENT_SOURCE_DIR_GOOGLETEST`. Use
+`CMakeUserPresets.json` for local overrides. See the pinned tags in the [root build configuration](../CMakeLists.txt).
 
 ## Build and test
 
@@ -38,10 +39,11 @@ cmake --build --preset sanitizers
 ctest --preset sanitizers
 ```
 
-Use the label filters below with any of the three test presets. Use `-R <regex>` to
-select by CTest name, `-N` to list registrations, or `-V` to see the commands and their
-output. GoogleTest discovery runs when CTest loads the registrations, so compile first.
-A missing or empty test selection is an error with the test presets.
+Use the label filters below with any test preset. CTest discovers GoogleTest cases under
+the `unit` label after the build. The `integration` label runs the serial
+`integration_proxy_sessions` Python suite against the executable from that preset.
+Use `-R <regex>` to select by CTest name, `-N` to list registrations, or `-V` to see test
+commands and output. An empty test selection is an error with the test presets.
 
 ```sh
 ctest --preset debug -L '^unit$'
@@ -64,10 +66,11 @@ and standard library, which must support C++23, including `std::expected` and `s
 
 ## Test deadlines and diagnostics
 
-Deadline regression fixtures advance their own monotonic clock while dispatching controlled
-readiness events. Optional socket callbacks count actual operations and can advance the clock
-after a real syscall, before the reactor observes its result. Fixtures keep callback state alive
-through reactor teardown. Tests that exercise timerfd arming and epoll use the system clock.
+Reactor fixtures dispatch controlled readiness events and can supply a monotonic test clock.
+Optional syscall and allocation hooks let tests inject resource failures or count operations.
+Socket hooks can advance the clock after a real syscall, before the reactor observes its result.
+Fixtures keep callback state alive through reactor teardown. Tests for kernel timerfd arming use
+the system clock. See [coverage limits](known-limitations.md#lim-011--fault-and-readiness-tests-leave-gaps).
 
 GoogleTest discovery and each unit test have a 15-second limit. CTest runs the Python suite
 serially with a 45-second limit and terminates the test process tree if it exceeds that limit.

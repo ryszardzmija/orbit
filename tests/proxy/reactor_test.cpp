@@ -441,6 +441,23 @@ TEST_F(ControlledReactorTest, ExpiredPendingHandoffReleasesBothSockets) {
     EXPECT_EQ(0, recv(attempt.peer.get(), &byte, 1, 0));
 }
 
+TEST_F(ControlledReactorTest, ExpiredPendingHandoffKeepsListenerEnabled) {
+    createReactor({}, clock.source(), {}, {.max_connections = 1, .max_pending_connections = 1});
+    ASSERT_TRUE(listenerAccepting());
+    auto client = test::socketPair();
+    auto attempt = test::socketPair();
+    const auto deadline = clock.now() + 1ms;
+    clock.advanceTo(deadline);
+
+    ASSERT_TRUE(dialResult(detail::UpstreamDialInProgress{
+        {std::move(client.local), {}, std::move(attempt.local), 0, deadline}}));
+
+    EXPECT_EQ(0u, pendingCount());
+    EXPECT_EQ(0u, totalCount());
+    EXPECT_TRUE(canAdmit());
+    EXPECT_TRUE(listenerAccepting());
+}
+
 TEST_F(ControlledReactorTest, SimulatedDeadlineCannotArmKernelTimer) {
     auto client = test::socketPair();
     auto attempt = test::socketPair();
