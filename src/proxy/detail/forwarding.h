@@ -6,6 +6,7 @@
 #include <string>
 
 #include "common/status.h"
+#include "net/socket_io.h"
 #include "proxy/detail/session/idle_deadline.h"
 #include "proxy/detail/session/session_state.h"
 
@@ -27,7 +28,7 @@ public:
     static Forwarder create(size_t capacity);
 
     Status<ForwardError> forward(SessionEndpoint& source, SessionEndpoint& destination,
-                                 IdleDeadline* idle);
+                                 IdleDeadline* idle, const net::StreamOperations& operations);
 
 private:
     explicit Forwarder(size_t capacity);

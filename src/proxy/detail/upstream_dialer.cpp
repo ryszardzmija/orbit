@@ -37,8 +37,10 @@ UpstreamDialError timedOut() {
 
 } // namespace
 
-UpstreamDialer::UpstreamDialer(detail::ResolvedUpstream resolved_upstream)
-    : resolved_upstream_(std::move(resolved_upstream)) {}
+UpstreamDialer::UpstreamDialer(detail::ResolvedUpstream resolved_upstream,
+                               net::DialOperations operations)
+    : resolved_upstream_(std::move(resolved_upstream)),
+      operations_(operations) {}
 
 std::expected<UpstreamDialer, UpstreamDialerCreateError>
 UpstreamDialer::create(const net::ResolutionEndpoint& upstream_address) {
@@ -55,7 +57,7 @@ UpstreamDialer::create(const net::ResolutionEndpoint& upstream_address) {
 
 std::expected<UpstreamDialResult, UpstreamDialError>
 UpstreamDialer::dial(FileDescriptor accepted_connection, const net::SocketAddress& accepted_address,
-                     Deadline deadline) {
+                     Deadline deadline, const SteadyTimeSource& time_source) {
     assert(resolved_upstream_.candidates().size() > 0);
 
     PendingConnection pending_connection{
@@ -67,14 +69,15 @@ UpstreamDialer::dial(FileDescriptor accepted_connection, const net::SocketAddres
         .error_messages = {},
     };
 
-    return tryCandidatesFrom(std::move(pending_connection), 0);
+    return tryCandidatesFrom(std::move(pending_connection), 0, time_source);
 }
 
 std::expected<UpstreamDialResult, UpstreamDialError>
-UpstreamDialer::advanceDialAttempt(PendingConnection pending_connection) {
+UpstreamDialer::advanceDialAttempt(PendingConnection pending_connection,
+                                   const SteadyTimeSource& time_source) {
     assert(pending_connection.attempted_connection_fd.has_value());
 
-    if (DeadlineClock::now() >= pending_connection.deadline) {
+    if (time_source.now() >= pending_connection.deadline) {
         return std::unexpected(timedOut());
     }
     auto completion_result =
@@ -97,7 +100,7 @@ UpstreamDialer::advanceDialAttempt(PendingConnection pending_connection) {
     pending_connection.attempted_connection_fd.reset();
 
     size_t next_idx = pending_connection.attempted_address_idx + 1;
-    return tryCandidatesFrom(std::move(pending_connection), next_idx);
+    return tryCandidatesFrom(std::move(pending_connection), next_idx, time_source);
 }
 
 const net::ResolutionEndpoint& UpstreamDialer::upstreamEndpoint() const {
@@ -106,14 +109,16 @@ const net::ResolutionEndpoint& UpstreamDialer::upstreamEndpoint() const {
 
 std::expected<UpstreamDialResult, UpstreamDialError>
 UpstreamDialer::tryCandidatesFrom(PendingConnection pending_connection,
-                                  std::size_t first_candidate_idx) {
+                                  std::size_t first_candidate_idx,
+                                  const SteadyTimeSource& time_source) {
     for (size_t i = first_candidate_idx; i < resolved_upstream_.candidates().size();) {
-        if (DeadlineClock::now() >= pending_connection.deadline) {
+        if (time_source.now() >= pending_connection.deadline) {
             return std::unexpected(timedOut());
         }
         pending_connection.attempted_address_idx = i;
 
-        auto dial_result = net::dial(resolved_upstream_.candidates()[i], pending_connection.deadline);
+        auto dial_result = net::dial(resolved_upstream_.candidates()[i],
+                                     pending_connection.deadline, time_source, operations_);
         if (!dial_result) {
             if (dial_result.error().failed_op == net::DialFailedOp::Deadline) {
                 return std::unexpected(timedOut());

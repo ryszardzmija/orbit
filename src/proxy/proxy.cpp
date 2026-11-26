@@ -68,26 +68,37 @@ uint32_t getEventMask(const detail::EndpointInterests& interests) {
 
 ProxyReactor::ProxyReactor(detail::EpollPoller poller, FileDescriptor shutdown_signal_fd,
                            FileDescriptor timer_fd, detail::UpstreamDialer upstream_dialer,
-                           TimeoutConfig timeouts)
+                           TimeoutConfig timeouts, SteadyTimeSource time_source,
+                           net::StreamOperations stream_operations)
     : poller_(std::move(poller)),
-      session_manager_(detail::SessionManagerOptions{
-          .send_buffer =
-              {
-                  .block_size = block_size,
-                  .high_watermark = high_watermark,
-                  .low_watermark = low_watermark,
-              },
-          .forwarder_buffer_capacity = forwarder_buf_cap,
-          .sender_buffer_capacity = sender_buf_cap,
-      }),
+      session_manager_(
+          detail::SessionManagerOptions{
+              .send_buffer =
+                  {
+                      .block_size = block_size,
+                      .high_watermark = high_watermark,
+                      .low_watermark = low_watermark,
+                  },
+              .forwarder_buffer_capacity = forwarder_buf_cap,
+              .sender_buffer_capacity = sender_buf_cap,
+          },
+          stream_operations),
       shutdown_signal_fd_(std::move(shutdown_signal_fd)),
       timer_fd_(std::move(timer_fd)),
       timeouts_(timeouts),
+      time_source_(time_source),
       upstream_dialer_(std::move(upstream_dialer)) {}
 
 Result<ProxyReactor, ProxyCreateError>
 ProxyReactor::create(const net::ListenSocketAddress& listen_address,
                      const net::ResolutionEndpoint& upstream_address, TimeoutConfig timeouts) {
+    return createImpl(listen_address, upstream_address, timeouts, {}, {});
+}
+
+Result<ProxyReactor, ProxyCreateError>
+ProxyReactor::createImpl(const net::ListenSocketAddress& listen_address,
+                         const net::ResolutionEndpoint& upstream_address, TimeoutConfig timeouts,
+                         SteadyTimeSource time_source, net::StreamOperations stream_operations) {
     if (timeouts.connect.count() < 1 || timeouts.connect > TimeoutConfig::maximum) {
         return std::unexpected(ProxyCreateError{"Invalid connection timeout"});
     }
@@ -125,7 +136,7 @@ ProxyReactor::create(const net::ListenSocketAddress& listen_address,
     net::Listener listener = std::move(listener_create_result.value());
 
     ProxyReactor reactor(std::move(poller), std::move(signal_fd), std::move(timer_fd),
-                         std::move(dialer), timeouts);
+                         std::move(dialer), timeouts, time_source, stream_operations);
 
     auto listener_register_result = reactor.registerListener(listener.fd());
     if (!listener_register_result) {
@@ -365,7 +376,7 @@ Result<detail::SessionId, AddSessionError> ProxyReactor::addSession(FileDescript
     detail::SourceId upstream_id = upstream_register_result.value();
 
     // Check at the ownership handoff as registration itself consumes dial budget.
-    if (detail::DeadlineClock::now() >= deadline) {
+    if (time_source_.now() >= deadline) {
         auto upstream = unregisterReactorSource(upstream_id);
         auto downstream = unregisterReactorSource(downstream_id);
         if (!upstream || !downstream) {
@@ -385,7 +396,7 @@ Result<detail::SessionId, AddSessionError> ProxyReactor::addSession(FileDescript
 
     if (timeouts_.idle.count() > 0) {
         deadlines_.schedule({detail::DeadlineKind::Idle, session_id},
-                            detail::DeadlineClock::now() + timeouts_.idle);
+                            time_source_.now() + timeouts_.idle);
     }
     return session_id;
 }
@@ -401,7 +412,7 @@ Status<FatalReactorError> ProxyReactor::handleEndpoint(detail::EndpointRegistrat
     std::optional<detail::IdleDeadline> idle_deadline;
     if (timeouts_.idle.count() > 0) {
         auto at = deadlines_.scheduledAt({detail::DeadlineKind::Idle, session_id});
-        idle_deadline.emplace(at.value(), timeouts_.idle);
+        idle_deadline.emplace(at.value(), timeouts_.idle, time_source_);
     }
     auto* idle = idle_deadline ? &*idle_deadline : nullptr;
 
@@ -522,7 +533,7 @@ Status<FatalReactorError> ProxyReactor::handleTimer(detail::TimerRegistration) {
     }
     if (*expired) {
         armed_deadline_.reset();
-        if (auto result = expireDeadlines(detail::DeadlineClock::now()); !result) {
+        if (auto result = expireDeadlines(time_source_.now()); !result) {
             return std::unexpected(FatalReactorError{result.error().message()});
         }
     }
@@ -530,6 +541,10 @@ Status<FatalReactorError> ProxyReactor::handleTimer(detail::TimerRegistration) {
 }
 
 Status<std::error_code> ProxyReactor::synchronizeTimer() {
+    // A simulated time point has no meaning to the kernel's CLOCK_MONOTONIC timer.
+    if (!time_source_.usesSystemClock()) {
+        return std::unexpected(std::make_error_code(std::errc::operation_not_supported));
+    }
     auto next = deadlines_.next();
     if (next != armed_deadline_) {
         if (auto result = detail::setTimer(timer_fd_.get(), next); !result) {
@@ -587,9 +602,9 @@ Status<FatalReactorError> ProxyReactor::handleListener(detail::ListenerRegistrat
 
         spdlog::info("Client {} connected", net::formatAddress(accept_success.remote));
 
-        auto deadline = detail::DeadlineClock::now() + timeouts_.connect;
-        auto dial_result =
-            upstream_dialer_.dial(std::move(accept_success.fd), accept_success.remote, deadline);
+        auto deadline = time_source_.now() + timeouts_.connect;
+        auto dial_result = upstream_dialer_.dial(std::move(accept_success.fd),
+                                                 accept_success.remote, deadline, time_source_);
         if (!dial_result) {
             if (auto error_result = handleDialError(std::move(dial_result.error()));
                 !error_result) {
@@ -615,7 +630,7 @@ Status<FatalReactorError> ProxyReactor::handlePendingConnection(detail::SourceId
     if (shutdown_state_ != ShutdownState::Running) {
         return {};
     }
-    auto dial_result = upstream_dialer_.advanceDialAttempt(std::move(*pending));
+    auto dial_result = upstream_dialer_.advanceDialAttempt(std::move(*pending), time_source_);
     if (!dial_result) {
         return handleDialError(std::move(dial_result.error()));
     }
@@ -652,7 +667,7 @@ Status<FatalReactorError> ProxyReactor::handleDialResult(detail::UpstreamDialRes
                      net::formatAddress(connected->upstream_address));
 
     } else if (auto* in_progress = std::get_if<detail::UpstreamDialInProgress>(&dial_result)) {
-        if (detail::DeadlineClock::now() >= in_progress->pending_connection.deadline) {
+        if (time_source_.now() >= in_progress->pending_connection.deadline) {
             spdlog::debug("Upstream connection establishment timed out");
             return {};
         }
@@ -692,8 +707,7 @@ Status<std::error_code> ProxyReactor::handleShutdownRequest() {
     switch (shutdown_state_) {
     case ShutdownState::Running:
         if (hasActiveSessions()) {
-            deadlines_.schedule(shutdown_deadline,
-                                detail::DeadlineClock::now() + graceful_shutdown_timeout);
+            deadlines_.schedule(shutdown_deadline, time_source_.now() + graceful_shutdown_timeout);
         }
         if (auto unregister_listener_result =
                 unregisterReactorSource(active_listener_->listener_id);

@@ -6,6 +6,7 @@
 
 #include <gtest/gtest.h>
 
+#include "controlled_clock.h"
 #include "proxy/proxy.h"
 #include "socket_pair.h"
 
@@ -16,8 +17,13 @@ class ProxyReactorTest : public testing::Test {
 protected:
     void SetUp() override { createReactor({}); }
 
-    void createReactor(TimeoutConfig timeouts) {
-        auto result = ProxyReactor::create({"127.0.0.1", 0}, {"127.0.0.1", 1}, timeouts);
+    // Clock and socket callback contexts can belong to derived fixtures.
+    void TearDown() override { reactor.reset(); }
+
+    void createReactor(TimeoutConfig timeouts, SteadyTimeSource time_source = {},
+                       net::StreamOperations stream_operations = {}) {
+        auto result = ProxyReactor::createImpl({"127.0.0.1", 0}, {"127.0.0.1", 1}, timeouts,
+                                               time_source, stream_operations);
         ASSERT_TRUE(result) << result.error().message;
         reactor.emplace(std::move(*result));
     }
@@ -33,17 +39,25 @@ protected:
 
     auto dispatch(detail::ReadyEvent event) { return reactor->dispatch(event); }
     bool registered(detail::SourceId id) const { return reactor->sources_.find(id).has_value(); }
+    bool watching(detail::SourceId id) const { return reactor->poller_.isWatching(id); }
+
+    void setUpstreamDialer(detail::UpstreamDialer dialer) {
+        reactor->upstream_dialer_ = std::move(dialer);
+    }
 
     detail::SourceId installPending(test::SocketPair& client, test::SocketPair& attempt,
-                                    detail::Deadline at = detail::DeadlineClock::now() +
-                                                          std::chrono::seconds(10)) {
-        auto added = reactor->registerPendingConnection({
+                                    std::optional<detail::Deadline> at = std::nullopt) {
+        return installPending({
             .accepted_connection_fd = std::move(client.local),
             .accepted_address = {},
             .attempted_connection_fd = std::move(attempt.local),
             .attempted_address_idx = 0,
-            .deadline = at,
+            .deadline = at ? *at : reactor->time_source_.now() + std::chrono::seconds(10),
         });
+    }
+
+    detail::SourceId installPending(detail::PendingConnection pending) {
+        auto added = reactor->registerPendingConnection(std::move(pending));
         if (!added) {
             throw std::system_error(added.error());
         }
@@ -86,6 +100,13 @@ protected:
     auto waitForEvents() { return reactor->poller_.wait(); }
 
     std::optional<ProxyReactor> reactor;
+};
+
+class ControlledReactorTest : public ProxyReactorTest {
+protected:
+    void SetUp() override { createReactor({}, clock.source()); }
+
+    test::ControlledClock clock;
 };
 
 } // namespace orbit::proxy

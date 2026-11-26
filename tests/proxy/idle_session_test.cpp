@@ -1,94 +1,78 @@
+#include <algorithm>
 #include <array>
 #include <cerrno>
 #include <chrono>
+#include <optional>
+#include <utility>
 
 #include <gtest/gtest.h>
 #include <sys/epoll.h>
 #include <sys/socket.h>
 
-#include "controlled_clock.h"
 #include "reactor_fixture.h"
-
-namespace {
-
-enum class IoOperation { Receive, Send };
-
-struct IoObservation {
-    int fd;
-    int calls = 0;
-    ssize_t result = 0;
-    int error = 0;
-};
-
-class AdvanceClockOnIo;
-thread_local AdvanceClockOnIo* observing_io = nullptr;
-
-class AdvanceClockOnIo {
-public:
-    AdvanceClockOnIo(orbit::proxy::test::ControlledClock& clock,
-                     orbit::proxy::detail::Deadline observed_at, IoOperation advance_after,
-                     int read_fd, int write_fd)
-        : received{read_fd},
-          sent{write_fd},
-          clock_(clock),
-          observed_at_(observed_at),
-          advance_after_(advance_after) {
-        observing_io = this;
-    }
-
-    ~AdvanceClockOnIo() { observing_io = nullptr; }
-
-    void observe(IoOperation operation, int fd, ssize_t result) noexcept {
-        auto& observation = operation == IoOperation::Receive ? received : sent;
-        if (observation.fd == fd) {
-            ++observation.calls;
-            observation.result = result;
-            observation.error = result < 0 ? errno : 0;
-            if (operation == advance_after_) {
-                clock_.advanceTo(observed_at_);
-            }
-        }
-    }
-
-    IoObservation received;
-    IoObservation sent;
-
-private:
-    orbit::proxy::test::ControlledClock& clock_;
-    orbit::proxy::detail::Deadline observed_at_;
-    IoOperation advance_after_;
-};
-
-} // namespace
-
-extern "C" ssize_t __real_recv(int fd, void* buffer, size_t size, int flags);
-extern "C" ssize_t __wrap_recv(int fd, void* buffer, size_t size, int flags) {
-    auto result = __real_recv(fd, buffer, size, flags);
-    if (observing_io) {
-        observing_io->observe(IoOperation::Receive, fd, result);
-    }
-    return result;
-}
-
-extern "C" ssize_t __real_send(int fd, const void* buffer, size_t size, int flags);
-extern "C" ssize_t __wrap_send(int fd, const void* buffer, size_t size, int flags) {
-    auto result = __real_send(fd, buffer, size, flags);
-    if (observing_io) {
-        observing_io->observe(IoOperation::Send, fd, result);
-    }
-    return result;
-}
 
 namespace orbit::proxy {
 
 using namespace std::chrono_literals;
 using detail::DeadlineClock;
 
-class IdleSessionTest : public ProxyReactorTest {
-    void SetUp() override { createReactor({.idle = 60s}); }
+namespace {
+
+struct IoObservation {
+    int fd = -1;
+    std::optional<detail::Deadline> advance_to;
+    std::optional<detail::Deadline> advance_after_read;
+    int calls = 0;
+    ssize_t result = 0;
+    int error = 0;
+    detail::Deadline observed_at;
+
+    void record(test::ControlledClock& clock, int actual_fd, ssize_t count, int syscall_errno) {
+        if (fd != actual_fd) {
+            return;
+        }
+        ++calls;
+        result = count;
+        error = count < 0 ? syscall_errno : 0;
+        observed_at = clock.now();
+        if (auto at = std::exchange(advance_to, std::nullopt)) {
+            clock.advanceTo(*at);
+        }
+        if (auto at = std::exchange(advance_after_read, std::nullopt)) {
+            clock.advanceAfterNextRead(*at);
+        }
+    }
 };
 
-namespace {
+struct StreamObservation {
+    test::ControlledClock& clock;
+    IoObservation received;
+    IoObservation sent;
+
+    net::StreamOperations operations() {
+        return {
+            .context = this,
+            .receive =
+                [](void* context, int fd, void* buffer, size_t size, int flags) {
+                    auto& io = *static_cast<StreamObservation*>(context);
+                    const auto result = ::recv(fd, buffer, size, flags);
+                    const int error = errno;
+                    io.received.record(io.clock, fd, result, error);
+                    errno = error;
+                    return result;
+                },
+            .send =
+                [](void* context, int fd, const void* buffer, size_t size, int flags) {
+                    auto& io = *static_cast<StreamObservation*>(context);
+                    const auto result = ::send(fd, buffer, size, flags);
+                    const int error = errno;
+                    io.sent.record(io.clock, fd, result, error);
+                    errno = error;
+                    return result;
+                },
+        };
+    }
+};
 
 size_t fillSendQueue(int fd) {
     int limit = 4096;
@@ -112,29 +96,59 @@ size_t fillSendQueue(int fd) {
 
 } // namespace
 
-TEST_F(ProxyReactorTest, IdleExpirationIsDisabledByDefault) {
+class IdleSessionTest : public ControlledReactorTest {
+protected:
+    void SetUp() override {
+        createReactor({.idle = 60s}, clock.source(), observation.operations());
+    }
+
+    StreamObservation observation{clock};
+};
+
+class SystemIdleSessionTest : public ProxyReactorTest {
+    void SetUp() override { createReactor({.idle = 60s}); }
+};
+
+TEST_F(ControlledReactorTest, IdleDisabledPerformsNoClockReadsDuringForwardingOrTeardown) {
     auto client = test::socketPair();
     auto backend = test::socketPair();
     auto ids = install(client, backend);
+    ASSERT_EQ(1u, clock.reads()); // Only the connection handoff checks time.
     EXPECT_FALSE(nextDeadline());
-    ASSERT_TRUE(expire(detail::Deadline::max()));
+    clock.advanceTo(clock.now() + 1h);
+    ASSERT_TRUE(expire(clock.now()));
+
     ASSERT_EQ(1, send(client.peer.get(), "d", 1, 0));
+    ASSERT_EQ(0, shutdown(client.peer.get(), SHUT_WR));
     ASSERT_TRUE(dispatch({ids.downstream, EPOLLIN}));
+    ASSERT_TRUE(dispatch({ids.downstream, EPOLLIN | EPOLLRDHUP}));
     char byte;
     ASSERT_EQ(1, recv(backend.peer.get(), &byte, 1, 0));
     EXPECT_EQ('d', byte);
+    EXPECT_EQ(0, recv(backend.peer.get(), &byte, 1, 0));
+
+    // Queue residual data on hangup and flush it through writable dispatch.
+    ASSERT_EQ(1, send(backend.peer.get(), "r", 1, 0));
+    ASSERT_EQ(0, shutdown(backend.peer.get(), SHUT_WR));
+    ASSERT_TRUE(dispatch({ids.upstream, EPOLLHUP}));
+    ASSERT_TRUE(dispatch({ids.downstream, EPOLLOUT}));
+    ASSERT_EQ(1, recv(client.peer.get(), &byte, 1, 0));
+    EXPECT_EQ('r', byte);
+    EXPECT_EQ(0, recv(client.peer.get(), &byte, 1, 0));
+    EXPECT_FALSE(registered(ids.downstream));
+    EXPECT_FALSE(registered(ids.upstream));
     EXPECT_FALSE(nextDeadline());
+    EXPECT_EQ(1u, clock.reads());
 }
 
 TEST_F(IdleSessionTest, WouldBlockReadinessAndHalfCloseLeaveInitialIdleDeadlineIntact) {
     auto client = test::socketPair();
     auto backend = test::socketPair();
-    auto before = DeadlineClock::now();
+    auto before = clock.now();
     auto ids = install(client, backend);
     auto at = nextDeadline();
     ASSERT_TRUE(at);
-    EXPECT_GE(*at, before + 60s);
-    EXPECT_LE(*at, DeadlineClock::now() + 60s);
+    EXPECT_EQ(*at, before + 60s);
     for (int i = 0; i < 3; ++i) {
         ASSERT_TRUE(dispatch({ids.downstream, EPOLLIN | EPOLLOUT}));
         EXPECT_EQ(at, nextDeadline());
@@ -144,9 +158,11 @@ TEST_F(IdleSessionTest, WouldBlockReadinessAndHalfCloseLeaveInitialIdleDeadlineI
     char byte;
     EXPECT_EQ(0, recv(backend.peer.get(), &byte, 1, 0));
     EXPECT_EQ(at, nextDeadline());
-    ASSERT_TRUE(expire(*at - 1ns));
+    clock.advanceTo(*at - 1ns);
+    ASSERT_TRUE(expire(clock.now()));
     EXPECT_TRUE(registered(ids.downstream));
-    ASSERT_TRUE(expire(*at));
+    clock.advanceTo(*at);
+    ASSERT_TRUE(expire(clock.now()));
     EXPECT_FALSE(registered(ids.downstream));
     EXPECT_FALSE(registered(ids.upstream));
     EXPECT_FALSE(nextDeadline());
@@ -160,30 +176,33 @@ TEST_F(IdleSessionTest, TrafficInEitherDirectionRefreshesOnlyItsOwnSession) {
     auto quiet_client = test::socketPair();
     auto quiet_backend = test::socketPair();
     auto quiet = install(quiet_client, quiet_backend);
-    auto previous = DeadlineClock::now() + 5s;
+    auto previous = clock.now() + 5s;
     setIdleAt(busy.downstream, previous);
     setIdleAt(quiet.upstream, previous);
     ASSERT_EQ(1, send(client.peer.get(), "x", 1, 0));
     ASSERT_TRUE(dispatch({busy.downstream, EPOLLIN}));
-    ASSERT_TRUE(expire(previous));
+    clock.advanceTo(previous);
+    ASSERT_TRUE(expire(clock.now()));
     ASSERT_FALSE(registered(quiet.downstream));
     ASSERT_TRUE(registered(busy.upstream));
     char byte;
     ASSERT_EQ(1, recv(backend.peer.get(), &byte, 1, 0));
     EXPECT_EQ('x', byte);
 
-    setIdleAt(busy.upstream, previous);
+    const auto reverse_deadline = clock.now() + 5s;
+    setIdleAt(busy.upstream, reverse_deadline);
     ASSERT_EQ(1, send(backend.peer.get(), "y", 1, 0));
     ASSERT_TRUE(dispatch({busy.upstream, EPOLLIN}));
-    ASSERT_TRUE(expire(previous));
+    clock.advanceTo(reverse_deadline);
+    ASSERT_TRUE(expire(clock.now()));
     ASSERT_TRUE(registered(busy.downstream));
     ASSERT_EQ(1, recv(client.peer.get(), &byte, 1, 0));
     EXPECT_EQ('y', byte);
     ASSERT_TRUE(nextDeadline());
-    EXPECT_GT(*nextDeadline(), previous);
+    EXPECT_GT(*nextDeadline(), reverse_deadline);
 }
 
-TEST_F(IdleSessionTest, QueuedWriteRefreshesOnlyOnSuccessfulSendAndPausedSessionCanExpire) {
+TEST_F(SystemIdleSessionTest, QueuedWriteRefreshesOnlyOnSuccessfulSendAndPausedSessionCanExpire) {
     auto client = test::socketPair();
     auto backend = test::socketPair();
     int limit = 4096;
@@ -236,7 +255,7 @@ TEST_F(IdleSessionTest, ResidualReadAndQueuedSendEachCountAsSocketActivity) {
     auto source = test::socketPair();
     auto destination = test::socketPair();
     auto ids = install(source, destination);
-    auto previous = DeadlineClock::now() + 5s;
+    auto previous = clock.now() + 5s;
     setIdleAt(ids.upstream, previous);
     ASSERT_EQ(1, send(source.peer.get(), "h", 1, 0));
     ASSERT_TRUE(dispatch({ids.downstream, EPOLLHUP})); // One residual receive, queued in full.
@@ -257,7 +276,9 @@ TEST_F(IdleSessionTest, ExpiredSessionCannotBeRefreshedByCopiedReadiness) {
     auto backend = test::socketPair();
     auto ids = install(client, backend);
     ASSERT_EQ(1, send(client.peer.get(), "x", 1, 0));
-    setIdleAt(ids.downstream, DeadlineClock::now());
+    const auto at = clock.now() + 1ms;
+    setIdleAt(ids.downstream, at);
+    clock.advanceTo(at);
     ASSERT_TRUE(dispatch({ids.downstream, EPOLLIN}));
     EXPECT_FALSE(registered(ids.upstream));
     EXPECT_FALSE(nextDeadline());
@@ -284,17 +305,21 @@ TEST_F(IdleSessionTest, IdleExpiryBetweenCombinedReadAndWriteSkipsQueuedSend) {
         filler -= n;
     }
 
-    auto at = DeadlineClock::now() + 5s;
+    auto at = clock.now() + 5s;
     setIdleAt(ids.upstream, at);
-    test::ControlledClock clock(at - 1ns);
-    AdvanceClockOnIo observation(clock, at, IoOperation::Receive, backend_fd, backend_fd);
+    clock.advanceTo(at - 1ns);
+    observation.received = {.fd = backend_fd, .advance_to = at + 1ns};
+    observation.sent = {.fd = backend_fd};
     ASSERT_TRUE(dispatch({ids.upstream, EPOLLIN | EPOLLOUT}));
     EXPECT_EQ(1, observation.received.calls);
     EXPECT_EQ(-1, observation.received.result);
     EXPECT_EQ(EAGAIN, observation.received.error);
+    EXPECT_EQ(at + 1ns, clock.now());
     EXPECT_EQ(0, observation.sent.calls);
     EXPECT_FALSE(registered(ids.downstream));
     EXPECT_FALSE(registered(ids.upstream));
+    EXPECT_FALSE(watching(ids.downstream));
+    EXPECT_FALSE(watching(ids.upstream));
     EXPECT_FALSE(nextDeadline());
     EXPECT_EQ(0, recv(backend.peer.get(), buffer.data(), 1, 0));
 }
@@ -306,10 +331,11 @@ TEST_F(IdleSessionTest, ReceiveObservedAtExpiryCannotRefreshDeadlineOrStartDirec
     int backend_fd = backend.local.get();
     auto ids = install(client, backend);
     ASSERT_EQ(1, send(client.peer.get(), "x", 1, 0));
-    auto at = DeadlineClock::now() + 5s;
+    auto at = clock.now() + 5s;
     setIdleAt(ids.downstream, at);
-    test::ControlledClock clock(at - 1ns);
-    AdvanceClockOnIo observation(clock, at, IoOperation::Receive, client_fd, backend_fd);
+    clock.advanceTo(at - 1ns);
+    observation.received = {.fd = client_fd, .advance_to = at};
+    observation.sent = {.fd = backend_fd};
 
     ASSERT_TRUE(dispatch({ids.downstream, EPOLLIN}));
     EXPECT_EQ(1, observation.received.calls);
@@ -329,16 +355,20 @@ TEST_F(IdleSessionTest, ReceiveObservedBeforeExpiryRefreshesDeadline) {
     int backend_fd = backend.local.get();
     auto ids = install(client, backend);
     ASSERT_EQ(1, send(client.peer.get(), "x", 1, 0));
-    auto at = DeadlineClock::now() + 5s;
+    auto at = clock.now() + 5s;
     setIdleAt(ids.downstream, at);
-    test::ControlledClock clock(at - 2ns);
-    AdvanceClockOnIo observation(clock, at - 1ns, IoOperation::Receive, client_fd, backend_fd);
+    clock.advanceTo(at - 2ns);
+    observation.received = {.fd = client_fd, .advance_to = at - 1ns};
+    observation.sent = {.fd = backend_fd};
 
     ASSERT_TRUE(dispatch({ids.downstream, EPOLLIN}));
+    EXPECT_EQ(1, observation.received.calls);
     EXPECT_EQ(1, observation.received.result);
+    EXPECT_EQ(1, observation.sent.calls);
     EXPECT_EQ(1, observation.sent.result);
     EXPECT_EQ(at - 1ns + 60s, nextDeadline());
-    ASSERT_TRUE(expire(at));
+    clock.advanceTo(at);
+    ASSERT_TRUE(expire(clock.now()));
     EXPECT_TRUE(registered(ids.downstream));
     EXPECT_TRUE(registered(ids.upstream));
     char byte;
@@ -355,10 +385,11 @@ TEST_F(IdleSessionTest, QueuedSendObservedAtExpiryCompletesWithoutRevivingSessio
     ASSERT_EQ(1, send(source.peer.get(), "x", 1, 0));
     ASSERT_TRUE(dispatch({ids.downstream, EPOLLHUP}));
     ASSERT_TRUE(interests(ids.upstream).upstream.writable);
-    auto at = DeadlineClock::now() + 5s;
+    auto at = clock.now() + 5s;
     setIdleAt(ids.upstream, at);
-    test::ControlledClock clock(at - 1ns);
-    AdvanceClockOnIo observation(clock, at, IoOperation::Send, source_fd, destination_fd);
+    clock.advanceTo(at - 1ns);
+    observation.received = {.fd = source_fd};
+    observation.sent = {.fd = destination_fd, .advance_to = at};
 
     ASSERT_TRUE(dispatch({ids.upstream, EPOLLOUT}));
     EXPECT_EQ(1, observation.sent.calls);
@@ -388,10 +419,11 @@ TEST_F(IdleSessionTest, ExpiryAfterWouldBlockSendStopsDeferredHangupRead) {
     ASSERT_TRUE(interests(ids.upstream).upstream.writable);
     char residual;
     ASSERT_EQ(1, recv(source_fd, &residual, 1, MSG_PEEK));
-    auto at = DeadlineClock::now() + 5s;
+    auto at = clock.now() + 5s;
     setIdleAt(ids.upstream, at);
-    test::ControlledClock clock(at - 1ns);
-    AdvanceClockOnIo observation(clock, at, IoOperation::Send, source_fd, destination_fd);
+    clock.advanceTo(at - 1ns);
+    observation.received = {.fd = source_fd};
+    observation.sent = {.fd = destination_fd, .advance_to = at};
 
     ASSERT_TRUE(dispatch({ids.upstream, EPOLLOUT}));
     EXPECT_EQ(1, observation.sent.calls);
@@ -403,12 +435,58 @@ TEST_F(IdleSessionTest, ExpiryAfterWouldBlockSendStopsDeferredHangupRead) {
     EXPECT_FALSE(nextDeadline());
 }
 
+TEST_F(IdleSessionTest, SuccessfulQueuedSendRefreshesBeforeDeferredHangupRead) {
+    auto source = test::socketPair();
+    auto destination = test::socketPair();
+    const int source_fd = source.local.get();
+    const int destination_fd = destination.local.get();
+    auto ids = install(source, destination);
+    std::array<char, 4097> payload{};
+    payload.fill('p');
+    payload.back() = 'z';
+    ASSERT_EQ(ssize_t(payload.size()), send(source.peer.get(), payload.data(), payload.size(), 0));
+    ASSERT_EQ(0, shutdown(source.peer.get(), SHUT_WR));
+    ASSERT_TRUE(dispatch({ids.downstream, EPOLLHUP}));
+    ASSERT_TRUE(interests(ids.downstream).downstream.readable);
+    ASSERT_TRUE(interests(ids.upstream).upstream.writable);
+
+    const auto at = clock.now() + 5s;
+    setIdleAt(ids.upstream, at);
+    clock.advanceTo(at - 1ns);
+    observation.received = {.fd = source_fd};
+    // Let the send's activity check see valid time, then cross the original deadline.
+    observation.sent = {.fd = destination_fd, .advance_after_read = at};
+    ASSERT_TRUE(dispatch({ids.upstream, EPOLLOUT}));
+    EXPECT_EQ(1, observation.sent.calls);
+    EXPECT_EQ(4096, observation.sent.result);
+    EXPECT_EQ(at - 1ns, observation.sent.observed_at);
+    EXPECT_EQ(1, observation.received.calls);
+    EXPECT_EQ(1, observation.received.result);
+    EXPECT_EQ(at, observation.received.observed_at);
+    EXPECT_EQ(at + 60s, nextDeadline());
+    ASSERT_TRUE(registered(ids.upstream));
+    ASSERT_TRUE(interests(ids.upstream).upstream.writable);
+
+    std::array<char, 4096> prefix{};
+    ASSERT_EQ(ssize_t(prefix.size()),
+              recv(destination.peer.get(), prefix.data(), prefix.size(), 0));
+    EXPECT_TRUE(std::equal(prefix.begin(), prefix.end(), payload.begin()));
+    ASSERT_TRUE(dispatch({ids.upstream, EPOLLOUT}));
+    char byte;
+    ASSERT_EQ(1, recv(destination.peer.get(), &byte, 1, 0));
+    EXPECT_EQ(payload.back(), byte);
+    EXPECT_EQ(0, recv(destination.peer.get(), &byte, 1, 0));
+    EXPECT_FALSE(registered(ids.downstream));
+    EXPECT_FALSE(registered(ids.upstream));
+    EXPECT_FALSE(nextDeadline());
+}
+
 TEST_F(IdleSessionTest, RemovedSessionDeadlineCannotCloseReplacement) {
     auto client = test::socketPair();
     auto backend = test::socketPair();
     int old_fd = client.local.get();
     auto old = install(client, backend);
-    auto at = DeadlineClock::now() + 5s;
+    auto at = clock.now() + 5s;
     setIdleAt(old.downstream, at);
     ASSERT_TRUE(dispatch({old.downstream, EPOLLERR}));
     ASSERT_FALSE(nextDeadline());
@@ -416,7 +494,8 @@ TEST_F(IdleSessionTest, RemovedSessionDeadlineCannotCloseReplacement) {
     auto new_backend = test::socketPair();
     ASSERT_EQ(old_fd, replacement.local.get());
     auto live = install(replacement, new_backend);
-    ASSERT_TRUE(expire(at));
+    clock.advanceTo(at);
+    ASSERT_TRUE(expire(clock.now()));
     ASSERT_TRUE(registered(live.downstream));
     ASSERT_TRUE(shutdownRequest());
     ASSERT_TRUE(shutdownRequest());
@@ -428,18 +507,19 @@ TEST_F(IdleSessionTest, IdleExpiryFinishesGracefulShutdown) {
     auto client = test::socketPair();
     auto backend = test::socketPair();
     auto ids = install(client, backend);
-    auto at = DeadlineClock::now() + 5s;
+    auto at = clock.now() + 5s;
     setIdleAt(ids.upstream, at);
     ASSERT_TRUE(shutdownRequest());
     EXPECT_FALSE(stopped());
-    ASSERT_TRUE(expire(at));
+    clock.advanceTo(at);
+    ASSERT_TRUE(expire(clock.now()));
     EXPECT_TRUE(stopped());
     EXPECT_FALSE(nextDeadline());
     EXPECT_FALSE(registered(ids.upstream));
 }
 
 TEST_F(IdleSessionTest, DueGracefulShutdownTakesPrecedenceOverAnIdleBurst) {
-    auto idle_at = DeadlineClock::now() + 5s;
+    auto idle_at = clock.now() + 5s;
     for (int i = 0; i < 65; ++i) {
         auto client = test::socketPair();
         auto backend = test::socketPair();
@@ -450,7 +530,8 @@ TEST_F(IdleSessionTest, DueGracefulShutdownTakesPrecedenceOverAnIdleBurst) {
     auto longer_backend = test::socketPair();
     auto longer = install(longer_client, longer_backend);
     ASSERT_TRUE(shutdownRequest());
-    ASSERT_TRUE(expire(DeadlineClock::now() + 30s));
+    clock.advanceTo(clock.now() + 30s);
+    ASSERT_TRUE(expire(clock.now()));
     EXPECT_TRUE(stopped());
     EXPECT_FALSE(registered(longer.downstream));
     EXPECT_FALSE(nextDeadline());

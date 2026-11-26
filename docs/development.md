@@ -64,6 +64,11 @@ and standard library, which must support C++23, including `std::expected` and `s
 
 ## Test deadlines and diagnostics
 
+Deadline regression fixtures advance their own monotonic clock while dispatching controlled
+readiness events. Optional socket callbacks count actual operations and can advance the clock
+after a real syscall, before the reactor observes its result. Fixtures keep callback state alive
+through reactor teardown. Tests that exercise timerfd arming and epoll use the system clock.
+
 GoogleTest discovery and each unit test have a 15-second limit. CTest runs the Python suite
 serially with a 45-second limit and terminates the test process tree if it exceeds that limit.
 Each fixture owns one direct child and the client and backend sockets. The transfer workers

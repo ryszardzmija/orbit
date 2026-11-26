@@ -62,6 +62,8 @@ flowchart TD
 | [`SendBufferFactory`](../src/proxy/detail/buffer/send_buffer_factory.cpp) and [`SendBuffer`](../src/proxy/detail/buffer/send_buffer.h) | The factory holds three size parameters from the reactor. Each writable endpoint owns a queue through a `unique_ptr`. The noncopyable, nonmovable queue owns its blocks and tracks FIFO offsets, logical byte count and admission state. `write`, `copy`, and `consume` are its data-plane interface. |
 | [`FileDescriptor`](../src/common/fd.h), [`Result` and `Status`](../src/common/status.h), and [`LoggerGuard`](../src/logging/logger.cpp) | The movable fd wrapper calls `close` on its current valid fd and clears the moved-from value. Syscall and domain failures propagate through `std::expected` where handled explicitly. The logger guard shuts down the spdlog worker and can report queue overruns on exit. |
 
+The dialer stores optional callbacks for `socket` and `connect`. The session manager stores a separate pair for `recv` and `send` and passes them to the forwarding helpers. Each record holds function pointers and a borrowed context for the lifetime of its component. The production defaults call Linux directly after a null check. The helpers still implement syscall error handling and acquire or borrow descriptors through the existing RAII owners.
+
 ## Execution model
 
 One application thread, the main thread, owns and mutates the reactor, poller metadata, dial state and all sessions. Dispatch runs synchronously from the readiness loop and no two handlers execute concurrently. Socket concurrency comes from multiplexing many connections through one epoll instance. No locks or atomics protect the data-plane structures. The process also runs one spdlog worker, with an 8,192-entry async log queue that overwrites the oldest entry on overflow.
@@ -183,6 +185,8 @@ The reactor logs connection and session setup, pending registration at debug lev
 ## Reactor deadlines
 
 The reactor owns one nonblocking `CLOCK_MONOTONIC` timerfd. Before waiting it arms the earliest absolute expiration, changing the kernel timer only when needed. A typed key identifies the affected lifecycle and its ID. An ordered set indexes expiration time and a map locates each key for immediate cancellation or rescheduling. Bookkeeping is proportional to live scheduled work. [Deadline queue](../src/proxy/detail/deadlines.cpp)
+
+The reactor keeps one time source for dial attempts, handoff, idle activity and shutdown. It defaults to `steady_clock::now()` and can read a fixture-owned clock through a function pointer and borrowed context. Arming the timerfd requires the system source. Deadline queue comparisons take an explicit time point. [Time source](../src/common/steady_time_source.h)
 
 A timer wakeup processes at most 64 due keys. Remaining due work rearms the one-shot timer in the past and returns through epoll alongside ready sockets. Attempt retirement cancels the key tied to its source ID before releasing either socket. An old timer notification consults the current queue. Graceful shutdown uses its own key.
 

@@ -4,9 +4,12 @@
 
 namespace orbit::net {
 
-std::expected<SendResult, std::error_code> trySend(int fd, std::span<const uint8_t> buf) {
+std::expected<SendResult, std::error_code> trySend(int fd, std::span<const uint8_t> buf,
+                                                   const StreamOperations& operations) {
     while (true) {
-        ssize_t bytes_sent = send(fd, buf.data(), buf.size(), MSG_NOSIGNAL);
+        ssize_t bytes_sent = operations.send ? operations.send(operations.context, fd, buf.data(),
+                                                               buf.size(), MSG_NOSIGNAL)
+                                             : ::send(fd, buf.data(), buf.size(), MSG_NOSIGNAL);
 
         if (bytes_sent == -1 && errno == EINTR) {
             continue;
@@ -30,9 +33,12 @@ std::expected<SendResult, std::error_code> trySend(int fd, std::span<const uint8
     }
 }
 
-std::expected<RecvResult, std::error_code> tryRecv(int fd, std::span<uint8_t> buf) {
+std::expected<RecvResult, std::error_code> tryRecv(int fd, std::span<uint8_t> buf,
+                                                   const StreamOperations& operations) {
     while (true) {
-        ssize_t bytes_received = recv(fd, buf.data(), buf.size(), 0);
+        ssize_t bytes_received = operations.receive ? operations.receive(operations.context, fd,
+                                                                         buf.data(), buf.size(), 0)
+                                                    : ::recv(fd, buf.data(), buf.size(), 0);
 
         if (bytes_received == -1 && errno == EINTR) {
             continue;

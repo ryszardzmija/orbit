@@ -7,8 +7,10 @@
 #include <absl/container/flat_hash_map.h>
 
 #include "common/fd.h"
+#include "common/steady_time_source.h"
 #include "config/timeouts.h"
 #include "net/listener.h"
+#include "net/socket_io.h"
 #include "proxy/detail/active_listener.h"
 #include "proxy/detail/epoll/epoll_poller.h"
 #include "proxy/detail/pending_connection.h"
@@ -78,7 +80,13 @@ private:
 
     ProxyReactor(detail::EpollPoller poller, FileDescriptor shutdown_signal_fd,
                  FileDescriptor timer_fd, detail::UpstreamDialer upstream_dialer,
-                 TimeoutConfig timeouts);
+                 TimeoutConfig timeouts, SteadyTimeSource time_source,
+                 net::StreamOperations stream_operations);
+
+    static Result<ProxyReactor, ProxyCreateError>
+    createImpl(const net::ListenSocketAddress& listen_address,
+               const net::ResolutionEndpoint& upstream_address, TimeoutConfig timeouts,
+               SteadyTimeSource time_source, net::StreamOperations stream_operations);
 
     // Resource registration
     Result<detail::SourceId, std::error_code> registerEndpoint(int fd, uint32_t initial_events,
@@ -147,6 +155,7 @@ private:
     detail::Deadlines deadlines_;
     std::optional<detail::Deadline> armed_deadline_;
     TimeoutConfig timeouts_;
+    SteadyTimeSource time_source_;
     absl::flat_hash_map<detail::SourceId, detail::PendingConnection> pending_connections_;
     std::optional<detail::ActiveListener> active_listener_;
     detail::UpstreamDialer upstream_dialer_;
