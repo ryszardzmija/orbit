@@ -143,31 +143,24 @@ Status<std::error_code> EpollPoller::retire(SourceId id) {
 
 bool EpollPoller::isWatching(SourceId id) const { return watched_.contains(id); }
 
-Result<std::vector<ReadyEvent>, std::error_code> EpollPoller::wait(bool nonblocking) {
-    while (true) {
-        int n = epoll_wait(epfd_.get(), event_buffer_.data(),
-                           static_cast<int>(event_buffer_.size()), nonblocking ? 0 : -1);
-
-        if (n == -1 && errno == EINTR) {
-            continue;
-        }
-
-        if (n == -1) {
-            return std::unexpected(std::error_code(errno, std::system_category()));
-        }
-
-        std::vector<ReadyEvent> result;
-        result.reserve(n);
-
-        for (int i = 0; i < n; i++) {
-            result.push_back({
-                .source_id = event_buffer_[i].data.u64,
-                .events = event_buffer_[i].events,
-            });
-        }
-
-        return result;
+Result<std::span<const ReadyEvent>, std::error_code> EpollPoller::wait(bool nonblocking) {
+    const int timeout = nonblocking ? 0 : -1;
+    const int capacity = static_cast<int>(event_buffer_.size());
+    const int count = operations_.wait
+                          ? operations_.wait(operations_.context, epfd_.get(), event_buffer_.data(),
+                                             capacity, timeout)
+                          : epoll_wait(epfd_.get(), event_buffer_.data(), capacity, timeout);
+    if (count == -1 && errno == EINTR) {
+        return std::span<const ReadyEvent>{};
     }
+    if (count == -1) {
+        return std::unexpected(std::error_code(errno, std::system_category()));
+    }
+    for (int i = 0; i < count; ++i) {
+        ready_events_[i] = {.source_id = event_buffer_[i].data.u64,
+                            .events = event_buffer_[i].events};
+    }
+    return std::span<const ReadyEvent>(ready_events_.data(), static_cast<size_t>(count));
 }
 
 } // namespace orbit::proxy::detail

@@ -5,6 +5,7 @@ add_executable(proxy_tests
     reactor_test.cpp
     resource_recovery_test.cpp
     global_buffer_test.cpp
+    interrupted_io_test.cpp
     idle_session_test.cpp
     deadlines_test.cpp
     upstream_dialer_test.cpp

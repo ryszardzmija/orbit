@@ -57,7 +57,8 @@ UpstreamDialer::create(const net::ResolutionEndpoint& upstream_address) {
 
 std::expected<UpstreamDialResult, net::DialError>
 UpstreamDialer::dial(FileDescriptor accepted_connection, const net::SocketAddress& accepted_address,
-                     Deadline deadline, const SteadyTimeSource& time_source) {
+                     Deadline deadline, const SteadyTimeSource& time_source,
+                     size_t& attempts_left) {
     assert(resolved_upstream_.candidates().size() > 0);
 
     PendingConnection pending_connection{
@@ -68,12 +69,12 @@ UpstreamDialer::dial(FileDescriptor accepted_connection, const net::SocketAddres
         .deadline = deadline,
     };
 
-    return tryCandidatesFrom(std::move(pending_connection), 0, time_source);
+    return tryCandidatesFrom(std::move(pending_connection), 0, time_source, attempts_left);
 }
 
 std::expected<UpstreamDialResult, net::DialError>
 UpstreamDialer::advanceDialAttempt(PendingConnection pending_connection,
-                                   const SteadyTimeSource& time_source, bool allow_fallback) {
+                                   const SteadyTimeSource& time_source, size_t& attempts_left) {
     assert(pending_connection.attempted_connection_fd.has_value());
 
     if (time_source.now() >= pending_connection.deadline) {
@@ -93,8 +94,12 @@ UpstreamDialer::advanceDialAttempt(PendingConnection pending_connection,
         };
     }
 
+    if (completion_result.error().failed_op == net::DialFailedOp::CompletionQuery &&
+        completion_result.error().code.value() == EINTR) {
+        return UpstreamDialDeferred{std::move(pending_connection), true};
+    }
     size_t next_idx = pending_connection.attempted_address_idx + 1;
-    if (!allow_fallback || next_idx >= resolved_upstream_.candidates().size() ||
+    if (next_idx >= resolved_upstream_.candidates().size() ||
         net::classifyDialError(completion_result.error()) != net::DialFailureKind::Candidate) {
         return std::unexpected(completion_result.error());
     }
@@ -102,7 +107,14 @@ UpstreamDialer::advanceDialAttempt(PendingConnection pending_connection,
     // The failed asynchronous attempt must no longer remain owned by pending connection.
     pending_connection.attempted_connection_fd.reset();
 
-    return tryCandidatesFrom(std::move(pending_connection), next_idx, time_source);
+    return tryCandidatesFrom(std::move(pending_connection), next_idx, time_source, attempts_left);
+}
+
+std::expected<UpstreamDialResult, net::DialError>
+UpstreamDialer::resumeDial(PendingConnection pending_connection,
+                           const SteadyTimeSource& time_source, size_t& attempts_left) {
+    const size_t next_idx = pending_connection.attempted_address_idx;
+    return tryCandidatesFrom(std::move(pending_connection), next_idx, time_source, attempts_left);
 }
 
 const net::ResolutionEndpoint& UpstreamDialer::upstreamEndpoint() const {
@@ -112,18 +124,26 @@ const net::ResolutionEndpoint& UpstreamDialer::upstreamEndpoint() const {
 std::expected<UpstreamDialResult, net::DialError>
 UpstreamDialer::tryCandidatesFrom(PendingConnection pending_connection,
                                   std::size_t first_candidate_idx,
-                                  const SteadyTimeSource& time_source) {
+                                  const SteadyTimeSource& time_source, size_t& attempts_left) {
     for (size_t i = first_candidate_idx; i < resolved_upstream_.candidates().size();) {
         if (time_source.now() >= pending_connection.deadline) {
             return std::unexpected(timedOut());
         }
         pending_connection.attempted_address_idx = i;
+        if (attempts_left == 0) {
+            return UpstreamDialDeferred{std::move(pending_connection)};
+        }
+        --attempts_left;
 
         auto dial_result = net::dial(resolved_upstream_.candidates()[i],
                                      pending_connection.deadline, time_source, operations_);
         if (!dial_result) {
-            if (dial_result.error().failed_op == net::DialFailedOp::Connect &&
+            if ((dial_result.error().failed_op == net::DialFailedOp::Connect ||
+                 dial_result.error().failed_op == net::DialFailedOp::Socket) &&
                 dial_result.error().code.value() == EINTR) {
+                if (attempts_left == 0) {
+                    return UpstreamDialDeferred{std::move(pending_connection), true};
+                }
                 continue; // Retry the same address with a fresh socket and the remaining budget.
             }
             if (net::classifyDialError(dial_result.error()) != net::DialFailureKind::Candidate ||

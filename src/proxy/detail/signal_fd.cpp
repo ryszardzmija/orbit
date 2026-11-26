@@ -29,26 +29,20 @@ std::expected<FileDescriptor, std::error_code> createShutdownSignalFd() {
 std::expected<int, std::error_code> readShutdownRequests(int fd) {
     // Two observed requests reach hard stop. Return to the reactor after one successful read.
     std::array<signalfd_siginfo, 2> records;
-    while (true) {
-        ssize_t bytes_read = read(fd, records.data(), sizeof(records));
-        if (bytes_read > 0 && bytes_read % sizeof(signalfd_siginfo) == 0) {
-            return static_cast<int>(bytes_read / sizeof(signalfd_siginfo));
-        }
-
-        if (bytes_read == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-            return 0;
-        }
-
-        if (bytes_read == -1 && errno == EINTR) {
-            continue;
-        }
-
-        if (bytes_read == -1) {
-            return std::unexpected(std::error_code(errno, std::system_category()));
-        }
-
-        return std::unexpected(std::make_error_code(std::errc::io_error));
+    ssize_t bytes_read = read(fd, records.data(), sizeof(records));
+    if (bytes_read > 0 && bytes_read % sizeof(signalfd_siginfo) == 0) {
+        return static_cast<int>(bytes_read / sizeof(signalfd_siginfo));
     }
+
+    if (bytes_read == -1 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) {
+        return 0;
+    }
+
+    if (bytes_read == -1) {
+        return std::unexpected(std::error_code(errno, std::system_category()));
+    }
+
+    return std::unexpected(std::make_error_code(std::errc::io_error));
 }
 
 } // namespace orbit::proxy::detail

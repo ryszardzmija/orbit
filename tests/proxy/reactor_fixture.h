@@ -43,7 +43,10 @@ protected:
         return reactor->session_manager_.sourceIds(*added);
     }
 
-    auto dispatch(detail::ReadyEvent event) { return reactor->dispatch(event); }
+    auto dispatch(detail::ReadyEvent event) { return dispatchBatch({&event, 1}); }
+    Status<FatalReactorError> dispatchBatch(std::span<const detail::ReadyEvent> events) {
+        return reactor->dispatchBatch(events);
+    }
     bool registered(detail::SourceId id) const { return reactor->sources_.find(id).has_value(); }
     bool watching(detail::SourceId id) const { return reactor->poller_.isWatching(id); }
 
@@ -146,7 +149,10 @@ protected:
     auto expire(detail::Deadline now) {
         auto result = reactor->expireDeadlines(now);
         if (result) {
-            return reactor->synchronizeListener();
+            if (auto synced = reactor->synchronizeListener(); !synced) {
+                return Status<FatalReactorError>(
+                    std::unexpected(FatalReactorError{synced.error().message()}));
+            }
         }
         return result;
     }
@@ -157,6 +163,10 @@ protected:
     auto arm() { return reactor->synchronizeTimer(); }
     auto waitForEvents() { return reactor->poller_.wait(); }
     auto resumeReadyRead() { return reactor->resumeReadyRead(); }
+    auto resumeDeferredDials() { return reactor->resumeDeferredDials(); }
+    auto deferredDialCount() const { return reactor->deferred_dials_.size(); }
+    bool hasRunnableDials() const { return reactor->hasRunnableDials(); }
+    auto runTurn() { return reactor->runTurn(); }
     bool hasReadyRead() const { return reactor->session_manager_.hasReadyRead(); }
     auto waitingReads() const { return reactor->session_manager_.waitingReadCount(); }
     const detail::BufferBudget& bufferBudget() const {

@@ -12,6 +12,7 @@ struct PendingConnection {
     FileDescriptor accepted_connection_fd;
     net::SocketAddress accepted_address;
     std::optional<FileDescriptor> attempted_connection_fd;
+    // When deferred, the index is the next candidate to try instead of a watched socket.
     size_t attempted_address_idx;
     Deadline deadline;
 };

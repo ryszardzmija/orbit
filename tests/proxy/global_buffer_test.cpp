@@ -22,8 +22,8 @@ protected:
 
     void SetUp() override { setupBudget(); }
 
-    void setupBudget(size_t high = block * 2) {
-        createReactor({.idle = 10s}, clock.source(),
+    void setupBudget(size_t high = block * 2, bool system_clock = false) {
+        createReactor({.idle = 10s}, system_clock ? SteadyTimeSource{} : clock.source(),
                       {
                           .context = this,
                           .receive =
@@ -52,6 +52,12 @@ protected:
                        .buffer_low_watermark = block / 2,
                        .buffer_budget = block},
                       {
+                          .epoll = {this, nullptr,
+                                    [](void* context, int, epoll_event*, int, int timeout) {
+                                        static_cast<GlobalBufferTest*>(context)
+                                            ->poll_timeouts.push_back(timeout);
+                                        return 0;
+                                    }},
                           .allocation = {this,
                                          [](void* context, detail::AllocationPoint point) noexcept {
                                              return point == static_cast<GlobalBufferTest*>(context)
@@ -87,6 +93,7 @@ protected:
     std::optional<size_t> send_limit;
     std::vector<int> blocked;
     std::vector<Read> reads;
+    std::vector<int> poll_timeouts;
 };
 
 TEST_F(GlobalBufferTest, DirectSendCancelsReservationAndPartialSendReusesItsTail) {
@@ -292,6 +299,40 @@ TEST_F(GlobalBufferTest, HardShutdownClearsWaitingDirectionsAndCharges) {
     EXPECT_TRUE(stopped());
     EXPECT_EQ(0u, sessionCount());
     EXPECT_EQ(0u, waitingReads());
+    expectUsage(0);
+}
+
+TEST_F(GlobalBufferTest, CapacityReleaseBurstRunsOneWaiterPerPollAndThenStopsPolling) {
+    setupBudget(block * 2, true);
+    auto holder = test::socketPair();
+    auto holder_dest = test::socketPair();
+    blocked = {holder_dest.local.get()};
+    const auto first = install(holder, holder_dest);
+    put(holder, "holds-capacity");
+    ASSERT_TRUE(dispatch({first.downstream, EPOLLIN}));
+    std::vector<test::SocketPair> clients, destinations;
+    constexpr size_t waiter_count = 12;
+    for (size_t i = 0; i < waiter_count; ++i) {
+        clients.push_back(test::socketPair());
+        destinations.push_back(test::socketPair());
+        const auto ids = install(clients.back(), destinations.back());
+        put(clients.back(), "waiting");
+        ASSERT_TRUE(dispatch({ids.downstream, EPOLLIN}));
+    }
+    ASSERT_EQ(waiter_count, waitingReads());
+    ASSERT_TRUE(runTurn());
+    EXPECT_EQ(-1, poll_timeouts.back()); // All waiters need a block.
+    EXPECT_EQ(1u, reads.size());
+    ASSERT_TRUE(dispatch({first.upstream, EPOLLERR}));
+    for (size_t i = 0; i < waiter_count; ++i) {
+        ASSERT_TRUE(runTurn());
+        EXPECT_EQ(0, poll_timeouts.back());
+        EXPECT_EQ(i + 2, reads.size());
+        EXPECT_EQ(waiter_count - i - 1, waitingReads());
+        expectData(destinations[i], "waiting");
+    }
+    ASSERT_TRUE(runTurn());
+    EXPECT_EQ(-1, poll_timeouts.back());
     expectUsage(0);
 }
 

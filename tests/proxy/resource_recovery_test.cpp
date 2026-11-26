@@ -306,5 +306,38 @@ TEST_F(ResourceRecoveryTest, RecoverableModFailureClosesAffectedPairAndOtherFail
     }
 }
 
+TEST_F(ResourceRecoveryTest, InterruptedAcceptYieldsToEstablishedTrafficInTheSameBatch) {
+    auto client = test::socketPair();
+    auto upstream = test::socketPair();
+    const auto live = install(client, upstream);
+    const std::array batch{detail::ReadyEvent{listenerId(), EPOLLIN},
+                           detail::ReadyEvent{live.downstream, EPOLLIN}};
+    accept_error = EINTR;
+    for (int i = 1; i <= 4; ++i) {
+        ASSERT_EQ(1, send(client.peer.get(), "a", 1, 0));
+        ASSERT_TRUE(dispatchBatch(batch));
+        EXPECT_EQ(i, accept_calls);
+        EXPECT_TRUE(listenerAccepting());
+        EXPECT_FALSE(retryAt());
+        char byte;
+        ASSERT_EQ(1, recv(upstream.peer.get(), &byte, 1, 0));
+        EXPECT_EQ('a', byte);
+    }
+}
+
+TEST_F(ResourceRecoveryTest, DeferredQueueAllocationFailureRollsBackItsDeadlineAndClient) {
+    const auto at = clock.now() + 5s;
+    auto client = test::socketPair();
+    failed_allocation = AllocationPoint::DeferredDial;
+    ASSERT_TRUE(dialResult(
+        detail::UpstreamDialDeferred{{std::move(client.local), {}, std::nullopt, 0, at}}));
+    EXPECT_EQ(0u, deferredDialCount());
+    EXPECT_EQ(0u, pendingCount());
+    EXPECT_FALSE(nextDeadline());
+    EXPECT_TRUE(retryAt());
+    EXPECT_FALSE(listenerAccepting());
+    expectClosed(client);
+}
+
 } // namespace
 } // namespace orbit::proxy

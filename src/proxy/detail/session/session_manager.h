@@ -52,9 +52,17 @@ enum class SessionEventAction {
     Close,
 };
 
+enum class SessionRetryKind { ResidualRead, FinishWrite };
+
+struct SessionRetry {
+    EndpointRole role;
+    SessionRetryKind kind;
+};
+
 struct SessionEventResult {
     SessionEventAction action;
     std::optional<std::string> error;
+    std::optional<SessionRetry> retry = std::nullopt;
 };
 
 // Owns active sessions and performs session-local I/O and state transitions.
@@ -93,6 +101,7 @@ public:
                                             IdleDeadline* idle = nullptr);
     SessionEventResult handleHangup(SessionId id, EndpointRole role, IdleDeadline* idle = nullptr);
     SessionEventResult handleError(SessionId id, EndpointRole role);
+    SessionEventResult retryInterrupted(SessionId id, SessionRetry retry, IdleDeadline* idle);
 
 private:
     struct ManagedSession {
@@ -111,6 +120,8 @@ private:
     static const SessionEndpoint& getOtherEndpoint(const Session& session, EndpointRole role);
     static EndpointInterests getInterests(const SessionEndpoint& endpoint,
                                           const SessionEndpoint& other);
+    SessionEventResult finishWrite(Session& session, EndpointRole destination_role,
+                                   IdleDeadline* idle);
     void cancelReadWait(SessionEndpoint& endpoint);
 
     // The budget stays at a stable address and outlives its borrowers.

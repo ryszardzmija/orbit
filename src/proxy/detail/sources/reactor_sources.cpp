@@ -10,7 +10,7 @@
 namespace orbit::proxy::detail {
 
 SourceId ReactorSources::add(ReactorRegistration registration) {
-    SourceId id = id_generator_.getNextId();
+    SourceId id = allocateId();
 
     auto [it, inserted] = registrations_.emplace(id, std::move(registration));
     assert(inserted && "generated ID is duplicate");

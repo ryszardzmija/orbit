@@ -50,6 +50,9 @@ Forwarder::forward(SessionEndpoint& source, SessionEndpoint& destination, IdleDe
     if (recv_result.value().status == net::RecvStatus::WouldBlock) {
         return ForwardOutcome::KeepOpen;
     }
+    if (recv_result->status == net::RecvStatus::Interrupted) {
+        return ForwardOutcome::Interrupted;
+    }
 
     std::span<const uint8_t> unsent(buf_.get(), recv_result->bytes_received);
     if (idle && !idle->recordTransfer(unsent.size())) {

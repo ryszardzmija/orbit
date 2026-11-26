@@ -15,7 +15,7 @@ namespace orbit::proxy::detail {
 using DeadlineClock = std::chrono::steady_clock;
 using Deadline = DeadlineClock::time_point;
 
-enum class DeadlineKind { Shutdown, Connect, Idle };
+enum class DeadlineKind { Shutdown, Connect, Idle, DialRetry, ResidualRead, FinishWrite };
 
 struct DeadlineKey {
     DeadlineKind kind;

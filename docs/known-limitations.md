@@ -50,11 +50,8 @@ Source baseline is `e3aec7b`. A source-confirmed finding follows from the implem
 
 ## LIM-009 — Reactor work budgets are incomplete
 
-- **Classification and priority** — Architectural risk, medium.
-- **Source and evidence** — [`ProxyReactor::handleListener`](../src/proxy/proxy.cpp) caps accept iterations at 16, and [`EpollPoller::wait`](../src/proxy/detail/epoll/epoll_poller.h) takes up to 1,024 events. A normal [`Forwarder::forward`](../src/proxy/detail/forwarding.cpp) and [`PendingDataSender::sendPending`](../src/proxy/detail/pending_data_sender.cpp) process one 4 KiB chunk each, apart from interrupted syscall retries. M1.1 bounds residual reads to one chunk per handler. [`UpstreamDialer::tryCandidatesFrom`](../src/proxy/detail/upstream_dialer.cpp) can scan remaining candidates inside a handler until the overall connect deadline. Deadline expiration processes up to 64 keys per dispatch, with a due graceful shutdown taking priority.
-- **Conditions and impact** — Repeated accepts with many failing addresses, or a large ready batch can delay other ready sessions and shutdown handling. Accept iteration count does not bound the duration of the dial work done inside each iteration. The code has no handler time budget or service-latency guarantee.
-- **Verification** — Source-confirmed work bounds and unbudgeted paths. Starvation duration and throughput impact remain unmeasured.
-- **Follow-up** — M0.3 measures single-connection echo latency. Measure mixed-workload latency and drain, dial and accept costs before selecting fairness budgets.
+- **M2.5 disposition** — Readiness dispatch, interrupted I/O, candidate attempts and continuation processing have [work-count budgets](architecture.md#work-per-reactor-turn). Controlled tests cover sustained candidate failure, continued traffic, timer cancellation, interrupted operations and transitions to and from a runnable queue.
+- **Remaining scope** — Work counts provide service opportunities. Wall-clock latency still depends on readiness volume, scheduling, syscall cost, hash table maintenance, allocation and teardown. Startup name resolution can block. Mixed-workload latency and the costs of dial and shutdown bursts remain unmeasured.
 
 ## LIM-010 — Logging is the runtime observability surface
 
@@ -68,7 +65,7 @@ Source baseline is `e3aec7b`. A source-confirmed finding follows from the implem
 ## LIM-011 — Fault and readiness tests leave gaps
 
 - **Classification and priority** — Testing gap, high.
-- **Source and evidence** — [GoogleTest units](../tests/CMakeLists.txt) cover syntax, address formatting and queue logic. [Loopback integration](../tests/integration/proxy_sessions_test.py) covers established traffic, one upstream reset, churn, half-close, ordinary full hangup, idle CPU and signal escalation. The large-transfer test does not observe exact buffer occupancy or control partial syscall results. M1.1 adds controlled saturated hangups in both directions. M1.2 adds controlled stale batches and fd reuse. M1.3 covers pending cancellation, timer escalation and terminal write-shutdown failure. M1.4 covers address fallback, registration failure, timer cleanup and deadline races. M1.5 covers idle expiry, positive socket activity, stalled queued output and shutdown interaction. Remaining gaps include fd exhaustion, kernel DEL failure and live IPv6 forwarding.
+- **Source and evidence** — [GoogleTest units](../tests/CMakeLists.txt) and [loopback integration](../tests/integration/proxy_sessions_test.py) cover M1 forwarding, deadlines, hangup and shutdown. M2 adds controlled partial sends and exact occupancy checks, admission and fault tests, global allocation and resumption tests, mixed readiness batches and a Linux descriptor-limit regression. Direct system-wide pressure, kernel DEL failure and live IPv6 forwarding remain coverage gaps.
 - **M1-A01 disposition** — Resolved. The audit reproduced an expired idle session surviving when a later operation in the same notification refreshed its deadline. Controlled-clock tests verify separate I/O checks for combined readiness and deferred hangup reads, and test activity at the expiry boundary.
 - **Conditions and impact** — Regressions in rare event combinations and failures can pass the existing suite. The harness still uses deliberate delays for reset, slow-reader and idle-CPU scenarios. Orbit's CLI rejects port zero, so the bind-after-release window for its listener still exists. It can cause a startup failure if another process takes the port.
 - **Verification** — Confirmed by test inventory. Churn and transfer cases are useful indirect coverage with limited control over the targeted state.
@@ -89,7 +86,7 @@ Source baseline is `e3aec7b`. A source-confirmed finding follows from the implem
 
 ## LIM-014 — Failed write shutdown may leave a session waiting
 
-- **Disposition** — Resolved in M1.3. Actual input EOF and an empty destination queue suffice to propagate FIN. EINTR retries the syscall and a terminal failure closes the pair locally. Tests drive EOF without RDHUP and force ENOTCONN using an unconnected socket.
+- **Disposition** — Resolved in M1.3. Actual input EOF and an empty destination queue suffice to propagate FIN. M2.5 schedules interrupted FIN attempts on the shared timer. Terminal failures close the pair locally. Tests drive EOF without RDHUP, repeated interruption and ENOTCONN.
 
 ## LIM-015 — Invalid environment settings can revert to defaults
 

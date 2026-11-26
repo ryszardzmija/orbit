@@ -1,6 +1,8 @@
 #pragma once
 
+#include <list>
 #include <optional>
+#include <span>
 #include <string>
 #include <system_error>
 
@@ -38,6 +40,7 @@ struct FatalReactorError {
 enum class ConnectionOperation {
     AllocateBuffers,
     AllocateDeadline,
+    AllocateDeferredDial,
     AddWatch,
     ChangeWatch,
     RemoveWatch,
@@ -76,7 +79,10 @@ private:
     constexpr static int max_expirations_per_dispatch = 64;
     constexpr static int max_backlog_size = 64;
     constexpr static int max_accept_batch_size = 16;
+    constexpr static size_t max_dial_attempts_per_batch = 8;
+    constexpr static size_t max_resumed_dials_per_turn = 8;
     constexpr static std::chrono::milliseconds admission_retry_interval{100};
+    constexpr static std::chrono::milliseconds interrupted_io_retry_interval{1};
 
     enum class ShutdownState {
         Running,
@@ -87,6 +93,14 @@ private:
     enum class EndpointEventOutcome {
         KeepSession,
         SessionClosed,
+    };
+
+    using DeferredDials = std::list<detail::SourceId>;
+
+    struct PendingEntry {
+        detail::PendingConnection connection;
+        std::optional<DeferredDials::iterator> deferred;
+        bool watched;
     };
 
     ProxyReactor(detail::EpollPoller poller, FileDescriptor shutdown_signal_fd,
@@ -108,7 +122,8 @@ private:
     Result<detail::SourceId, std::error_code> registerShutdownSignalEvent();
     Result<detail::SourceId, std::error_code> registerTimerEvent();
     Result<detail::SourceId, ConnectionFailure>
-    registerPendingConnection(detail::PendingConnection pending_connection);
+    registerPendingConnection(detail::PendingConnection pending_connection,
+                              bool interrupted = false);
 
     Result<detail::SourceId, std::error_code>
     registerReactorSource(int fd, uint32_t initial_events,
@@ -124,23 +139,29 @@ private:
     Status<std::error_code> cancelPendingConnections();
 
     // Event handlers
-    Status<FatalReactorError> dispatch(detail::ReadyEvent event, bool from_wait_queue = false);
+    Status<FatalReactorError> runTurn();
+    Status<FatalReactorError> dispatchBatch(std::span<const detail::ReadyEvent> events);
+    Status<FatalReactorError> dispatch(detail::ReadyEvent event, size_t& dial_attempts_left,
+                                       bool from_wait_queue = false);
     Status<FatalReactorError> handleEndpoint(detail::EndpointRegistration registration,
-                                             uint32_t event_mask, bool from_wait_queue);
+                                             uint32_t event_mask, bool from_wait_queue,
+                                             std::optional<detail::SessionRetryKind> retry = {});
     Status<FatalReactorError> resumeReadyRead();
     Status<FatalReactorError> handleShutdownSignal(detail::ShutdownSignalRegistration);
     Status<FatalReactorError> handleTimer(detail::TimerRegistration);
-    Status<FatalReactorError> handleListener(detail::ListenerRegistration);
-    Status<FatalReactorError> handlePendingConnection(detail::SourceId id);
+    Status<FatalReactorError> handleListener(detail::ListenerRegistration, size_t& attempts_left);
+    Status<FatalReactorError> handlePendingConnection(detail::SourceId id, size_t& attempts_left);
 
     // Handlers for handlePendingConnection()
     Status<FatalReactorError> handleDialResult(detail::UpstreamDialResult dial_result);
     Status<FatalReactorError> handleDialError(net::DialError dial_error);
     Status<FatalReactorError> handleConnectionFailure(ConnectionFailure failure);
+    Status<FatalReactorError> resumeDeferredDials();
+    bool hasRunnableDials() const;
 
     Status<std::error_code> handleShutdownRequest();
     Status<std::error_code> synchronizeTimer();
-    Status<std::error_code> expireDeadlines(detail::Deadline now);
+    Status<FatalReactorError> expireDeadlines(detail::Deadline now);
     Status<std::error_code> synchronizeListener();
     std::optional<detail::Deadline> nextWakeup() const;
     void suspendAdmission(const char* operation, std::error_code code, bool log_pressure = true);
@@ -181,7 +202,9 @@ private:
     bool transient_admission_ = false;
     SteadyTimeSource time_source_;
     net::AcceptOperations accept_operations_;
-    absl::flat_hash_map<detail::SourceId, detail::PendingConnection> pending_connections_;
+    detail::AllocationChecks allocation_;
+    DeferredDials deferred_dials_;
+    absl::flat_hash_map<detail::SourceId, PendingEntry> pending_connections_;
     std::optional<detail::ActiveListener> active_listener_;
     detail::UpstreamDialer upstream_dialer_;
     ShutdownState shutdown_state_ = ShutdownState::Running;

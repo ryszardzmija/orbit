@@ -146,37 +146,31 @@ std::expected<Listener, ListenError> Listener::create(const ListenSocketAddress&
 
 std::expected<AcceptResult, std::error_code>
 Listener::acceptClientConnection(const AcceptOperations& operations) {
-    while (true) {
-        sockaddr_storage client_addr = {};
-        socklen_t client_addr_len = sizeof(client_addr);
+    sockaddr_storage client_addr = {};
+    socklen_t client_addr_len = sizeof(client_addr);
 
-        auto* address = reinterpret_cast<sockaddr*>(&client_addr);
-        constexpr int flags = SOCK_CLOEXEC | SOCK_NONBLOCK;
-        int fd = operations.accept ? operations.accept(operations.context, listen_fd_.get(),
-                                                       address, &client_addr_len, flags)
-                                   : accept4(listen_fd_.get(), address, &client_addr_len, flags);
+    auto* address = reinterpret_cast<sockaddr*>(&client_addr);
+    constexpr int flags = SOCK_CLOEXEC | SOCK_NONBLOCK;
+    int fd = operations.accept ? operations.accept(operations.context, listen_fd_.get(), address,
+                                                   &client_addr_len, flags)
+                               : accept4(listen_fd_.get(), address, &client_addr_len, flags);
 
-        if (fd == -1 && errno == EINTR) {
-            continue;
-        }
-
-        if (fd == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-            return AcceptWouldBlock{};
-        }
-
-        if (fd == -1) {
-            return std::unexpected(std::error_code(errno, std::system_category()));
-        }
-
-        return AcceptSuccess{
-            .fd = FileDescriptor(fd),
-            .remote =
-                {
-                    .addrlen = client_addr_len,
-                    .addr = client_addr,
-                },
-        };
+    if (fd == -1 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) {
+        return AcceptWouldBlock{};
     }
+
+    if (fd == -1) {
+        return std::unexpected(std::error_code(errno, std::system_category()));
+    }
+
+    return AcceptSuccess{
+        .fd = FileDescriptor(fd),
+        .remote =
+            {
+                .addrlen = client_addr_len,
+                .addr = client_addr,
+            },
+    };
 }
 
 } // namespace orbit::net
