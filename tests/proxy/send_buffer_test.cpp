@@ -8,6 +8,8 @@
 
 #include <gtest/gtest.h>
 
+using orbit::proxy::detail::AllocationPoint;
+using orbit::proxy::detail::BufferBudget;
 using orbit::proxy::detail::SendBuffer;
 
 class SendBufferTest : public testing::Test {
@@ -238,4 +240,60 @@ TEST_F(SendBufferTest, BufferConstructionFailsForLowWatermarkGreaterThanHighWate
 TEST_F(SendBufferTest, RejectsAnUnrepresentableBlockCapacity) {
     EXPECT_THROW(SendBuffer(block_size, std::numeric_limits<size_t>::max(), 0),
                  std::invalid_argument);
+}
+
+TEST(BufferBudgetTest, CommittedBlocksAndActiveReservationsShareTheSameLimit) {
+    BufferBudget budget(8);
+    SendBuffer first(4, 8, 4, {}, &budget);
+    SendBuffer second(4, 8, 4, {}, &budget);
+    const std::string bytes = "12345678";
+    {
+        auto reservation = first.reserveAppend(bytes.size());
+        EXPECT_EQ(8u, reservation.capacity());
+        EXPECT_EQ(8u, budget.reserved());
+        EXPECT_EQ(0u, budget.available());
+        EXPECT_FALSE(second.write(asBytes(bytes).first(1)));
+        ASSERT_TRUE(first.write(asBytes(bytes).first(3), reservation));
+        EXPECT_EQ(first.allocatedCapacity(), budget.allocated());
+        EXPECT_EQ(4u, budget.reserved());
+        auto tail = first.reserveAppend(4, false);
+        EXPECT_EQ(1u, tail.capacity());
+        ASSERT_TRUE(first.write(asBytes(bytes).subspan(3, 1), tail));
+        EXPECT_FALSE(first.write(asBytes(bytes).first(1), tail));
+    }
+    EXPECT_EQ(0u, budget.reserved());
+    EXPECT_EQ(4u, budget.available());
+    ASSERT_TRUE(second.write(asBytes(bytes).first(1)));
+    EXPECT_EQ(first.allocatedCapacity() + second.allocatedCapacity(), budget.allocated());
+    EXPECT_EQ(0u, budget.available());
+    first.consume(first.size());
+    second.consume(second.size());
+    EXPECT_EQ(0u, budget.allocated());
+    EXPECT_EQ(8u, budget.available());
+}
+
+TEST(BufferBudgetTest, AllocationFailureCancelsOnlyTheUncommittedReservation) {
+    BufferBudget budget(8);
+    int calls = 0;
+    {
+        SendBuffer buffer(
+            4, 8, 4,
+            {&calls, [](void* context,
+                        AllocationPoint) noexcept { return ++*static_cast<int*>(context) == 2; }},
+            &budget);
+        const std::string bytes = "abcdefgh";
+        {
+            auto reservation = buffer.reserveAppend(bytes.size());
+            EXPECT_THROW(buffer.write(asBytes(bytes), reservation), std::bad_alloc);
+            EXPECT_EQ(4u, budget.reserved());
+            EXPECT_EQ(4u, buffer.size());
+            EXPECT_EQ(buffer.allocatedCapacity(), budget.allocated());
+        }
+        EXPECT_EQ(0u, budget.reserved());
+        EXPECT_EQ(4u, budget.available());
+        std::string retained(4, '\0');
+        EXPECT_EQ(4u, buffer.copy(asBytes(retained)));
+        EXPECT_EQ("abcd", retained);
+    }
+    EXPECT_EQ(8u, budget.available());
 }

@@ -156,6 +156,12 @@ protected:
     }
     auto arm() { return reactor->synchronizeTimer(); }
     auto waitForEvents() { return reactor->poller_.wait(); }
+    auto resumeReadyRead() { return reactor->resumeReadyRead(); }
+    bool hasReadyRead() const { return reactor->session_manager_.hasReadyRead(); }
+    auto waitingReads() const { return reactor->session_manager_.waitingReadCount(); }
+    const detail::BufferBudget& bufferBudget() const {
+        return reactor->session_manager_.bufferBudget();
+    }
 
     std::optional<ProxyReactor> reactor;
 

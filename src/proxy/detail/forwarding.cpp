@@ -19,18 +19,22 @@ Forwarder Forwarder::create(size_t capacity) {
     return Forwarder(capacity);
 }
 
-Status<ForwardError> Forwarder::forward(SessionEndpoint& source, SessionEndpoint& destination,
-                                        IdleDeadline* idle,
-                                        const net::StreamOperations& operations) {
+Result<ForwardOutcome, ForwardError>
+Forwarder::forward(SessionEndpoint& source, SessionEndpoint& destination, IdleDeadline* idle,
+                   const net::StreamOperations& operations, bool allow_new_blocks) {
     assert(destination.state.send_buffer != nullptr);
     auto& queue = *destination.state.send_buffer;
     size_t receive_capacity = std::min(capacity_, queue.remainingCapacity());
     if (receive_capacity == 0) {
-        return {};
+        return ForwardOutcome::KeepOpen;
+    }
+    auto reservation = queue.reserveAppend(receive_capacity, allow_new_blocks);
+    if (reservation.capacity() == 0) {
+        return ForwardOutcome::WaitForCapacity;
     }
 
-    auto recv_result =
-        net::tryRecv(source.fd.get(), std::span<uint8_t>(buf_.get(), receive_capacity), operations);
+    auto recv_result = net::tryRecv(
+        source.fd.get(), std::span<uint8_t>(buf_.get(), reservation.capacity()), operations);
     if (!recv_result) {
         return std::unexpected(ForwardError{
             .code = recv_result.error(),
@@ -40,16 +44,16 @@ Status<ForwardError> Forwarder::forward(SessionEndpoint& source, SessionEndpoint
 
     if (recv_result.value().status == net::RecvStatus::Eof) {
         source.state.done_reading = true;
-        return {};
+        return ForwardOutcome::KeepOpen;
     }
 
     if (recv_result.value().status == net::RecvStatus::WouldBlock) {
-        return {};
+        return ForwardOutcome::KeepOpen;
     }
 
     std::span<const uint8_t> unsent(buf_.get(), recv_result->bytes_received);
     if (idle && !idle->recordTransfer(unsent.size())) {
-        return {};
+        return ForwardOutcome::KeepOpen;
     }
 
     // We can try to send the data directly only if the send buffer is empty since otherwise
@@ -58,7 +62,7 @@ Status<ForwardError> Forwarder::forward(SessionEndpoint& source, SessionEndpoint
     // event continues the drain after this single receive.
     if (!source.state.hungUp() && queue.empty()) {
         if (idle && !idle->canStartIo()) {
-            return {};
+            return ForwardOutcome::KeepOpen;
         }
         auto send_result = net::trySend(destination.fd.get(), unsent, operations);
         if (!send_result) {
@@ -70,14 +74,14 @@ Status<ForwardError> Forwarder::forward(SessionEndpoint& source, SessionEndpoint
 
         size_t bytes_written = send_result.value().bytes_sent;
         if (idle && !idle->recordTransfer(bytes_written)) {
-            return {};
+            return ForwardOutcome::KeepOpen;
         }
         unsent = unsent.subspan(bytes_written);
     }
 
     try {
-        if (queue.write(unsent)) {
-            return {};
+        if (queue.write(unsent, reservation)) {
+            return ForwardOutcome::KeepOpen;
         }
     } catch (const std::bad_alloc&) {
         // The owner must close because it cannot retain all bytes already read.

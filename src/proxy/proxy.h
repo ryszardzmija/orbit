@@ -124,9 +124,10 @@ private:
     Status<std::error_code> cancelPendingConnections();
 
     // Event handlers
-    Status<FatalReactorError> dispatch(detail::ReadyEvent event);
+    Status<FatalReactorError> dispatch(detail::ReadyEvent event, bool from_wait_queue = false);
     Status<FatalReactorError> handleEndpoint(detail::EndpointRegistration registration,
-                                             uint32_t event_mask);
+                                             uint32_t event_mask, bool from_wait_queue);
+    Status<FatalReactorError> resumeReadyRead();
     Status<FatalReactorError> handleShutdownSignal(detail::ShutdownSignalRegistration);
     Status<FatalReactorError> handleTimer(detail::TimerRegistration);
     Status<FatalReactorError> handleListener(detail::ListenerRegistration);

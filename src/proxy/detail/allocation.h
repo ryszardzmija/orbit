@@ -4,7 +4,7 @@
 
 namespace orbit::proxy::detail {
 
-enum class AllocationPoint { SendBuffer, PayloadBlock, DeadlineIndex };
+enum class AllocationPoint { SendBuffer, PayloadBlock, DeadlineIndex, WaitingRead };
 
 struct AllocationChecks {
     void* context = nullptr;

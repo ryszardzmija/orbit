@@ -5,6 +5,7 @@
 #include <span>
 
 #include "proxy/detail/allocation.h"
+#include "proxy/detail/buffer/buffer_budget.h"
 
 namespace orbit::proxy::detail {
 
@@ -15,8 +16,28 @@ public:
         Paused,
     };
 
+    class AppendReservation {
+    public:
+        AppendReservation(const AppendReservation&) = delete;
+        AppendReservation& operator=(const AppendReservation&) = delete;
+
+        size_t capacity() const { return capacity_; }
+
+    private:
+        friend class SendBuffer;
+
+        AppendReservation(SendBuffer& buffer, size_t capacity, BufferBudget::Reservation blocks)
+            : buffer_(&buffer),
+              capacity_(capacity),
+              blocks_(std::move(blocks)) {}
+
+        SendBuffer* buffer_;
+        size_t capacity_;
+        BufferBudget::Reservation blocks_;
+    };
+
     SendBuffer(size_t block_size, size_t high_watermark, size_t low_watermark,
-               AllocationChecks allocation = {});
+               AllocationChecks allocation = {}, BufferBudget* budget = nullptr);
 
     SendBuffer(const SendBuffer&) = delete;
     SendBuffer& operator=(const SendBuffer&) = delete;
@@ -27,6 +48,9 @@ public:
 
     // Rejects inadmissible writes without changing the queue.
     bool write(std::span<const uint8_t> data);
+    // Reserves only the blocks needed beyond reusable capacity in the current tail.
+    AppendReservation reserveAppend(size_t requested, bool allow_new_blocks = true);
+    bool write(std::span<const uint8_t> data, AppendReservation& reservation);
     size_t copy(std::span<uint8_t> dest);
     void consume(size_t num_bytes);
     BufferStatus status() const;
@@ -53,8 +77,10 @@ private:
         std::unique_ptr<ListNode> next_ = nullptr;
     };
 
-    void writeData(std::span<const uint8_t> data);
-    void addBlock();
+    size_t blocksNeeded(size_t bytes) const;
+    size_t tailCapacity() const;
+    void writeData(std::span<const uint8_t> data, BufferBudget::Reservation& blocks);
+    void addBlock(BufferBudget::Reservation& blocks);
     uint8_t* getDestPtr();
 
     void consumeData(size_t num_bytes);
@@ -66,6 +92,7 @@ private:
     size_t high_watermark_;
     size_t low_watermark_;
     AllocationChecks allocation_;
+    BufferBudget* budget_;
 
     std::unique_ptr<ListNode> head_ = nullptr;
     ListNode* tail_ = nullptr;

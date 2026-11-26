@@ -43,6 +43,7 @@ protected:
             "ORBIT_BUFFER_LOW_WATERMARK_BYTES",
             "ORBIT_MAX_CONNECTIONS",
             "ORBIT_MAX_PENDING_CONNECTIONS",
+            "ORBIT_BUFFER_BUDGET_BYTES",
         };
 
         for (const char* variable : environment_variables) {
@@ -259,4 +260,24 @@ TEST_F(ConfigTest, ValidatesTotalAndPendingAdmissionLimits) {
     ASSERT_TRUE(validated);
     EXPECT_EQ(2u, validated->resources.max_connections);
     EXPECT_EQ(1u, validated->resources.max_pending_connections);
+}
+
+TEST_F(ConfigTest, ValidatesGlobalBufferBudgetAndAllocationGranularity) {
+    const auto defaults = parseArguments({"--upstream", "backend:1"});
+    ASSERT_TRUE(defaults);
+    EXPECT_EQ(67108864u, defaults->resources.buffer_budget);
+    for (auto invalid : {"", "0", "4095", "4097", "1073745920", "9999999999999999999999"}) {
+        SCOPED_TRACE(invalid);
+        ASSERT_EQ(0, setenv("ORBIT_BUFFER_BUDGET_BYTES", invalid, 1));
+        EXPECT_FALSE(parseArguments({"--upstream", "backend:1"}));
+        EXPECT_FALSE(parseArguments({"--upstream", "backend:1", "--buffer-budget-bytes", invalid}));
+    }
+    const auto minimum =
+        parseArguments({"--upstream", "backend:1", "--buffer-budget-bytes", "4096"});
+    ASSERT_TRUE(minimum);
+    EXPECT_EQ(4096u, minimum->resources.buffer_budget);
+    ASSERT_EQ(0, setenv("ORBIT_BUFFER_BUDGET_BYTES", "1073741824", 1));
+    const auto maximum = parseArguments({"--upstream", "backend:1"});
+    ASSERT_TRUE(maximum);
+    EXPECT_EQ(1073741824u, maximum->resources.buffer_budget);
 }

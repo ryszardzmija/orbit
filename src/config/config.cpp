@@ -139,6 +139,7 @@ std::expected<Config, ConfigError> parseConfig(int argc, char** argv) {
     auto buffer_low = std::to_string(config.resources.buffer_low_watermark);
     auto connection_limit = std::to_string(config.resources.max_connections);
     auto pending_limit = std::to_string(config.resources.max_pending_connections);
+    auto buffer_budget = std::to_string(config.resources.buffer_budget);
 
     CLI::App app("orbit - a TCP reverse proxy");
     app.set_version_flag("--version", "orbit 0.1.0");
@@ -196,6 +197,11 @@ std::expected<Config, ConfigError> parseConfig(int argc, char** argv) {
                        "Maximum admitted clients establishing upstream connections")
             ->envname("ORBIT_MAX_PENDING_CONNECTIONS")
             ->capture_default_str();
+    const auto* budget_option =
+        app.add_option("--buffer-budget-bytes", buffer_budget,
+                       "Total allocation limit for forwarding payload blocks")
+            ->envname("ORBIT_BUFFER_BUDGET_BYTES")
+            ->capture_default_str();
 
     try {
         app.parse(argc, argv);
@@ -211,6 +217,13 @@ std::expected<Config, ConfigError> parseConfig(int argc, char** argv) {
                                                          ResourceConfig::connection_limit_ceiling);
         config.resources.max_pending_connections =
             parseResource(*pending_option, pending_limit, 1, config.resources.max_connections);
+        config.resources.buffer_budget =
+            parseResource(*budget_option, buffer_budget, ResourceConfig::payload_block_size,
+                          ResourceConfig::max_buffer_budget);
+        if (!config.resources.validBufferBudget()) {
+            throw CLI::ValidationError("--buffer-budget-bytes",
+                                       "expected a multiple of 4096 bytes");
+        }
 
         config.upstreams.reserve(upstream_values.size());
         for (const std::string& upstream_value : upstream_values) {

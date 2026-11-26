@@ -6,7 +6,7 @@ This document describes the current reactor. See [configuration](config.md) for 
 
 Orbit is a Linux Layer 4 TCP reverse proxy. Each accepted client gets a separate upstream TCP connection. Orbit transfers ordered byte streams in both directions without parsing application messages or relying on their boundaries. The implementation supports concurrent sessions, nonblocking upstream connection establishment, forwarding with directional buffering and backpressure, TCP half-close propagation, and signal-driven shutdown.
 
-The configuration accepts multiple upstream endpoints. The runtime resolves only the first endpoint and can try its resolved addresses in order. Orbit limits total and pending admission, and bounds each forwarding direction. Health-aware routing and an independent aggregate payload budget remain future work.
+The configuration accepts multiple upstream endpoints. The runtime resolves only the first endpoint and can try its resolved addresses in order. Orbit limits total and pending admission, bounds each forwarding direction, and enforces a shared forwarding payload budget. Health-aware routing remains future work.
 
 ## Startup and runtime
 
@@ -135,7 +135,17 @@ The same path handles both directions. For client-to-upstream traffic the upstre
 
 `SendBuffer` uses a singly linked chain of lazily allocated blocks, with a read offset, a write offset and a logical byte count. The block size is 4 KiB. The configurable high and low watermarks default to 256 KiB and 192 KiB. The high watermark is the hard logical limit. The queue rejects writes that exceed admissible space before changing its contents. Reaching the high watermark pauses reads until the queue reaches or falls below the low watermark. Ordinary reads and residual hangup reads use the same admission rule and FIFO. After each kept event action the reactor synchronizes both endpoints' interests. Level-triggered reads can report remaining data or EOF when they resume.
 
-Logical occupancy counts unsent bytes. Allocated payload capacity counts all live blocks at full size. For block size `B` and high watermark `H`, each direction owns at most `ceil((H + B - 1) / B) * B` payload bytes of allocation. The addition accounts for up to `B - 1` consumed bytes in the front block, and rounding accounts for unused tail space. At the default limit this is 65 blocks or 260 KiB per direction. Consumption frees traversed blocks and frees the last block as soon as the queue is empty. Node metadata, allocator overhead, the two shared 4 KiB scratch arrays, other process memory and kernel TCP send and receive queues are separate quantities. The aggregate payload bound currently follows from the directional and total admission limits.
+Logical occupancy counts unsent bytes. Allocated payload capacity counts all live blocks at full size. For block size `B` and high watermark `H`, each direction owns at most `ceil((H + B - 1) / B) * B` payload bytes of allocation. The addition accounts for up to `B - 1` consumed bytes in the front block, and rounding accounts for unused tail space. At the default limit this is 65 blocks or 260 KiB per direction. Consumption frees traversed blocks and frees the last block as soon as the queue is empty.
+
+### Shared forwarding payload budget
+
+The manager owns one budget for all queues. Before receiving, the forwarder reserves the full payload block capacity it may need after using free space in the current tail block. It shortens the receive when the reservation can cover only part of the request. Committed block capacity plus outstanding reservations stays within the budget. Allocating a block converts its reservation to a committed charge. Returning from the forwarding call releases unused reservations, including after a direct send, EOF, would-block or allocation failure. Queue destruction and consumption release committed charges as blocks are freed.
+
+The budget covers allocated forwarding blocks and their reservations. Node and wait-list metadata, allocator overhead, two shared 4 KiB scratch arrays, other application memory, process RSS and virtual memory, and kernel TCP memory are outside its accounting.
+
+A direction with logical room and no usable payload capacity waits in a shared FIFO. It has one entry tied to its live session and source role. Session teardown and loss of its destination cancel the entry directly. While the FIFO is nonempty, new readers may use space in their own tail blocks. Newly free blocks go to FIFO waiters. Each scheduled waiter gets one normal read opportunity, which may use one new 4 KiB block with the runtime's 4 KiB receive scratch space.
+
+After a readiness batch the reactor retries at most one waiter if a block can be reserved. The next epoll poll is nonblocking when more FIFO work is runnable. With no available block the reactor waits for I/O or deadlines. A scheduled read rechecks the source and destination's lifecycle, idle deadline and directional hysteresis, including for a residual source whose earlier edge has already been consumed. The same mechanism continues during graceful shutdown. Once a waiter stays eligible, it advances in FIFO order as read opportunities become available. Fully occupied budgets can stall directions indefinitely when peers or application exchanges keep every charged block from being released. See [LIM-018](known-limitations.md#lim-018--forwarding-progress-depends-on-payload-capacity-becoming-available).
 
 ## Epoll registration and dispatch
 

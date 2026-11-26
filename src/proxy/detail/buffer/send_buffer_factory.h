@@ -10,7 +10,8 @@ namespace orbit::proxy::detail {
 
 class SendBufferFactory {
 public:
-    explicit SendBufferFactory(const SendBufferOptions& config, AllocationChecks allocation = {});
+    SendBufferFactory(const SendBufferOptions& config, AllocationChecks allocation,
+                      BufferBudget& budget);
 
     std::unique_ptr<SendBuffer> make() const;
 
@@ -19,6 +20,7 @@ private:
     size_t high_watermark_;
     size_t low_watermark_;
     AllocationChecks allocation_;
+    BufferBudget* budget_;
 };
 
 } // namespace orbit::proxy::detail

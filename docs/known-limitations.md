@@ -29,7 +29,7 @@ Source baseline is `e3aec7b`. A source-confirmed finding follows from the implem
 
 - **M2.1 disposition** — Both directions enforce strict logical limits and account for allocated blocks. The sum of the two directional bounds limits the payload allocation attributable to one session.
 - **M2.2 disposition** — The reactor bounds total and pending admission and pauses acceptance at either limit. The total limit and the bound on each session together limit allocated payload capacity.
-- **Remaining scope** — Operators cannot set an independent aggregate payload budget. Node overhead, process memory and kernel TCP queue usage are outside the directional bounds. See [LIM-013](#lim-013--resource-exhaustion-can-stop-the-reactor) for resource failure handling.
+- **M2.4 disposition** — An independent aggregate budget covers committed payload block capacity and reservations. Node overhead, process memory and kernel TCP queue usage are outside the payload budget. See [LIM-013](#lim-013--resource-exhaustion-can-stop-the-reactor) for resource failure handling and LIM-018 for the progress condition.
 
 ## LIM-006 — Pending dials have mixed graceful shutdown behavior
 
@@ -112,3 +112,9 @@ Source baseline is `e3aec7b`. A source-confirmed finding follows from the implem
 - **Source and evidence** — GCC 15.2.0 with `-fsanitize=address,undefined` reports a non-constant function-pointer comparison in the pinned Abseil hash policy header when compiling Orbit's proxy. [Abseil's upstream report](https://github.com/abseil/abseil-cpp/issues/1634).
 - **Disposition** — The sanitizer preset uses Clang 22. With mixed instrumentation, Orbit aborted during startup in Abseil's `CommonFields::set_capacity` because ASan changes the hash-table layout. The build now instruments Abseil in the same configuration as Orbit.
 - **Follow-up** — Recheck compiler and Abseil compatibility when changing either toolchain. Keep Abseil's compiled code and the Orbit code that uses its headers on matching sanitizer settings.
+
+## LIM-018 — Forwarding progress depends on payload capacity becoming available
+
+- **Condition and impact** — All charged blocks can be held by destinations whose peers have stopped reading. An unrelated direction can then remain paused, including when its peer could accept an immediate send or when the source has reached EOF. Orbit needs capacity before attempting a receive because the result can include payload.
+- **Current behavior** — Existing tail space remains usable. Consumption, hangup and teardown release capacity, and FIFO scheduling gives eligible waiters opportunities as blocks become available. Established-session idle expiration can also release capacity if enabled.
+- **Remaining scope** — Application protocols can depend on a paused direction to trigger reads in another direction. A fully occupied budget can sustain such a dependency until the peers make progress or a session ends.

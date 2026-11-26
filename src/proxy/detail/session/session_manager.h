@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <memory>
 #include <optional>
 #include <ranges>
 #include <string>
@@ -8,6 +9,7 @@
 #include <absl/container/flat_hash_map.h>
 
 #include "common/fd.h"
+#include "config/resources.h"
 #include "net/socket_io.h"
 #include "proxy/detail/buffer/send_buffer_factory.h"
 #include "proxy/detail/buffer/send_buffer_options.h"
@@ -25,6 +27,7 @@ struct SessionManagerOptions {
     SendBufferOptions send_buffer;
     size_t forwarder_buffer_capacity;
     size_t sender_buffer_capacity;
+    size_t buffer_budget = ResourceConfig::default_buffer_budget;
 };
 
 struct SessionSourceIds {
@@ -60,6 +63,8 @@ public:
     explicit SessionManager(const SessionManagerOptions& options,
                             net::StreamOperations operations = {},
                             AllocationChecks allocation = {});
+    SessionManager(SessionManager&&) = default;
+    SessionManager& operator=(SessionManager&&) = delete;
 
     SessionId allocateId();
     std::optional<Session> prepare(FileDescriptor downstream, FileDescriptor upstream) const;
@@ -72,12 +77,16 @@ public:
     auto ids() const { return std::views::keys(sessions_); }
     SessionSourceIds sourceIds(SessionId id) const;
     SessionInterests interests(SessionId id) const;
+    const BufferBudget& bufferBudget() const { return *buffer_budget_; }
+    size_t waitingReadCount() const { return waiting_reads_.size(); }
+    bool hasReadyRead() const;
+    std::optional<SourceId> takeReadyRead();
 
     // The session retains ownership after its source registration is retired.
     bool shouldRetire(SessionId id, EndpointRole role) const;
 
-    SessionEventResult handleReadable(SessionId id, EndpointRole role,
-                                      IdleDeadline* idle = nullptr);
+    SessionEventResult handleReadable(SessionId id, EndpointRole role, IdleDeadline* idle = nullptr,
+                                      bool from_wait_queue = false);
     SessionEventResult handleWritable(SessionId id, EndpointRole role,
                                       IdleDeadline* idle = nullptr);
     SessionEventResult handlePeerHalfClosed(SessionId id, EndpointRole role,
@@ -102,8 +111,14 @@ private:
     static const SessionEndpoint& getOtherEndpoint(const Session& session, EndpointRole role);
     static EndpointInterests getInterests(const SessionEndpoint& endpoint,
                                           const SessionEndpoint& other);
+    void cancelReadWait(SessionEndpoint& endpoint);
 
+    // The budget stays at a stable address and outlives its borrowers.
+    std::unique_ptr<BufferBudget> buffer_budget_;
     absl::flat_hash_map<SessionId, ManagedSession> sessions_;
+    WaitingReads waiting_reads_;
+    size_t block_size_;
+    AllocationChecks allocation_;
     SessionIdGenerator session_id_generator_;
     SendBufferFactory send_buffer_factory_;
     Forwarder forwarder_;
