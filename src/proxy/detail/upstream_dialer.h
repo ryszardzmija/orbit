@@ -25,7 +25,13 @@ struct UpstreamDialInProgress {
     PendingConnection pending_connection;
 };
 
-using UpstreamDialResult = std::variant<UpstreamDialConnected, UpstreamDialInProgress>;
+struct UpstreamDialDeferred {
+    PendingConnection pending_connection;
+    bool interrupted = false;
+};
+
+using UpstreamDialResult =
+    std::variant<UpstreamDialConnected, UpstreamDialInProgress, UpstreamDialDeferred>;
 
 struct UpstreamDialerCreateError {
     std::string message;
@@ -38,10 +44,13 @@ public:
 
     std::expected<UpstreamDialResult, net::DialError>
     dial(FileDescriptor accepted_connection, const net::SocketAddress& accepted_address,
-         Deadline deadline, const SteadyTimeSource& time_source);
+         Deadline deadline, const SteadyTimeSource& time_source, size_t& attempts_left);
     std::expected<UpstreamDialResult, net::DialError>
     advanceDialAttempt(PendingConnection pending_connection, const SteadyTimeSource& time_source,
-                       bool allow_fallback = true);
+                       size_t& attempts_left);
+    std::expected<UpstreamDialResult, net::DialError>
+    resumeDial(PendingConnection pending_connection, const SteadyTimeSource& time_source,
+               size_t& attempts_left);
 
     const net::ResolutionEndpoint& upstreamEndpoint() const;
 
@@ -52,7 +61,7 @@ private:
 
     std::expected<UpstreamDialResult, net::DialError>
     tryCandidatesFrom(PendingConnection pending_connection, std::size_t first_candidate_idx,
-                      const SteadyTimeSource& time_source);
+                      const SteadyTimeSource& time_source, size_t& attempts_left);
 
     detail::ResolvedUpstream resolved_upstream_;
     net::DialOperations operations_;

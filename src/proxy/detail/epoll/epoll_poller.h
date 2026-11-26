@@ -3,8 +3,8 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <span>
 #include <system_error>
-#include <vector>
 
 #include <absl/container/flat_hash_map.h>
 #include <sys/epoll.h>
@@ -23,6 +23,7 @@ struct ReadyEvent {
 struct EpollOperations {
     void* context = nullptr;
     int (*control)(void*, int epfd, int op, int fd, epoll_event*) = nullptr;
+    int (*wait)(void*, int epfd, epoll_event*, int maxevents, int timeout) = nullptr;
 };
 
 // Owns an epoll instance and tracks the file descriptors registered with it.
@@ -59,8 +60,8 @@ public:
     // Whether a source is currently being watched.
     bool isWatching(SourceId id) const;
 
-    // Blocks until readiness by default. A runnable continuation can request a zero-time poll.
-    Result<std::vector<ReadyEvent>, std::error_code> wait(bool nonblocking = false);
+    // The batch is borrowed until the next wait. An interrupted poll returns an empty batch.
+    Result<std::span<const ReadyEvent>, std::error_code> wait(bool nonblocking = false);
 
 private:
     static constexpr std::size_t event_buf_cap = 1024;
@@ -80,7 +81,8 @@ private:
     FileDescriptor epfd_;
     EpollOperations operations_;
     absl::flat_hash_map<SourceId, WatchedFd> watched_;
-    std::array<epoll_event, event_buf_cap> event_buffer_;
+    std::array<epoll_event, event_buf_cap> event_buffer_{};
+    std::array<ReadyEvent, event_buf_cap> ready_events_{};
 };
 
 } // namespace orbit::proxy::detail

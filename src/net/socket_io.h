@@ -14,6 +14,7 @@ enum class RecvStatus {
     Ok,
     WouldBlock,
     Eof,
+    Interrupted,
 };
 
 enum class SendStatus {
@@ -36,6 +37,7 @@ struct StreamOperations {
     void* context = nullptr;
     ssize_t (*receive)(void*, int fd, void* buffer, size_t size, int flags) = nullptr;
     ssize_t (*send)(void*, int fd, const void* buffer, size_t size, int flags) = nullptr;
+    int (*shutdown)(void*, int fd, int how) = nullptr;
 };
 
 std::expected<RecvResult, std::error_code> tryRecv(int fd, std::span<uint8_t> buf,

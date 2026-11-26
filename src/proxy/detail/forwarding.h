@@ -24,7 +24,7 @@ struct ForwardError {
     FailedOp failed_op;
 };
 
-enum class ForwardOutcome { KeepOpen, WaitForCapacity };
+enum class ForwardOutcome { KeepOpen, WaitForCapacity, Interrupted };
 
 class Forwarder {
 public:

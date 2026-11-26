@@ -44,27 +44,21 @@ std::expected<void, std::error_code> setTimer(int fd, std::optional<Deadline> at
 std::expected<bool, std::error_code> drainTimerFd(int fd) {
     uint64_t expirations = 0;
 
-    while (true) {
-        ssize_t n = read(fd, &expirations, sizeof(expirations));
+    ssize_t n = read(fd, &expirations, sizeof(expirations));
 
-        if (n == sizeof(expirations)) {
-            return expirations != 0;
-        }
-
-        if (n == -1 && errno == EINTR) {
-            continue;
-        }
-
-        if (n == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-            return false;
-        }
-
-        if (n == -1) {
-            return std::unexpected(std::error_code(errno, std::system_category()));
-        }
-
-        return std::unexpected(std::make_error_code(std::errc::io_error));
+    if (n == sizeof(expirations)) {
+        return expirations != 0;
     }
+
+    if (n == -1 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) {
+        return false;
+    }
+
+    if (n == -1) {
+        return std::unexpected(std::error_code(errno, std::system_category()));
+    }
+
+    return std::unexpected(std::make_error_code(std::errc::io_error));
 }
 
 } // namespace orbit::proxy::detail

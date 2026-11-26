@@ -13,9 +13,10 @@ Orbit is a TCP reverse proxy for Linux. It provides a client-facing address for 
 service and relays traffic in both directions, so applications can keep using their existing
 protocols.
 
-Orbit uses Linux `epoll` to handle concurrent connections. It manages traffic flow when clients
-or upstreams read slowly and supports graceful shutdown, giving active connections time to
-finish.
+Orbit uses Linux `epoll` to handle concurrent connections. It limits total and pending
+admission and shares a forwarding payload budget across connections. It manages traffic
+flow when peers read slowly and supports graceful shutdown, giving active connections
+time to finish.
 
 The project is evolving into a resource-efficient, fault-tolerant Layer 4 TCP load balancer.
 Development priorities include distributing connections across upstreams, handling upstream

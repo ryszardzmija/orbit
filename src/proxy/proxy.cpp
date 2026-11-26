@@ -1,5 +1,6 @@
 #include "proxy/proxy.h"
 
+#include <algorithm>
 #include <cassert>
 #include <cstdint>
 #include <expected>
@@ -78,6 +79,8 @@ const char* operationName(ConnectionOperation operation) {
         return "allocate send buffers";
     case ConnectionOperation::AllocateDeadline:
         return "allocate connection deadline";
+    case ConnectionOperation::AllocateDeferredDial:
+        return "allocate deferred dial entry";
     case ConnectionOperation::AddWatch:
         return "epoll ADD";
     case ConnectionOperation::ChangeWatch:
@@ -132,6 +135,7 @@ ProxyReactor::ProxyReactor(detail::EpollPoller poller, FileDescriptor shutdown_s
       max_pending_connections_(resources.max_pending_connections),
       time_source_(time_source),
       accept_operations_(operations.accept),
+      allocation_(operations.allocation),
       upstream_dialer_(std::move(upstream_dialer)) {}
 
 Result<ProxyReactor, ProxyCreateError>
@@ -220,29 +224,8 @@ Status<ProxyRuntimeError> ProxyReactor::start() {
     spdlog::info("Starting proxying traffic...");
 
     while (!shouldStop()) {
-        if (auto armed = synchronizeTimer(); !armed) {
-            return std::unexpected(ProxyRuntimeError{armed.error().message()});
-        }
-        auto wait_result = poller_.wait(session_manager_.hasReadyRead());
-        if (!wait_result) {
-            return std::unexpected(ProxyRuntimeError{wait_result.error().message()});
-        }
-
-        for (const detail::ReadyEvent& event : *wait_result) {
-            auto handler_result = dispatch(event);
-            if (!handler_result) {
-                spdlog::error("Error in reactor event handler: {}", handler_result.error().message);
-                return std::unexpected(ProxyRuntimeError{handler_result.error().message});
-            }
-
-            if (shouldStop()) {
-                break;
-            }
-        }
-        if (!shouldStop()) {
-            if (auto resumed = resumeReadyRead(); !resumed) {
-                return std::unexpected(ProxyRuntimeError{resumed.error().message});
-            }
+        if (auto turn = runTurn(); !turn) {
+            return std::unexpected(ProxyRuntimeError{std::move(turn.error().message)});
         }
     }
 
@@ -252,15 +235,44 @@ Status<ProxyRuntimeError> ProxyReactor::start() {
     return {};
 }
 
-Status<FatalReactorError> ProxyReactor::resumeReadyRead() {
-    if (auto source = session_manager_.takeReadyRead()) {
-        // This also retries a hung-up source whose readable edge was already consumed.
-        return dispatch({*source, EPOLLIN}, true);
+Status<FatalReactorError> ProxyReactor::runTurn() {
+    if (auto armed = synchronizeTimer(); !armed) {
+        return std::unexpected(FatalReactorError{armed.error().message()});
+    }
+    auto events = poller_.wait(hasRunnableDials() || session_manager_.hasReadyRead());
+    if (!events) {
+        return std::unexpected(FatalReactorError{events.error().message()});
+    }
+    if (auto dispatched = dispatchBatch(*events); !dispatched || shouldStop()) {
+        return dispatched;
+    }
+    if (auto resumed = resumeDeferredDials(); !resumed) {
+        return resumed;
+    }
+    return resumeReadyRead();
+}
+
+Status<FatalReactorError> ProxyReactor::dispatchBatch(std::span<const detail::ReadyEvent> events) {
+    size_t dial_attempts_left = max_dial_attempts_per_batch;
+    for (const auto& event : events) {
+        if (auto status = dispatch(event, dial_attempts_left); !status || shouldStop()) {
+            return status;
+        }
     }
     return {};
 }
 
-Status<FatalReactorError> ProxyReactor::dispatch(detail::ReadyEvent event, bool from_wait_queue) {
+Status<FatalReactorError> ProxyReactor::resumeReadyRead() {
+    if (auto source = session_manager_.takeReadyRead()) {
+        // This also retries a hung-up source whose readable edge was already consumed.
+        size_t no_dial_attempts = 0;
+        return dispatch({*source, EPOLLIN}, no_dial_attempts, true);
+    }
+    return {};
+}
+
+Status<FatalReactorError> ProxyReactor::dispatch(detail::ReadyEvent event,
+                                                 size_t& dial_attempts_left, bool from_wait_queue) {
     auto registration = sources_.find(event.source_id);
 
     if (!registration) {
@@ -276,12 +288,12 @@ Status<FatalReactorError> ProxyReactor::dispatch(detail::ReadyEvent event, bool 
                 if (event.events & (EPOLLERR | EPOLLHUP)) {
                     return std::unexpected(FatalReactorError{"Listener reported error or hangup"});
                 }
-                return handleListener(r);
+                return handleListener(r, dial_attempts_left);
             },
             [&](detail::ShutdownSignalRegistration r) { return handleShutdownSignal(r); },
             [&](detail::TimerRegistration r) { return handleTimer(r); },
             [&](detail::PendingDialRegistration) {
-                return handlePendingConnection(event.source_id);
+                return handlePendingConnection(event.source_id, dial_attempts_left);
             },
         },
         *registration);
@@ -306,6 +318,8 @@ Status<std::error_code> ProxyReactor::closeSession(detail::SessionId session_id)
     std::optional<std::error_code> first_error;
 
     for (auto id : {source_ids.downstream, source_ids.upstream}) {
+        deadlines_.cancel({detail::DeadlineKind::ResidualRead, id});
+        deadlines_.cancel({detail::DeadlineKind::FinishWrite, id});
         if (poller_.isWatching(id)) {
             if (auto result = unregisterReactorSource(id); !result && !first_error) {
                 first_error = result.error();
@@ -379,24 +393,44 @@ Result<detail::SourceId, std::error_code> ProxyReactor::registerTimerEvent() {
 }
 
 Result<detail::SourceId, ConnectionFailure>
-ProxyReactor::registerPendingConnection(detail::PendingConnection pending_connection) {
-    auto registered = registerReactorSource(pending_connection.attempted_connection_fd->get(),
-                                            EPOLLOUT, detail::PendingDialRegistration{});
+ProxyReactor::registerPendingConnection(detail::PendingConnection pending_connection,
+                                        bool interrupted) {
+    const bool watched = pending_connection.attempted_connection_fd.has_value() && !interrupted;
+    Result<detail::SourceId, std::error_code> registered =
+        watched ? registerReactorSource(pending_connection.attempted_connection_fd->get(), EPOLLOUT,
+                                        detail::PendingDialRegistration{})
+                : Result<detail::SourceId, std::error_code>(sources_.allocateId());
     if (!registered) {
         return std::unexpected(
             ConnectionFailure{ConnectionOperation::AddWatch, registered.error()});
     }
+    const detail::DeadlineKey key{detail::DeadlineKind::Connect, *registered};
+    const detail::DeadlineKey retry_key{detail::DeadlineKind::DialRetry, *registered};
+    std::optional<DeferredDials::iterator> deferred;
+    ConnectionOperation allocation = ConnectionOperation::AllocateDeadline;
     try {
-        deadlines_.schedule({detail::DeadlineKind::Connect, *registered},
-                            pending_connection.deadline);
+        deadlines_.schedule(key, pending_connection.deadline);
+        if (interrupted) {
+            deadlines_.schedule(retry_key, time_source_.now() + interrupted_io_retry_interval);
+        } else if (!watched) {
+            allocation = ConnectionOperation::AllocateDeferredDial;
+            allocation_.check(detail::AllocationPoint::DeferredDial);
+            deferred = deferred_dials_.insert(deferred_dials_.end(), *registered);
+        }
     } catch (const std::bad_alloc&) {
-        auto retired = unregisterReactorSource(*registered);
-        return std::unexpected(ConnectionFailure{ConnectionOperation::AllocateDeadline,
+        deadlines_.cancel(key);
+        deadlines_.cancel(retry_key);
+        Status<std::error_code> retired;
+        if (watched) {
+            retired = unregisterReactorSource(*registered);
+        }
+        return std::unexpected(ConnectionFailure{allocation,
                                                  std::make_error_code(std::errc::not_enough_memory),
                                                  retired ? std::error_code{} : retired.error()});
     }
-    // Abseil table allocation failures remain fatal. Only the deadline insertion above is caught.
-    pending_connections_.emplace(*registered, std::move(pending_connection));
+    // Abseil table allocation failures remain fatal.
+    pending_connections_.emplace(*registered,
+                                 PendingEntry{std::move(pending_connection), deferred, watched});
     transient_admission_ = false;
     return *registered;
 }
@@ -405,8 +439,14 @@ Result<detail::PendingConnection, std::error_code> ProxyReactor::takePending(det
     auto it = pending_connections_.find(id);
     assert(it != pending_connections_.end());
     deadlines_.cancel({detail::DeadlineKind::Connect, id});
-    auto retired = unregisterReactorSource(id);
-    auto pending = std::move(it->second);
+    deadlines_.cancel({detail::DeadlineKind::DialRetry, id});
+    Status<std::error_code> retired;
+    if (auto deferred = it->second.deferred) {
+        deferred_dials_.erase(*deferred);
+    } else if (it->second.watched) {
+        retired = unregisterReactorSource(id);
+    }
+    auto pending = std::move(it->second.connection);
     pending_connections_.erase(it);
     if (!retired) {
         return std::unexpected(retired.error());
@@ -487,8 +527,9 @@ Result<detail::SessionId, ConnectionFailure> ProxyReactor::addSession(FileDescri
     return id;
 }
 
-Status<FatalReactorError> ProxyReactor::handleEndpoint(detail::EndpointRegistration registration,
-                                                       uint32_t event_mask, bool from_wait_queue) {
+Status<FatalReactorError>
+ProxyReactor::handleEndpoint(detail::EndpointRegistration registration, uint32_t event_mask,
+                             bool from_wait_queue, std::optional<detail::SessionRetryKind> retry) {
     detail::SessionId session_id = registration.session_id;
 
     if (!session_manager_.contains(session_id)) {
@@ -502,9 +543,26 @@ Status<FatalReactorError> ProxyReactor::handleEndpoint(detail::EndpointRegistrat
     }
     auto* idle = idle_deadline ? &*idle_deadline : nullptr;
 
+    if (retry) {
+        auto result =
+            session_manager_.retryInterrupted(session_id, {registration.role, *retry}, idle);
+        if (auto applied = applySessionEventResult(session_id, result, idle); !applied) {
+            return std::unexpected(applied.error());
+        }
+        return {};
+    }
+
     // Error and full hangup supersede ordinary readiness in the same notification.
     // A full hangup has its own bounded read and cannot accept queued output.
     if (event_mask & (EPOLLERR | EPOLLHUP)) {
+        if (!(event_mask & EPOLLERR)) {
+            const auto [downstream, upstream] = session_manager_.sourceIds(session_id);
+            const bool from_client = registration.role == detail::EndpointRole::Downstream;
+            deadlines_.cancel(
+                {detail::DeadlineKind::FinishWrite, from_client ? downstream : upstream});
+            deadlines_.cancel(
+                {detail::DeadlineKind::ResidualRead, from_client ? upstream : downstream});
+        }
         auto result = (event_mask & EPOLLERR)
                           ? session_manager_.handleError(session_id, registration.role)
                           : session_manager_.handleHangup(session_id, registration.role, idle);
@@ -563,6 +621,21 @@ ProxyReactor::applySessionEventResult(detail::SessionId session_id,
     if (idle) {
         if (auto at = idle->takeRefresh()) {
             deadlines_.schedule({detail::DeadlineKind::Idle, session_id}, *at);
+        }
+    }
+    if (auto retry = event_result.retry) {
+        const auto [downstream, upstream] = session_manager_.sourceIds(session_id);
+        const auto source = retry->role == detail::EndpointRole::Downstream ? downstream : upstream;
+        const auto kind = retry->kind == detail::SessionRetryKind::ResidualRead
+                              ? detail::DeadlineKind::ResidualRead
+                              : detail::DeadlineKind::FinishWrite;
+        try {
+            deadlines_.schedule({kind, source}, time_source_.now() + interrupted_io_retry_interval);
+        } catch (const std::bad_alloc&) {
+            if (auto closed = closeSession(session_id); !closed) {
+                return std::unexpected(FatalReactorError{closed.error().message()});
+            }
+            return EndpointEventOutcome::SessionClosed;
         }
     }
     if (auto result = synchronizeSessionInterests(session_id); !result) {
@@ -637,9 +710,7 @@ Status<FatalReactorError> ProxyReactor::handleTimer(detail::TimerRegistration) {
     }
     if (*expired) {
         armed_deadline_.reset();
-        if (auto result = expireDeadlines(time_source_.now()); !result) {
-            return std::unexpected(FatalReactorError{result.error().message()});
-        }
+        return expireDeadlines(time_source_.now());
     }
     return {};
 }
@@ -659,11 +730,14 @@ Status<std::error_code> ProxyReactor::synchronizeTimer() {
     return {};
 }
 
-Status<std::error_code> ProxyReactor::expireDeadlines(detail::Deadline now) {
+Status<FatalReactorError> ProxyReactor::expireDeadlines(detail::Deadline now) {
     // A burst of earlier idle expirations must not defer a due process shutdown.
     if (shutdown_state_ == ShutdownState::GracefullyStopping &&
         deadlines_.due(shutdown_deadline, now)) {
-        return handleShutdownRequest();
+        if (auto shutdown = handleShutdownRequest(); !shutdown) {
+            return std::unexpected(FatalReactorError{shutdown.error().message()});
+        }
+        return {};
     }
     if (admission_retry_at_ && *admission_retry_at_ <= now) {
         admission_retry_at_.reset();
@@ -675,15 +749,44 @@ Status<std::error_code> ProxyReactor::expireDeadlines(detail::Deadline now) {
         }
         if (key->kind == detail::DeadlineKind::Idle) {
             if (auto closed = closeSession(key->id); !closed) {
-                return closed;
+                return std::unexpected(FatalReactorError{closed.error().message()});
             }
         } else if (key->kind == detail::DeadlineKind::Connect &&
                    pending_connections_.contains(key->id)) {
             auto pending = takePending(key->id);
             if (!pending) {
-                return std::unexpected(pending.error());
+                return std::unexpected(FatalReactorError{pending.error().message()});
             }
             spdlog::debug("Upstream connection establishment timed out");
+        } else if (key->kind == detail::DeadlineKind::DialRetry) {
+            auto it = pending_connections_.find(key->id);
+            if (it != pending_connections_.end()) {
+                try {
+                    allocation_.check(detail::AllocationPoint::DeferredDial);
+                    it->second.deferred = deferred_dials_.insert(deferred_dials_.end(), key->id);
+                } catch (const std::bad_alloc&) {
+                    if (auto dropped = takePending(key->id); !dropped) {
+                        return std::unexpected(FatalReactorError{dropped.error().message()});
+                    }
+                    suspendAdmission("allocate deferred dial entry",
+                                     std::make_error_code(std::errc::not_enough_memory), false);
+                }
+            }
+        } else if (key->kind == detail::DeadlineKind::ResidualRead ||
+                   key->kind == detail::DeadlineKind::FinishWrite) {
+            auto registration = sources_.find(key->id);
+            if (!registration) {
+                continue;
+            }
+            auto* endpoint = std::get_if<detail::EndpointRegistration>(&*registration);
+            if (endpoint) {
+                auto retry = key->kind == detail::DeadlineKind::ResidualRead
+                                 ? detail::SessionRetryKind::ResidualRead
+                                 : detail::SessionRetryKind::FinishWrite;
+                if (auto resumed = handleEndpoint(*endpoint, 0, false, retry); !resumed) {
+                    return resumed;
+                }
+            }
         }
     }
     return {};
@@ -738,8 +841,9 @@ Status<std::error_code> ProxyReactor::synchronizeListener() {
     return result;
 }
 
-Status<FatalReactorError> ProxyReactor::handleListener(detail::ListenerRegistration) {
-    for (int i = 0; i < max_accept_batch_size && canAdmit(); ++i) {
+Status<FatalReactorError> ProxyReactor::handleListener(detail::ListenerRegistration,
+                                                       size_t& attempts_left) {
+    for (int i = 0; i < max_accept_batch_size && attempts_left > 0 && canAdmit(); ++i) {
         AdmissionReservation reservation(transient_admission_);
         auto accept_result = active_listener_->listener.acceptClientConnection(accept_operations_);
         if (!accept_result) {
@@ -766,8 +870,9 @@ Status<FatalReactorError> ProxyReactor::handleListener(detail::ListenerRegistrat
         spdlog::info("Client {} connected", net::formatAddress(accept_success.remote));
 
         auto deadline = time_source_.now() + timeouts_.connect;
-        auto dial_result = upstream_dialer_.dial(std::move(accept_success.fd),
-                                                 accept_success.remote, deadline, time_source_);
+        auto dial_result =
+            upstream_dialer_.dial(std::move(accept_success.fd), accept_success.remote, deadline,
+                                  time_source_, attempts_left);
         if (!dial_result) {
             if (auto error_result = handleDialError(std::move(dial_result.error()));
                 !error_result) {
@@ -785,7 +890,8 @@ Status<FatalReactorError> ProxyReactor::handleListener(detail::ListenerRegistrat
     return {};
 }
 
-Status<FatalReactorError> ProxyReactor::handlePendingConnection(detail::SourceId id) {
+Status<FatalReactorError> ProxyReactor::handlePendingConnection(detail::SourceId id,
+                                                                size_t& attempts_left) {
     auto pending = takePending(id);
     if (!pending) {
         return std::unexpected(FatalReactorError{pending.error().message()});
@@ -794,13 +900,54 @@ Status<FatalReactorError> ProxyReactor::handlePendingConnection(detail::SourceId
         return {};
     }
     AdmissionReservation reservation(transient_admission_);
-    auto dial_result = upstream_dialer_.advanceDialAttempt(std::move(*pending), time_source_,
-                                                           !admission_retry_at_);
+    size_t no_attempts = 0;
+    auto dial_result = upstream_dialer_.advanceDialAttempt(
+        std::move(*pending), time_source_, admission_retry_at_ ? no_attempts : attempts_left);
     if (!dial_result) {
         return handleDialError(std::move(dial_result.error()));
     }
 
     return handleDialResult(std::move(*dial_result));
+}
+
+bool ProxyReactor::hasRunnableDials() const {
+    return shutdown_state_ == ShutdownState::Running && !admission_retry_at_ &&
+           !deferred_dials_.empty();
+}
+
+Status<FatalReactorError> ProxyReactor::resumeDeferredDials() {
+    const size_t count = std::min(deferred_dials_.size(), max_resumed_dials_per_turn);
+    for (size_t i = 0; i < count && hasRunnableDials(); ++i) {
+        const auto id = deferred_dials_.front();
+        auto& entry = pending_connections_.at(id);
+        size_t attempts_left = 1;
+        auto result = entry.connection.attempted_connection_fd
+                          ? upstream_dialer_.advanceDialAttempt(std::move(entry.connection),
+                                                                time_source_, attempts_left)
+                          : upstream_dialer_.resumeDial(std::move(entry.connection), time_source_,
+                                                        attempts_left);
+        if (result) {
+            if (auto* deferred = std::get_if<detail::UpstreamDialDeferred>(&*result);
+                deferred && !deferred->interrupted) {
+                entry.connection = std::move(deferred->pending_connection);
+                deferred_dials_.splice(deferred_dials_.end(), deferred_dials_, *entry.deferred);
+                continue;
+            }
+        }
+        // A successful result already holds the sockets. Retire the old record before handoff.
+        auto removed = takePending(id);
+        assert(removed && "deferred entries have no watch to retire");
+        AdmissionReservation reservation(transient_admission_);
+        auto handled =
+            result ? handleDialResult(std::move(*result)) : handleDialError(result.error());
+        if (!handled) {
+            return handled;
+        }
+    }
+    if (auto updated = synchronizeListener(); !updated) {
+        return std::unexpected(FatalReactorError{updated.error().message()});
+    }
+    return {};
 }
 
 Status<FatalReactorError> ProxyReactor::handleDialResult(detail::UpstreamDialResult dial_result) {
@@ -837,7 +984,16 @@ Status<FatalReactorError> ProxyReactor::handleDialResult(detail::UpstreamDialRes
         spdlog::debug("Pending connection for {} registered", net::formatAddress(accepted_address));
 
     } else {
-        assert(false && "Invalid DialResult value");
+        auto& deferred = std::get<detail::UpstreamDialDeferred>(dial_result);
+        if (time_source_.now() >= deferred.pending_connection.deadline) {
+            return {};
+        }
+        if (auto registered = registerPendingConnection(std::move(deferred.pending_connection),
+                                                        deferred.interrupted);
+            !registered) {
+            return handleConnectionFailure(registered.error());
+        }
+        return {};
     }
 
     if (!admission_retry_at_) {
@@ -875,6 +1031,7 @@ Status<FatalReactorError> ProxyReactor::handleConnectionFailure(ConnectionFailur
     switch (failure.operation) {
     case ConnectionOperation::AllocateBuffers:
     case ConnectionOperation::AllocateDeadline:
+    case ConnectionOperation::AllocateDeferredDial:
         suspendAdmission(operation, failure.code, false);
         return {};
     case ConnectionOperation::EstablishmentDeadline:

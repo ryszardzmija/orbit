@@ -19,6 +19,8 @@ struct EndpointState {
     bool peer_half_closed;
     bool half_close_sent;
     bool done_reading;
+    bool residual_retry_pending = false;
+    bool fin_retry_pending = false;
     bool hungUp() const { return !send_buffer; }
     bool canWrite() const { return !hungUp() && !half_close_sent; }
 };

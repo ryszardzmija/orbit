@@ -11,6 +11,7 @@ namespace orbit::proxy::detail {
 
 class ReactorSources {
 public:
+    SourceId allocateId() { return id_generator_.getNextId(); }
     SourceId add(ReactorRegistration registration);
     void remove(SourceId id);
     std::optional<ReactorRegistration> find(SourceId id) const;

@@ -20,23 +20,8 @@ namespace orbit::proxy::detail {
 
 namespace {
 
-Status<std::error_code> halfCloseIfReady(const SessionEndpoint& source,
-                                         SessionEndpoint& destination, IdleDeadline* idle) {
-    if (!destination.state.canWrite() || !source.state.done_reading ||
-        !destination.state.send_buffer->empty()) {
-        return {};
-    }
-
-    while (!idle || idle->canStartIo()) {
-        if (shutdown(destination.fd.get(), SHUT_WR) == 0) {
-            destination.state.half_close_sent = true;
-            break;
-        }
-        if (errno != EINTR) {
-            return std::unexpected(std::error_code(errno, std::system_category()));
-        }
-    }
-    return {};
+EndpointRole oppositeRole(EndpointRole role) {
+    return role == EndpointRole::Upstream ? EndpointRole::Downstream : EndpointRole::Upstream;
 }
 
 bool shouldClose(const Session& session) {
@@ -44,10 +29,11 @@ bool shouldClose(const Session& session) {
     return !session.downstream.state.canWrite() && !session.upstream.state.canWrite();
 }
 
-SessionEventResult keepOpen() {
+SessionEventResult keepOpen(std::optional<SessionRetry> retry = std::nullopt) {
     return SessionEventResult{
         .action = SessionEventAction::KeepOpen,
         .error = std::nullopt,
+        .retry = retry,
     };
 }
 
@@ -182,12 +168,12 @@ SessionEventResult SessionManager::handleReadable(SessionId id, EndpointRole rol
         }
         return keepOpen();
     }
-
-    if (auto result = halfCloseIfReady(source, destination, idle); !result) {
-        return closeSession("Half-closing connection failed: " + result.error().message());
+    if (*result == ForwardOutcome::Interrupted && source.state.hungUp()) {
+        source.state.residual_retry_pending = true;
+        return keepOpen(SessionRetry{role, SessionRetryKind::ResidualRead});
     }
 
-    return shouldClose(session) ? closeSession() : keepOpen();
+    return finishWrite(session, oppositeRole(role), idle);
 }
 
 SessionEventResult SessionManager::handleWritable(SessionId id, EndpointRole role,
@@ -208,16 +194,49 @@ SessionEventResult SessionManager::handleWritable(SessionId id, EndpointRole rol
     }
 
     if (source.state.hungUp() && getInterests(source, destination).readable) {
-        auto source_role =
-            role == EndpointRole::Upstream ? EndpointRole::Downstream : EndpointRole::Upstream;
-        return handleReadable(id, source_role, idle);
+        return handleReadable(id, oppositeRole(role), idle);
     }
+    return finishWrite(session, role, idle);
+}
 
-    if (auto result = halfCloseIfReady(source, destination, idle); !result) {
-        return closeSession("Half-closing connection failed: " + result.error().message());
+SessionEventResult SessionManager::finishWrite(Session& session, EndpointRole destination_role,
+                                               IdleDeadline* idle) {
+    const auto& source = getOtherEndpoint(session, destination_role);
+    auto& destination = getEndpoint(session, destination_role);
+    if (destination.state.canWrite() && !destination.state.fin_retry_pending &&
+        source.state.done_reading && destination.state.send_buffer->empty() &&
+        (!idle || idle->canStartIo())) {
+        const auto fd = destination.fd.get();
+        int result = operations_.shutdown ? operations_.shutdown(operations_.context, fd, SHUT_WR)
+                                          : shutdown(fd, SHUT_WR);
+        if (result == 0) {
+            destination.state.half_close_sent = true;
+        } else if (errno == EINTR) {
+            destination.state.fin_retry_pending = true;
+            return keepOpen(SessionRetry{destination_role, SessionRetryKind::FinishWrite});
+        } else {
+            return closeSession("Half-closing connection failed: " +
+                                std::system_category().message(errno));
+        }
     }
 
     return shouldClose(session) ? closeSession() : keepOpen();
+}
+
+SessionEventResult SessionManager::retryInterrupted(SessionId id, SessionRetry retry,
+                                                    IdleDeadline* idle) {
+    auto& session = getSession(id);
+    auto& state = getEndpoint(session, retry.role).state;
+    if (retry.kind == SessionRetryKind::ResidualRead) {
+        if (!std::exchange(state.residual_retry_pending, false)) {
+            return keepOpen();
+        }
+        return handleReadable(id, retry.role, idle);
+    }
+    if (!std::exchange(state.fin_retry_pending, false)) {
+        return keepOpen();
+    }
+    return finishWrite(session, retry.role, idle);
 }
 
 SessionEventResult SessionManager::handlePeerHalfClosed(SessionId id, EndpointRole role,
@@ -234,7 +253,10 @@ SessionEventResult SessionManager::handleHangup(SessionId id, EndpointRole role,
     Session& session = getSession(id);
     SessionEndpoint& hungup = getEndpoint(session, role);
     hungup.state.send_buffer.reset();
-    cancelReadWait(getOtherEndpoint(session, role));
+    hungup.state.fin_retry_pending = false;
+    auto& source_to_hungup = getOtherEndpoint(session, role);
+    source_to_hungup.state.residual_retry_pending = false;
+    cancelReadWait(source_to_hungup);
     hungup.state.peer_half_closed = true;
     if (shouldClose(session)) {
         return closeSession();
@@ -313,7 +335,7 @@ EndpointInterests SessionManager::getInterests(const SessionEndpoint& endpoint,
         // Stop reading once the destination has hung up: anything we read could only be forwarded
         // to a socket that can no longer receive it.
         .readable = !endpoint.state.done_reading && other.state.canWrite() &&
-                    !endpoint.state.capacity_wait &&
+                    !endpoint.state.capacity_wait && !endpoint.state.residual_retry_pending &&
                     other.state.send_buffer->status() == SendBuffer::BufferStatus::Accepting,
         // Never attempt to write to a hung-up socket.
         .writable = endpoint.state.canWrite() && !endpoint.state.send_buffer->empty(),
