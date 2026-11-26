@@ -20,6 +20,11 @@ struct AcceptWouldBlock {};
 
 using AcceptResult = std::variant<AcceptSuccess, AcceptWouldBlock>;
 
+struct AcceptOperations {
+    void* context = nullptr;
+    int (*accept)(void*, int, sockaddr*, socklen_t*, int) = nullptr;
+};
+
 struct ListenError {
     std::string message;
 };
@@ -39,7 +44,8 @@ public:
 
     int fd() const { return listen_fd_.get(); }
     const SocketAddress& localAddress() const { return local_address_; }
-    std::expected<AcceptResult, std::error_code> acceptClientConnection();
+    std::expected<AcceptResult, std::error_code>
+    acceptClientConnection(const AcceptOperations& operations = {});
 
     static std::expected<Listener, ListenError> create(const ListenSocketAddress& address,
                                                        int max_backlog_size);

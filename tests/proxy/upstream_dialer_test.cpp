@@ -87,7 +87,7 @@ public:
         if (fd < 0) {
             throw std::system_error(errno, std::system_category(), "eventfd");
         }
-        return {std::move(client), {}, FileDescriptor(fd), 0, deadline, {}};
+        return {std::move(client), {}, FileDescriptor(fd), 0, deadline};
     }
 
 protected:
@@ -105,7 +105,7 @@ TEST_F(UpstreamDialerTest, FallbackPreservesOverallDeadlineThroughConnectComplet
     observation.interrupt_connect_at = at - 1ms;
     auto result =
         dialer.advanceDialAttempt(failedAttempt(test::socketPair().local, at), time_source);
-    ASSERT_TRUE(result) << result.error().error_messages;
+    ASSERT_TRUE(result) << result.error().code.message();
     EXPECT_EQ(2, observation.socket_calls);
     EXPECT_EQ(2, observation.connect_calls);
     EXPECT_EQ(at - 1ms, clock.now());
@@ -115,7 +115,7 @@ TEST_F(UpstreamDialerTest, FallbackPreservesOverallDeadlineThroughConnectComplet
         pollfd ready{attempt->pending_connection.attempted_connection_fd->get(), POLLOUT, 0};
         ASSERT_EQ(1, poll(&ready, 1, 1000));
         result = dialer.advanceDialAttempt(std::move(attempt->pending_connection), time_source);
-        ASSERT_TRUE(result) << result.error().error_messages;
+        ASSERT_TRUE(result) << result.error().code.message();
     }
     ASSERT_TRUE(std::holds_alternative<UpstreamDialConnected>(*result));
     EXPECT_EQ(at, std::get<UpstreamDialConnected>(*result).deadline);
@@ -153,8 +153,8 @@ TEST_F(UpstreamDialerTest, InterruptedConnectAtDeadlineDoesNotPrepareAnotherSock
     auto result = dialer.dial(std::move(client.local), {}, at, clock.source());
 
     ASSERT_FALSE(result);
-    EXPECT_FALSE(result.error().socket_creation_error);
-    EXPECT_EQ("overall connection establishment deadline expired", result.error().error_messages);
+    EXPECT_EQ(net::DialFailedOp::Deadline, result.error().failed_op);
+    EXPECT_EQ(std::errc::timed_out, result.error().code);
     EXPECT_EQ(at, clock.now());
     EXPECT_EQ(1, observation.socket_calls);
     EXPECT_EQ(1, observation.connect_calls);
@@ -272,6 +272,63 @@ TEST_F(FallbackReactorTest, ImmediateAttemptsReserveAdmissionAndReleaseOnFailure
     ASSERT_TRUE(dispatch({listenerId(), EPOLLIN}));
     EXPECT_EQ(4, attempts.calls);
     EXPECT_EQ(1u, sessionCount());
+}
+
+TEST_F(FallbackReactorTest, DialDescriptorPressureDropsThatClientAndBlocksFurtherAttempts) {
+    createReactor({}, clock.source(), {}, {.max_connections = 2, .max_pending_connections = 1});
+    auto client = test::socketPair();
+    auto upstream = test::socketPair();
+    const auto live = install(client, upstream);
+    auto backend = net::Listener::create({"127.0.0.1", 0}, 4);
+    ASSERT_TRUE(backend);
+    struct Failure {
+        int calls = 0;
+        int code = EMFILE;
+    } fault;
+    setUpstreamDialer(detail::UpstreamDialerTest::withCandidates(
+        backend->localAddress(),
+        {
+            .context = &fault,
+            .socket =
+                [](void* context, int domain, int type, int protocol) {
+                    auto& state = *static_cast<Failure*>(context);
+                    ++state.calls;
+                    if (state.code != 0) {
+                        errno = state.code;
+                        return -1;
+                    }
+                    return socket(domain, type, protocol);
+                },
+            .connect = [](void*, int, const sockaddr*, socklen_t) { return 0; },
+        }));
+    int attempts = 0;
+    char byte;
+    for (auto error : {EMFILE, ENFILE}) {
+        fault.code = error;
+        auto incoming = connectToListener();
+        ASSERT_TRUE(dispatch({listenerId(), EPOLLIN}));
+        EXPECT_EQ(++attempts, fault.calls);
+        EXPECT_EQ(0u, pendingCount());
+        EXPECT_EQ(0, recv(incoming.get(), &byte, 1, 0));
+        EXPECT_FALSE(listenerAccepting());
+        ASSERT_TRUE(dispatch({listenerId(), EPOLLIN}));
+        EXPECT_EQ(attempts, fault.calls);
+        ASSERT_EQ(1, send(client.peer.get(), "a", 1, 0));
+        ASSERT_TRUE(dispatch({live.downstream, EPOLLIN}));
+        EXPECT_EQ(1, recv(upstream.peer.get(), &byte, 1, 0));
+        EXPECT_EQ('a', byte);
+        ASSERT_TRUE(retryAt());
+        clock.advanceTo(*retryAt());
+        ASSERT_TRUE(expire(clock.now()));
+        EXPECT_TRUE(listenerAccepting());
+    }
+    fault.code = 0;
+    auto incoming = connectToListener();
+    ASSERT_TRUE(dispatch({listenerId(), EPOLLIN}));
+    EXPECT_EQ(++attempts, fault.calls);
+    EXPECT_EQ(2u, sessionCount());
+    EXPECT_EQ(0u, pendingCount());
+    EXPECT_FALSE(retryAt());
 }
 
 } // namespace orbit::proxy

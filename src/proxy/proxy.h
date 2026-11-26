@@ -35,14 +35,26 @@ struct FatalReactorError {
     std::string message;
 };
 
-enum class RollbackStatus {
-    Success,
-    Failure,
+enum class ConnectionOperation {
+    AllocateBuffers,
+    AllocateDeadline,
+    AddWatch,
+    ChangeWatch,
+    RemoveWatch,
+    EstablishmentDeadline,
 };
 
-struct AddSessionError {
-    std::string message;
-    RollbackStatus status;
+struct ConnectionFailure {
+    ConnectionOperation operation;
+    std::error_code code;
+    std::error_code rollback_error = {};
+};
+
+struct ReactorOperations {
+    net::StreamOperations stream;
+    net::AcceptOperations accept;
+    detail::EpollOperations epoll;
+    detail::AllocationChecks allocation;
 };
 
 class ProxyReactor {
@@ -64,6 +76,7 @@ private:
     constexpr static int max_expirations_per_dispatch = 64;
     constexpr static int max_backlog_size = 64;
     constexpr static int max_accept_batch_size = 16;
+    constexpr static std::chrono::milliseconds admission_retry_interval{100};
 
     enum class ShutdownState {
         Running,
@@ -79,13 +92,13 @@ private:
     ProxyReactor(detail::EpollPoller poller, FileDescriptor shutdown_signal_fd,
                  FileDescriptor timer_fd, detail::UpstreamDialer upstream_dialer,
                  TimeoutConfig timeouts, ResourceConfig resources, SteadyTimeSource time_source,
-                 net::StreamOperations stream_operations);
+                 ReactorOperations operations);
 
     static Result<ProxyReactor, ProxyCreateError>
     createImpl(const net::ListenSocketAddress& listen_address,
                const net::ResolutionEndpoint& upstream_address, TimeoutConfig timeouts,
                ResourceConfig resources, SteadyTimeSource time_source,
-               net::StreamOperations stream_operations);
+               ReactorOperations operations);
 
     // Resource registration
     Result<detail::SourceId, std::error_code> registerEndpoint(int fd, uint32_t initial_events,
@@ -94,7 +107,7 @@ private:
     Result<detail::SourceId, std::error_code> registerListener(int fd);
     Result<detail::SourceId, std::error_code> registerShutdownSignalEvent();
     Result<detail::SourceId, std::error_code> registerTimerEvent();
-    Result<detail::SourceId, std::error_code>
+    Result<detail::SourceId, ConnectionFailure>
     registerPendingConnection(detail::PendingConnection pending_connection);
 
     Result<detail::SourceId, std::error_code>
@@ -103,10 +116,9 @@ private:
     Status<std::error_code> unregisterReactorSource(detail::SourceId id);
 
     // Session lifecycle
-    Result<detail::SessionId, AddSessionError>
+    Result<detail::SessionId, ConnectionFailure>
     addSession(FileDescriptor upstream_fd, FileDescriptor downstream_fd, detail::Deadline deadline);
     Status<std::error_code> closeSession(detail::SessionId session_id);
-    void closeSessionAndLog(detail::SessionId session_id);
 
     Result<detail::PendingConnection, std::error_code> takePending(detail::SourceId id);
     Status<std::error_code> cancelPendingConnections();
@@ -122,12 +134,15 @@ private:
 
     // Handlers for handlePendingConnection()
     Status<FatalReactorError> handleDialResult(detail::UpstreamDialResult dial_result);
-    Status<FatalReactorError> handleDialError(detail::UpstreamDialError dial_error);
+    Status<FatalReactorError> handleDialError(net::DialError dial_error);
+    Status<FatalReactorError> handleConnectionFailure(ConnectionFailure failure);
 
     Status<std::error_code> handleShutdownRequest();
     Status<std::error_code> synchronizeTimer();
     Status<std::error_code> expireDeadlines(detail::Deadline now);
     Status<std::error_code> synchronizeListener();
+    std::optional<detail::Deadline> nextWakeup() const;
+    void suspendAdmission(const char* operation, std::error_code code, bool log_pressure = true);
     size_t pendingConnectionCount() const;
     bool canAdmit() const;
 
@@ -136,14 +151,14 @@ private:
     applySessionEventResult(detail::SessionId session_id,
                             const detail::SessionEventResult& event_result,
                             detail::IdleDeadline* idle);
-    Status<std::error_code> synchronizeSessionInterests(detail::SessionId session_id);
-    Status<std::error_code> synchronizeEndpoint(detail::SessionId session_id,
-                                                detail::EndpointRole role, detail::SourceId source_id,
-                                                const detail::EndpointInterests& interests);
+    Status<ConnectionFailure> synchronizeSessionInterests(detail::SessionId session_id);
+    Status<ConnectionFailure> synchronizeEndpoint(detail::SessionId session_id,
+                                                  detail::EndpointRole role,
+                                                  detail::SourceId source_id,
+                                                  const detail::EndpointInterests& interests);
 
     // Reactor shutdown
     Status<std::error_code> forceCloseAllSessions();
-    void performHardStop();
 
     // Reactor state tracking
     bool hasActiveSessions() const;
@@ -156,12 +171,15 @@ private:
     FileDescriptor timer_fd_;
     detail::Deadlines deadlines_;
     std::optional<detail::Deadline> armed_deadline_;
+    std::optional<detail::Deadline> admission_retry_at_;
+    bool pressure_reported_ = false;
     TimeoutConfig timeouts_;
     size_t max_connections_;
     size_t max_pending_connections_;
     // The reactor has at most one admission between ownership records at any instant.
     bool transient_admission_ = false;
     SteadyTimeSource time_source_;
+    net::AcceptOperations accept_operations_;
     absl::flat_hash_map<detail::SourceId, detail::PendingConnection> pending_connections_;
     std::optional<detail::ActiveListener> active_listener_;
     detail::UpstreamDialer upstream_dialer_;

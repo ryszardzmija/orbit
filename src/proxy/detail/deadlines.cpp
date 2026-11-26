@@ -5,7 +5,13 @@ namespace orbit::proxy::detail {
 void Deadlines::schedule(DeadlineKey key, Deadline at) {
     auto [it, inserted] = times_.try_emplace(key, at);
     if (inserted) {
-        ordered_.emplace(at, key);
+        try {
+            allocation_.check(AllocationPoint::DeadlineIndex);
+            ordered_.emplace(at, key);
+        } catch (const std::bad_alloc&) {
+            times_.erase(it);
+            throw;
+        }
     } else if (it->second != at) {
         auto entry = ordered_.extract({it->second, key});
         entry.value().first = at;

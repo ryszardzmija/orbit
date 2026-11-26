@@ -61,22 +61,29 @@ SessionEventResult closeSession(std::optional<std::string> error = std::nullopt)
 } // namespace
 
 SessionManager::SessionManager(const SessionManagerOptions& options,
-                               net::StreamOperations operations)
-    : send_buffer_factory_(options.send_buffer),
+                               net::StreamOperations operations, AllocationChecks allocation)
+    : send_buffer_factory_(options.send_buffer, allocation),
       forwarder_(Forwarder::create(options.forwarder_buffer_capacity)),
       sender_(PendingDataSender::create(options.sender_buffer_capacity)),
       operations_(operations) {}
 
 SessionId SessionManager::allocateId() { return session_id_generator_.getNextId(); }
 
-void SessionManager::add(SessionId id, FileDescriptor downstream, FileDescriptor upstream,
-                         SessionSourceIds source_ids) {
+std::optional<Session> SessionManager::prepare(FileDescriptor downstream,
+                                               FileDescriptor upstream) const {
+    try {
+        return Session{
+            .downstream = getInitialSessionEndpoint(std::move(downstream)),
+            .upstream = getInitialSessionEndpoint(std::move(upstream)),
+        };
+    } catch (const std::bad_alloc&) {
+        return std::nullopt;
+    }
+}
+
+void SessionManager::add(SessionId id, Session session, SessionSourceIds source_ids) {
     ManagedSession managed_session = {
-        .session =
-            {
-                .downstream = getInitialSessionEndpoint(std::move(downstream)),
-                .upstream = getInitialSessionEndpoint(std::move(upstream)),
-            },
+        .session = std::move(session),
         .source_ids = source_ids,
     };
 
@@ -124,7 +131,11 @@ SessionEventResult SessionManager::handleReadable(SessionId id, EndpointRole rol
     }
 
     if (auto result = forwarder_.forward(source, destination, idle, operations_); !result) {
-        return closeSession("Forwarding failed: " + result.error().message);
+        if (result.error().failed_op == FailedOp::Buffer &&
+            result.error().code == std::errc::not_enough_memory) {
+            return closeSession();
+        }
+        return closeSession("Forwarding failed: " + result.error().code.message());
     }
 
     if (auto result = halfCloseIfReady(source, destination, idle); !result) {

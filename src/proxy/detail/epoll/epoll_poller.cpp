@@ -12,16 +12,23 @@
 
 namespace orbit::proxy::detail {
 
-EpollPoller::EpollPoller(FileDescriptor epfd)
-    : epfd_(std::move(epfd)) {}
+EpollPoller::EpollPoller(FileDescriptor epfd, EpollOperations operations)
+    : epfd_(std::move(epfd)),
+      operations_(operations) {}
 
-Result<EpollPoller, std::error_code> EpollPoller::create() {
+Result<EpollPoller, std::error_code> EpollPoller::create(EpollOperations operations) {
     int epfd = epoll_create1(EPOLL_CLOEXEC);
     if (epfd == -1) {
         return std::unexpected(std::error_code(errno, std::system_category()));
     }
 
-    return EpollPoller(FileDescriptor(epfd));
+    return EpollPoller(FileDescriptor(epfd), operations);
+}
+
+int EpollPoller::control(int op, int fd, epoll_event* event) {
+    return operations_.control
+               ? operations_.control(operations_.context, epfd_.get(), op, fd, event)
+               : epoll_ctl(epfd_.get(), op, fd, event);
 }
 
 Status<std::error_code> EpollPoller::add(SourceId source_id, int fd, uint32_t interests) {
@@ -40,7 +47,7 @@ Status<std::error_code> EpollPoller::add(SourceId source_id, int fd, uint32_t in
         .data = {.u64 = source_id},
     };
 
-    if (int result = epoll_ctl(epfd_.get(), EPOLL_CTL_ADD, fd, &registration_data); result == -1) {
+    if (control(EPOLL_CTL_ADD, fd, &registration_data) == -1) {
         auto error = std::error_code(errno, std::system_category());
         watched_.erase(it);
         return std::unexpected(error);
@@ -90,8 +97,7 @@ Status<std::error_code> EpollPoller::setInterestsImpl(SourceId source_id, uint32
         .data = {.u64 = source_id},
     };
 
-    if (int result = epoll_ctl(epfd_.get(), EPOLL_CTL_MOD, watched_fd.fd, &registration_data);
-        result == -1) {
+    if (control(EPOLL_CTL_MOD, watched_fd.fd, &registration_data) == -1) {
         return std::unexpected(std::error_code(errno, std::system_category()));
     }
 
@@ -108,7 +114,7 @@ Status<std::error_code> EpollPoller::remove(SourceId id) {
         return std::unexpected(std::make_error_code(std::errc::no_such_file_or_directory));
     }
 
-    if (int result = epoll_ctl(epfd_.get(), EPOLL_CTL_DEL, it->second.fd, nullptr); result == -1) {
+    if (control(EPOLL_CTL_DEL, it->second.fd, nullptr) == -1) {
         return std::unexpected(std::error_code(errno, std::system_category()));
     }
 
@@ -128,7 +134,7 @@ Status<std::error_code> EpollPoller::retire(SourceId id) {
     int fd = it->second.fd;
     watched_.erase(it);
 
-    if (int result = epoll_ctl(epfd_.get(), EPOLL_CTL_DEL, fd, nullptr); result == -1) {
+    if (control(EPOLL_CTL_DEL, fd, nullptr) == -1 && errno != ENOENT) {
         return std::unexpected(std::error_code(errno, std::system_category()));
     }
 

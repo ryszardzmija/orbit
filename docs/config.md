@@ -35,3 +35,5 @@ Choose the two watermarks together when lowering the high watermark below the de
 The defaults allow up to 512 connection-owned descriptors and limit how many clients can tie up that capacity in upstream establishment. Size the limits for the deployment's process and system descriptor budgets and allow headroom for non-connection descriptors. If lowering the total below 64, also lower the pending limit.
 
 At either limit Orbit pauses acceptance. Waiting clients occupy the kernel listen backlog, so a client-side TCP connect can succeed before Orbit accepts it or opens its upstream connection. If the backlog fills, connection establishment can stall or fail under the host's TCP policy.
+
+Temporary descriptor or other supported resource pressure also pauses acceptance. Orbit reevaluates admission after a 100 ms cooldown using the shared timer. A connection that encounters a resource failure during establishment can be closed. See [failure handling](architecture.md#failure-handling).

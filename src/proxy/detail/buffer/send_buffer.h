@@ -4,6 +4,8 @@
 #include <memory>
 #include <span>
 
+#include "proxy/detail/allocation.h"
+
 namespace orbit::proxy::detail {
 
 class SendBuffer {
@@ -13,7 +15,8 @@ public:
         Paused,
     };
 
-    SendBuffer(size_t block_size, size_t high_watermark, size_t low_watermark);
+    SendBuffer(size_t block_size, size_t high_watermark, size_t low_watermark,
+               AllocationChecks allocation = {});
 
     SendBuffer(const SendBuffer&) = delete;
     SendBuffer& operator=(const SendBuffer&) = delete;
@@ -62,6 +65,7 @@ private:
     size_t block_size_;
     size_t high_watermark_;
     size_t low_watermark_;
+    AllocationChecks allocation_;
 
     std::unique_ptr<ListNode> head_ = nullptr;
     ListNode* tail_ = nullptr;

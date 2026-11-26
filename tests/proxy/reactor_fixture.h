@@ -24,10 +24,11 @@ protected:
     void TearDown() override { reactor.reset(); }
 
     void createReactor(TimeoutConfig timeouts, SteadyTimeSource time_source = {},
-                       net::StreamOperations stream_operations = {},
-                       ResourceConfig resources = {}) {
+                       net::StreamOperations stream_operations = {}, ResourceConfig resources = {},
+                       ReactorOperations operations = {}) {
+        operations.stream = stream_operations;
         auto result = ProxyReactor::createImpl({"127.0.0.1", 0}, {"127.0.0.1", 1}, timeouts,
-                                               resources, time_source, stream_operations);
+                                               resources, time_source, operations);
         ASSERT_TRUE(result) << result.error().message;
         reactor.emplace(std::move(*result));
     }
@@ -36,7 +37,7 @@ protected:
         auto added = reactor->addSession(std::move(upstream.local), std::move(downstream.local),
                                          detail::Deadline::max());
         if (!added) {
-            throw std::runtime_error(added.error().message);
+            throw std::system_error(added.error().code);
         }
         synchronizeAdmission();
         return reactor->session_manager_.sourceIds(*added);
@@ -64,7 +65,7 @@ protected:
     detail::SourceId installPending(detail::PendingConnection pending) {
         auto added = reactor->registerPendingConnection(std::move(pending));
         if (!added) {
-            throw std::system_error(added.error());
+            throw std::system_error(added.error().code);
         }
         synchronizeAdmission();
         return *added;
@@ -107,7 +108,13 @@ protected:
     }
     bool stopped() const { return reactor->shouldStop(); }
     int timerFd() const { return reactor->timer_fd_.get(); }
-    auto handleTimer() { return reactor->handleTimer({}); }
+    auto handleTimer() {
+        auto result = reactor->handleTimer({});
+        if (result) {
+            synchronizeAdmission();
+        }
+        return result;
+    }
 
     detail::SessionId sessionFor(detail::SourceId source) const {
         return std::get<detail::EndpointRegistration>(reactor->sources_.find(source).value())
@@ -127,9 +134,15 @@ protected:
         return reactor->session_manager_.sourceIds(*ids.begin());
     }
     auto dialResult(detail::UpstreamDialResult result) {
-        return reactor->handleDialResult(std::move(result));
+        auto status = reactor->handleDialResult(std::move(result));
+        if (status) {
+            synchronizeAdmission();
+        }
+        return status;
     }
     auto nextDeadline() const { return reactor->deadlines_.next(); }
+    auto nextWakeup() const { return reactor->nextWakeup(); }
+    auto retryAt() const { return reactor->admission_retry_at_; }
     auto expire(detail::Deadline now) {
         auto result = reactor->expireDeadlines(now);
         if (result) {
