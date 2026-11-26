@@ -27,11 +27,8 @@ Source baseline is `e3aec7b`. A source-confirmed finding follows from the implem
 
 ## LIM-005 — Admission and application buffer limits are absent
 
-- **Classification and priority** — Functional limitation, high.
-- **Source and evidence** — [`ProxyReactor::handleListener` and `registerPendingConnection`](../src/proxy/proxy.cpp) and [`SessionManager::add`](../src/proxy/detail/session/session_manager.cpp) have no admission cap. [`SendBuffer::write`](../src/proxy/detail/buffer/send_buffer.cpp) uses flow-control watermarks and allocates blocks on demand. There is no per-direction hard cap, strict per-session allocation budget or global accounting across queues. The requested listen backlog of 64 and the batch size of 16 regulate distinct parts of acceptance.
-- **Conditions and impact** — Concurrent sessions, accumulated in-progress dials or slow receivers grow fd demand, userspace allocations and kernel TCP queue usage. Logical queue length omits block slack, node overhead and allocator retention. OS fd and memory limits can eventually constrain growth, with exhaustion behavior described in [LIM-013](#lim-013--resource-exhaustion-can-stop-the-reactor).
-- **Verification** — Source-confirmed. `SendBufferTest.WriteCanExceedHighWatermarkInSingleCall` exercises logical overshoot. No aggregate resource bound is established.
-- **Follow-up** — The resource-management milestone should specify established and pending caps, hard buffer admission rules, global accounting, and behavior during overload. Measure application allocations, process memory, and kernel socket memory independently.
+- **M2.1 disposition** — Both directions enforce strict logical limits and account for allocated blocks. The sum of the two directional bounds limits the payload allocation attributable to one session.
+- **Remaining scope** — Connection admission and aggregate payload capacity still require independent limits. Node overhead, process memory and kernel TCP queue usage are outside the directional bounds. See [LIM-013](#lim-013--resource-exhaustion-can-stop-the-reactor) for resource failure handling.
 
 ## LIM-006 — Pending dials have mixed graceful shutdown behavior
 
@@ -39,11 +36,8 @@ Source baseline is `e3aec7b`. A source-confirmed finding follows from the implem
 
 ## LIM-007 — SendBufferConfig is disconnected from runtime
 
-- **Classification and priority** — Functional limitation, low.
-- **Source and evidence** — [`Config::send_buffer` and `SendBufferConfig::max_buffer_size`](../src/config/config.h) declare a 64 KiB default. [`parseConfig`](../src/config/config.cpp) exposes no buffer option, [`main`](../src/main.cpp) does not pass that field to the reactor, and [`ProxyReactor`](../src/proxy/proxy.h) sets hardcoded block and watermark values. The factory receives the latter values through `SessionManagerOptions`.
-- **Conditions and impact** — Changing the config structure's default or setting its field in memory has no runtime effect. The field name suggests a strict capacity where the live settings use hysteresis.
-- **Verification** — Source-confirmed. Buffer unit tests instantiate `SendBuffer` directly and do not validate runtime config wiring.
-- **Follow-up** — Resolve the unused field when defining the memory policy. If introducing operator settings, validate relationships and document whether each controls logical occupancy, hard admission, or allocation accounting.
+- **Disposition** — Resolved in M2.1. The old unused field was removed. Validated resource configuration supplies the high and low watermarks to both runtime queues.
+- **Verification** — Configuration tests cover numeric ranges, relationships and precedence. A controlled reactor test verifies the configured receive limit, hysteresis, partial-send FIFO and would-block behavior.
 
 ## LIM-008 — Source identities have no wrap policy
 

@@ -3,6 +3,7 @@
 #include <chrono>
 #include <fcntl.h>
 #include <optional>
+#include <string>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -16,6 +17,61 @@
 namespace orbit::proxy {
 
 using namespace std::chrono_literals;
+
+TEST_F(ProxyReactorTest, ConfiguredWatermarksLimitReadsAndPreserveAPartialSendSuffix) {
+    struct Io {
+        std::vector<size_t> receive_sizes;
+        int sends = 0;
+    } io;
+    createReactor({}, {},
+                  {
+                      .context = &io,
+                      .receive =
+                          [](void* context, int fd, void* data, size_t size, int flags) {
+                              static_cast<Io*>(context)->receive_sizes.push_back(size);
+                              return recv(fd, data, size, flags);
+                          },
+                      .send =
+                          [](void* context, int fd, const void* data, size_t size, int flags) {
+                              int attempt = ++static_cast<Io*>(context)->sends;
+                              if (attempt == 1) {
+                                  size = 2;
+                              } else if (attempt == 2) {
+                                  errno = EAGAIN;
+                                  return ssize_t{-1};
+                              }
+                              return send(fd, data, size, flags);
+                          },
+                  },
+                  {.buffer_high_watermark = 4099, .buffer_low_watermark = 1});
+    auto source = test::socketPair();
+    auto dest = test::socketPair();
+    auto ids = install(source, dest);
+    std::string payload;
+    for (size_t i = 0; i < 4110; ++i) {
+        payload += static_cast<char>('a' + i % 26);
+    }
+    ASSERT_EQ(ssize_t(payload.size()), send(source.peer.get(), payload.data(), payload.size(), 0));
+    ASSERT_TRUE(dispatch({ids.downstream, EPOLLIN}));
+    ASSERT_TRUE(dispatch({ids.downstream, EPOLLIN}));
+    EXPECT_FALSE(interests(ids.downstream).downstream.readable);
+    ASSERT_TRUE(dispatch({ids.downstream, EPOLLIN}));
+    EXPECT_EQ((std::vector<size_t>{4096, 5}), io.receive_sizes);
+    EXPECT_EQ(1, io.sends);
+
+    // A blocked write and then a 4096-byte write leave the queue above its configured low mark.
+    ASSERT_TRUE(dispatch({ids.upstream, EPOLLOUT}));
+    EXPECT_FALSE(interests(ids.downstream).downstream.readable);
+    ASSERT_TRUE(dispatch({ids.upstream, EPOLLOUT}));
+    EXPECT_FALSE(interests(ids.downstream).downstream.readable);
+    ASSERT_TRUE(dispatch({ids.upstream, EPOLLOUT}));
+    EXPECT_TRUE(interests(ids.downstream).downstream.readable);
+    ASSERT_TRUE(dispatch({ids.downstream, EPOLLIN}));
+
+    std::string received(payload.size(), '\0');
+    ASSERT_EQ(ssize_t(received.size()), recv(dest.peer.get(), received.data(), received.size(), 0));
+    EXPECT_EQ(payload, received);
+}
 
 TEST_F(ProxyReactorTest, RetiredSourceCannotDispatchToAReusedDescriptor) {
     auto downstream = test::socketPair();

@@ -1,6 +1,6 @@
 # Configuration
 
-Orbit accepts options on the command line or through the corresponding environment variables. An explicit command-line value takes precedence over that option's environment value. Empty environment values are skipped. Values for `ORBIT_LISTEN_PORT` or `ORBIT_LOG_LEVEL` that fail their CLI11 validators are silently skipped, leaving the defaults. Invalid endpoint syntax in a supplied upstream list is a parsing error.
+Orbit accepts options on the command line or through the corresponding environment variables. An explicit command-line value takes precedence over that option's environment value. Invalid resource values, including empty values, fail startup. Empty environment values for other options are skipped. Values for `ORBIT_LISTEN_PORT` or `ORBIT_LOG_LEVEL` that fail their CLI11 validators are silently skipped, leaving the defaults. Invalid endpoint syntax in a supplied upstream list is a parsing error.
 
 | Option | Environment variable | Default and validation |
 | --- | --- | --- |
@@ -9,6 +9,8 @@ Orbit accepts options on the command line or through the corresponding environme
 | `--upstream` | `ORBIT_UPSTREAMS` | Required. Supply at least one endpoint. Repeat the option or use a comma-separated list. |
 | `--connect-timeout-ms` | `ORBIT_CONNECT_TIMEOUT_MS` | `10000` (10 seconds). Decimal milliseconds from 1 through 2147483647. Invalid CLI or environment values fail startup. |
 | `--idle-timeout-ms` | `ORBIT_IDLE_TIMEOUT_MS` | `0` (disabled). Decimal milliseconds from 0 through 2147483647. Invalid CLI or environment values fail startup. |
+| `--buffer-high-watermark-bytes` | `ORBIT_BUFFER_HIGH_WATERMARK_BYTES` | `262144` (256 KiB). Hard maximum logical queued payload in each direction. Decimal bytes from 4096 through 16777216. |
+| `--buffer-low-watermark-bytes` | `ORBIT_BUFFER_LOW_WATERMARK_BYTES` | `196608` (192 KiB). A paused direction resumes at or below this occupancy. Decimal bytes from 0 through one less than the selected high watermark. |
 | `--log-level` | `ORBIT_LOG_LEVEL` | `info`. Accepted names are `trace`, `debug`, `info`, `warn`, `error`, `critical`, and `off`, case-insensitively. CLI11 also accepts their numeric values 0 through 6 in that order. |
 
 Use `HOST:PORT` for DNS names and IPv4 addresses and `[ADDRESS]:PORT` for IPv6. A host must be nonempty. An upstream port must consist of decimal digits with a value from 1 through 65535. Parsing checks endpoint syntax. Resolution and binding take place during startup.
@@ -26,4 +28,4 @@ When enabled, the idle interval starts on session establishment. A positive sock
 
 Graceful shutdown has a separate fixed 30-second deadline starting at the first processed shutdown request. An established session can reach its own idle deadline earlier. A second shutdown request forces closure immediately.
 
-Buffer watermarks are set in the reactor. The internal `Config::send_buffer` field has no CLI or environment option and does not control runtime buffering. See [upstream selection and dialing](architecture.md#upstream-selection-and-dialing) and [forwarding and backpressure](architecture.md#forwarding-and-backpressure).
+Choose the two watermarks together when lowering the high watermark below the default low watermark. The reactor allocates payload in 4 KiB blocks. See [forwarding and backpressure](architecture.md#forwarding-and-backpressure) for the bound on allocated capacity.

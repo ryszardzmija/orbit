@@ -4,6 +4,7 @@
 #include <cassert>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <span>
 #include <stdexcept>
@@ -46,6 +47,13 @@ SendBuffer::SendBuffer(size_t block_size, size_t high_watermark, size_t low_wate
                                     std::to_string(block_size) +
                                     " high_watermark=" + std::to_string(high_watermark));
     }
+    // Live blocks cover the queue plus up to block_size - 1 consumed bytes at its front.
+    constexpr size_t max_size = std::numeric_limits<size_t>::max();
+    const size_t head_slack = block_size - 1;
+    if (high_watermark > max_size - head_slack ||
+        high_watermark + head_slack > max_size - max_size % block_size) {
+        throw std::invalid_argument("Directional payload block capacity can overflow");
+    }
 }
 
 SendBuffer::~SendBuffer() {
@@ -53,7 +61,7 @@ SendBuffer::~SendBuffer() {
         // Destroy the current node and take the resources of the next one.
         // This prevents the class from relying on cascading destructor calls
         // (which for very deep buffers could cause stack overflow) for cleanup.
-        head_ = head_->takeNext();
+        discardBlock();
     }
 }
 
@@ -61,10 +69,17 @@ bool SendBuffer::empty() const { return size_ == 0; }
 
 SendBuffer::BufferStatus SendBuffer::status() const { return status_; }
 
-void SendBuffer::write(std::span<const uint8_t> data) {
-    assert(status_ == BufferStatus::Accepting);
+size_t SendBuffer::remainingCapacity() const {
+    return status_ == BufferStatus::Accepting ? high_watermark_ - size_ : 0;
+}
+
+bool SendBuffer::write(std::span<const uint8_t> data) {
+    if (data.size() > remainingCapacity()) {
+        return false;
+    }
     writeData(data);
     updateStatus();
+    return true;
 }
 
 void SendBuffer::writeData(std::span<const uint8_t> data) {
@@ -90,6 +105,7 @@ void SendBuffer::addBlock() {
         tail_ = tail_->next();
     }
     write_pos_ = 0;
+    allocated_capacity_ += block_size_;
 }
 
 uint8_t* SendBuffer::getDestPtr() { return tail_->data().subspan(write_pos_).data(); }
@@ -119,6 +135,9 @@ size_t SendBuffer::copy(std::span<uint8_t> dest) {
 
 void SendBuffer::consume(size_t num_bytes) {
     consumeData(num_bytes);
+    if (empty() && head_ != nullptr) {
+        discardBlock();
+    }
     updateStatus();
 }
 
@@ -142,14 +161,16 @@ void SendBuffer::consumeData(size_t num_bytes) {
 
 void SendBuffer::discardBlock() {
     head_ = head_->takeNext();
+    allocated_capacity_ -= block_size_;
     if (head_ == nullptr) {
         tail_ = nullptr;
+        write_pos_ = 0;
     }
     read_pos_ = 0;
 }
 
 void SendBuffer::updateStatus() {
-    if (status_ == BufferStatus::Accepting && size_ >= high_watermark_) {
+    if (status_ == BufferStatus::Accepting && size_ == high_watermark_) {
         status_ = BufferStatus::Paused;
     } else if (status_ == BufferStatus::Paused && size_ <= low_watermark_) {
         status_ = BufferStatus::Accepting;

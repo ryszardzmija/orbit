@@ -1,5 +1,6 @@
 #include "proxy/detail/forwarding.h"
 
+#include <algorithm>
 #include <cassert>
 #include <memory>
 
@@ -22,10 +23,14 @@ Status<ForwardError> Forwarder::forward(SessionEndpoint& source, SessionEndpoint
                                         IdleDeadline* idle,
                                         const net::StreamOperations& operations) {
     assert(destination.state.send_buffer != nullptr);
-    assert(destination.state.send_buffer->status() == SendBuffer::BufferStatus::Accepting);
+    auto& queue = *destination.state.send_buffer;
+    size_t receive_capacity = std::min(capacity_, queue.remainingCapacity());
+    if (receive_capacity == 0) {
+        return {};
+    }
 
     auto recv_result =
-        net::tryRecv(source.fd.get(), std::span<uint8_t>(buf_.get(), capacity_), operations);
+        net::tryRecv(source.fd.get(), std::span<uint8_t>(buf_.get(), receive_capacity), operations);
     if (!recv_result) {
         return std::unexpected(ForwardError{
             .message = recv_result.error().message(),
@@ -42,8 +47,8 @@ Status<ForwardError> Forwarder::forward(SessionEndpoint& source, SessionEndpoint
         return {};
     }
 
-    size_t bytes_read = recv_result.value().bytes_received;
-    if (idle && !idle->recordTransfer(bytes_read)) {
+    std::span<const uint8_t> unsent(buf_.get(), recv_result->bytes_received);
+    if (idle && !idle->recordTransfer(unsent.size())) {
         return {};
     }
 
@@ -51,14 +56,12 @@ Status<ForwardError> Forwarder::forward(SessionEndpoint& source, SessionEndpoint
     // the data would be reordered.
     // Queue residual input even for an empty destination. Its level-triggered writable
     // event continues the drain after this single receive.
-    if (!source.state.hungUp() && destination.state.send_buffer->empty()) {
+    if (!source.state.hungUp() && queue.empty()) {
         if (idle && !idle->canStartIo()) {
             return {};
         }
-        auto send_result = net::trySend(destination.fd.get(),
-                                        std::span<uint8_t>(buf_.get(), bytes_read), operations);
+        auto send_result = net::trySend(destination.fd.get(), unsent, operations);
         if (!send_result) {
-            bufferData(destination, bytes_read);
             return std::unexpected(ForwardError{
                 .message = send_result.error().message(),
                 .failed_op = FailedOp::Send,
@@ -69,25 +72,16 @@ Status<ForwardError> Forwarder::forward(SessionEndpoint& source, SessionEndpoint
         if (idle && !idle->recordTransfer(bytes_written)) {
             return {};
         }
-        if (bytes_written != bytes_read) {
-            storeUnsent(destination, bytes_read, bytes_written);
-        }
-    } else {
-        bufferData(destination, bytes_read);
+        unsent = unsent.subspan(bytes_written);
     }
 
+    if (!queue.write(unsent)) {
+        return std::unexpected(ForwardError{
+            .message = "Directional send buffer rejected received bytes",
+            .failed_op = FailedOp::Send,
+        });
+    }
     return {};
-}
-
-void Forwarder::bufferData(SessionEndpoint& destination, size_t bytes_read) {
-    auto to_buffer = std::span<const uint8_t>(buf_.get(), bytes_read);
-    destination.state.send_buffer->write(to_buffer);
-}
-
-void Forwarder::storeUnsent(SessionEndpoint& destination, size_t bytes_read, size_t bytes_written) {
-    auto to_buffer =
-        std::span<const uint8_t>(buf_.get() + bytes_written, bytes_read - bytes_written);
-    destination.state.send_buffer->write(to_buffer);
 }
 
 } // namespace orbit::proxy::detail

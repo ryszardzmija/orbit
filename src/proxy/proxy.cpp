@@ -68,16 +68,16 @@ uint32_t getEventMask(const detail::EndpointInterests& interests) {
 
 ProxyReactor::ProxyReactor(detail::EpollPoller poller, FileDescriptor shutdown_signal_fd,
                            FileDescriptor timer_fd, detail::UpstreamDialer upstream_dialer,
-                           TimeoutConfig timeouts, SteadyTimeSource time_source,
-                           net::StreamOperations stream_operations)
+                           TimeoutConfig timeouts, ResourceConfig resources,
+                           SteadyTimeSource time_source, net::StreamOperations stream_operations)
     : poller_(std::move(poller)),
       session_manager_(
           detail::SessionManagerOptions{
               .send_buffer =
                   {
-                      .block_size = block_size,
-                      .high_watermark = high_watermark,
-                      .low_watermark = low_watermark,
+                      .block_size = ResourceConfig::payload_block_size,
+                      .high_watermark = resources.buffer_high_watermark,
+                      .low_watermark = resources.buffer_low_watermark,
                   },
               .forwarder_buffer_capacity = forwarder_buf_cap,
               .sender_buffer_capacity = sender_buf_cap,
@@ -91,19 +91,24 @@ ProxyReactor::ProxyReactor(detail::EpollPoller poller, FileDescriptor shutdown_s
 
 Result<ProxyReactor, ProxyCreateError>
 ProxyReactor::create(const net::ListenSocketAddress& listen_address,
-                     const net::ResolutionEndpoint& upstream_address, TimeoutConfig timeouts) {
-    return createImpl(listen_address, upstream_address, timeouts, {}, {});
+                     const net::ResolutionEndpoint& upstream_address, TimeoutConfig timeouts,
+                     ResourceConfig resources) {
+    return createImpl(listen_address, upstream_address, timeouts, resources, {}, {});
 }
 
 Result<ProxyReactor, ProxyCreateError>
 ProxyReactor::createImpl(const net::ListenSocketAddress& listen_address,
                          const net::ResolutionEndpoint& upstream_address, TimeoutConfig timeouts,
-                         SteadyTimeSource time_source, net::StreamOperations stream_operations) {
+                         ResourceConfig resources, SteadyTimeSource time_source,
+                         net::StreamOperations stream_operations) {
     if (timeouts.connect.count() < 1 || timeouts.connect > TimeoutConfig::maximum) {
         return std::unexpected(ProxyCreateError{"Invalid connection timeout"});
     }
     if (timeouts.idle.count() < 0 || timeouts.idle > TimeoutConfig::maximum) {
         return std::unexpected(ProxyCreateError{"Invalid idle timeout"});
+    }
+    if (!resources.validBufferWatermarks()) {
+        return std::unexpected(ProxyCreateError{"Invalid directional buffer watermarks"});
     }
     auto poller_create_result = detail::EpollPoller::create();
     if (!poller_create_result) {
@@ -136,7 +141,7 @@ ProxyReactor::createImpl(const net::ListenSocketAddress& listen_address,
     net::Listener listener = std::move(listener_create_result.value());
 
     ProxyReactor reactor(std::move(poller), std::move(signal_fd), std::move(timer_fd),
-                         std::move(dialer), timeouts, time_source, stream_operations);
+                         std::move(dialer), timeouts, resources, time_source, stream_operations);
 
     auto listener_register_result = reactor.registerListener(listener.fd());
     if (!listener_register_result) {

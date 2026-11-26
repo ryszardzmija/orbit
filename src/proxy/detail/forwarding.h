@@ -33,9 +33,6 @@ public:
 private:
     explicit Forwarder(size_t capacity);
 
-    void storeUnsent(SessionEndpoint& destination, size_t bytes_read, size_t bytes_written);
-    void bufferData(SessionEndpoint& destination, size_t bytes_read);
-
     std::unique_ptr<uint8_t[]> buf_;
     size_t capacity_;
 };

@@ -21,9 +21,10 @@ protected:
     void TearDown() override { reactor.reset(); }
 
     void createReactor(TimeoutConfig timeouts, SteadyTimeSource time_source = {},
-                       net::StreamOperations stream_operations = {}) {
+                       net::StreamOperations stream_operations = {},
+                       ResourceConfig resources = {}) {
         auto result = ProxyReactor::createImpl({"127.0.0.1", 0}, {"127.0.0.1", 1}, timeouts,
-                                               time_source, stream_operations);
+                                               resources, time_source, stream_operations);
         ASSERT_TRUE(result) << result.error().message;
         reactor.emplace(std::move(*result));
     }
