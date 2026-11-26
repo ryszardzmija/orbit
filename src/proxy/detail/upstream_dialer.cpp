@@ -13,12 +13,16 @@ namespace orbit::proxy::detail {
 
 namespace {
 
-std::expected<void, net::DialError> checkConnectCompletion(int fd) {
+std::expected<void, net::DialError> checkConnectCompletion(int fd,
+                                                           const net::DialOperations& operations) {
     int socket_error = 0;
     socklen_t error_size = sizeof(socket_error);
 
-    if (int result = getsockopt(fd, SOL_SOCKET, SO_ERROR, &socket_error, &error_size);
-        result == -1) {
+    const int result = operations.getsockopt
+                           ? operations.getsockopt(operations.context, fd, SOL_SOCKET, SO_ERROR,
+                                                   &socket_error, &error_size)
+                           : getsockopt(fd, SOL_SOCKET, SO_ERROR, &socket_error, &error_size);
+    if (result == -1) {
         return std::unexpected(net::DialError{std::error_code(errno, std::system_category()),
                                               net::DialFailedOp::CompletionQuery});
     }
@@ -81,7 +85,7 @@ UpstreamDialer::advanceDialAttempt(PendingConnection pending_connection,
         return std::unexpected(timedOut());
     }
     auto completion_result =
-        checkConnectCompletion(pending_connection.attempted_connection_fd->get());
+        checkConnectCompletion(pending_connection.attempted_connection_fd->get(), operations_);
 
     if (completion_result) {
         return UpstreamDialConnected{

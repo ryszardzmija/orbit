@@ -95,11 +95,37 @@ private:
         SessionClosed,
     };
 
+    class AdmissionReservation {
+    public:
+        explicit AdmissionReservation(bool& transient);
+        AdmissionReservation(AdmissionReservation&& other) noexcept;
+        AdmissionReservation& operator=(AdmissionReservation&&) = delete;
+        ~AdmissionReservation();
+
+        void release() noexcept;
+
+    private:
+        bool* transient_;
+    };
+
+    struct ExtractedPending {
+        // Destruction closes the sockets before releasing their admission.
+        AdmissionReservation admission;
+        detail::PendingConnection connection;
+    };
+
     using DeferredDials = std::list<detail::SourceId>;
+
+    enum class DeferredDialKind { SocketAttempt, CompletionQuery };
+
+    struct QueuedDial {
+        DeferredDialKind kind;
+        DeferredDials::iterator position;
+    };
 
     struct PendingEntry {
         detail::PendingConnection connection;
-        std::optional<DeferredDials::iterator> deferred;
+        std::optional<QueuedDial> deferred;
         bool watched;
     };
 
@@ -123,7 +149,7 @@ private:
     Result<detail::SourceId, std::error_code> registerTimerEvent();
     Result<detail::SourceId, ConnectionFailure>
     registerPendingConnection(detail::PendingConnection pending_connection,
-                              bool interrupted = false);
+                              AdmissionReservation& admission, bool interrupted = false);
 
     Result<detail::SourceId, std::error_code>
     registerReactorSource(int fd, uint32_t initial_events,
@@ -131,11 +157,13 @@ private:
     Status<std::error_code> unregisterReactorSource(detail::SourceId id);
 
     // Session lifecycle
-    Result<detail::SessionId, ConnectionFailure>
-    addSession(FileDescriptor upstream_fd, FileDescriptor downstream_fd, detail::Deadline deadline);
+    Result<detail::SessionId, ConnectionFailure> addSession(FileDescriptor upstream_fd,
+                                                            FileDescriptor downstream_fd,
+                                                            detail::Deadline deadline,
+                                                            AdmissionReservation& admission);
     Status<std::error_code> closeSession(detail::SessionId session_id);
 
-    Result<detail::PendingConnection, std::error_code> takePending(detail::SourceId id);
+    Result<ExtractedPending, std::error_code> takePending(detail::SourceId id);
     Status<std::error_code> cancelPendingConnections();
 
     // Event handlers
@@ -153,18 +181,21 @@ private:
     Status<FatalReactorError> handlePendingConnection(detail::SourceId id, size_t& attempts_left);
 
     // Handlers for handlePendingConnection()
-    Status<FatalReactorError> handleDialResult(detail::UpstreamDialResult dial_result);
+    Status<FatalReactorError> handleDialResult(detail::UpstreamDialResult dial_result,
+                                               AdmissionReservation& admission);
     Status<FatalReactorError> handleDialError(net::DialError dial_error);
     Status<FatalReactorError> handleConnectionFailure(ConnectionFailure failure);
     Status<FatalReactorError> resumeDeferredDials();
     bool hasRunnableDials() const;
+    DeferredDials& deferredQueue(DeferredDialKind kind);
+    QueuedDial enqueueDeferredDial(detail::SourceId id, const detail::PendingConnection& pending);
 
     Status<std::error_code> handleShutdownRequest();
     Status<std::error_code> synchronizeTimer();
     Status<FatalReactorError> expireDeadlines(detail::Deadline now);
     Status<std::error_code> synchronizeListener();
     std::optional<detail::Deadline> nextWakeup() const;
-    void suspendAdmission(const char* operation, std::error_code code, bool log_pressure = true);
+    void suspendAdmission(const char* operation, std::error_code code, bool report = true);
     size_t pendingConnectionCount() const;
     bool canAdmit() const;
 
@@ -194,7 +225,7 @@ private:
     detail::Deadlines deadlines_;
     std::optional<detail::Deadline> armed_deadline_;
     std::optional<detail::Deadline> admission_retry_at_;
-    bool pressure_reported_ = false;
+    bool admission_pause_reported_ = false;
     TimeoutConfig timeouts_;
     size_t max_connections_;
     size_t max_pending_connections_;
@@ -203,7 +234,8 @@ private:
     SteadyTimeSource time_source_;
     net::AcceptOperations accept_operations_;
     detail::AllocationChecks allocation_;
-    DeferredDials deferred_dials_;
+    DeferredDials deferred_attempts_;
+    DeferredDials deferred_completions_;
     absl::flat_hash_map<detail::SourceId, PendingEntry> pending_connections_;
     std::optional<detail::ActiveListener> active_listener_;
     detail::UpstreamDialer upstream_dialer_;

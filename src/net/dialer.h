@@ -37,11 +37,13 @@ enum class DialFailureKind { Candidate, Timeout, Pressure, Infrastructure };
 DialFailureKind classifyDialError(DialError error);
 const char* dialOperationName(DialFailedOp operation);
 
-// Optional syscall overrides borrow their context and follow the socket/connect errno conventions.
+// Optional syscall overrides borrow their context and follow the syscall errno conventions.
 struct DialOperations {
     void* context = nullptr;
     int (*socket)(void*, int domain, int type, int protocol) = nullptr;
     int (*connect)(void*, int fd, const sockaddr* address, socklen_t length) = nullptr;
+    int (*getsockopt)(void*, int fd, int level, int option, void* value,
+                      socklen_t* length) = nullptr;
 };
 
 std::expected<DialSuccess, DialError> dial(const SocketAddress& address,

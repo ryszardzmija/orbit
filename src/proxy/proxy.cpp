@@ -1,6 +1,5 @@
 #include "proxy/proxy.h"
 
-#include <algorithm>
 #include <cassert>
 #include <cstdint>
 #include <expected>
@@ -33,30 +32,18 @@ struct overloaded : Ts... {
     using Ts::operator()...;
 };
 
-// Reserves both a total and an establishment slot until a map takes ownership or setup fails.
-struct AdmissionReservation {
-    explicit AdmissionReservation(bool& transient)
-        : transient(transient) {
-        assert(!transient);
-        transient = true;
-    }
+enum class AcceptFailure { Connection, Backoff, Infrastructure };
 
-    AdmissionReservation(const AdmissionReservation&) = delete;
-    AdmissionReservation& operator=(const AdmissionReservation&) = delete;
-    ~AdmissionReservation() { transient = false; }
-
-    bool& transient;
-};
-
-enum class FailureKind { Connection, Pressure, Infrastructure };
-
-FailureKind classifyAcceptError(const std::error_code& error) {
+AcceptFailure classifyAcceptError(const std::error_code& error) {
     switch (error.value()) {
     case EMFILE:
     case ENFILE:
     case ENOMEM:
     case ENOBUFS:
-        return FailureKind::Pressure;
+    // A permission check can fail before the protocol dequeues a connection.
+    case EPERM:
+    case EACCES:
+        return AcceptFailure::Backoff;
     case ECONNABORTED:
     case ENETDOWN:
     case EPROTO:
@@ -66,10 +53,9 @@ FailureKind classifyAcceptError(const std::error_code& error) {
     case EHOSTUNREACH:
     case EOPNOTSUPP:
     case ENETUNREACH:
-    case EPERM:
-        return FailureKind::Connection;
+        return AcceptFailure::Connection;
     default:
-        return FailureKind::Infrastructure;
+        return AcceptFailure::Infrastructure;
     }
 }
 
@@ -108,6 +94,24 @@ uint32_t getEventMask(const detail::EndpointInterests& interests) {
 }
 
 } // namespace
+
+ProxyReactor::AdmissionReservation::AdmissionReservation(bool& transient)
+    : transient_(&transient) {
+    assert(!transient);
+    transient = true;
+}
+
+ProxyReactor::AdmissionReservation::AdmissionReservation(AdmissionReservation&& other) noexcept
+    : transient_(std::exchange(other.transient_, nullptr)) {}
+
+ProxyReactor::AdmissionReservation::~AdmissionReservation() { release(); }
+
+void ProxyReactor::AdmissionReservation::release() noexcept {
+    if (transient_) {
+        *transient_ = false;
+        transient_ = nullptr;
+    }
+}
 
 ProxyReactor::ProxyReactor(detail::EpollPoller poller, FileDescriptor shutdown_signal_fd,
                            FileDescriptor timer_fd, detail::UpstreamDialer upstream_dialer,
@@ -394,7 +398,7 @@ Result<detail::SourceId, std::error_code> ProxyReactor::registerTimerEvent() {
 
 Result<detail::SourceId, ConnectionFailure>
 ProxyReactor::registerPendingConnection(detail::PendingConnection pending_connection,
-                                        bool interrupted) {
+                                        AdmissionReservation& admission, bool interrupted) {
     const bool watched = pending_connection.attempted_connection_fd.has_value() && !interrupted;
     Result<detail::SourceId, std::error_code> registered =
         watched ? registerReactorSource(pending_connection.attempted_connection_fd->get(), EPOLLOUT,
@@ -406,7 +410,7 @@ ProxyReactor::registerPendingConnection(detail::PendingConnection pending_connec
     }
     const detail::DeadlineKey key{detail::DeadlineKind::Connect, *registered};
     const detail::DeadlineKey retry_key{detail::DeadlineKind::DialRetry, *registered};
-    std::optional<DeferredDials::iterator> deferred;
+    std::optional<QueuedDial> deferred;
     ConnectionOperation allocation = ConnectionOperation::AllocateDeadline;
     try {
         deadlines_.schedule(key, pending_connection.deadline);
@@ -414,8 +418,7 @@ ProxyReactor::registerPendingConnection(detail::PendingConnection pending_connec
             deadlines_.schedule(retry_key, time_source_.now() + interrupted_io_retry_interval);
         } else if (!watched) {
             allocation = ConnectionOperation::AllocateDeferredDial;
-            allocation_.check(detail::AllocationPoint::DeferredDial);
-            deferred = deferred_dials_.insert(deferred_dials_.end(), *registered);
+            deferred = enqueueDeferredDial(*registered, pending_connection);
         }
     } catch (const std::bad_alloc&) {
         deadlines_.cancel(key);
@@ -431,27 +434,30 @@ ProxyReactor::registerPendingConnection(detail::PendingConnection pending_connec
     // Abseil table allocation failures remain fatal.
     pending_connections_.emplace(*registered,
                                  PendingEntry{std::move(pending_connection), deferred, watched});
-    transient_admission_ = false;
+    admission.release();
     return *registered;
 }
 
-Result<detail::PendingConnection, std::error_code> ProxyReactor::takePending(detail::SourceId id) {
+Result<ProxyReactor::ExtractedPending, std::error_code>
+ProxyReactor::takePending(detail::SourceId id) {
     auto it = pending_connections_.find(id);
     assert(it != pending_connections_.end());
     deadlines_.cancel({detail::DeadlineKind::Connect, id});
     deadlines_.cancel({detail::DeadlineKind::DialRetry, id});
     Status<std::error_code> retired;
     if (auto deferred = it->second.deferred) {
-        deferred_dials_.erase(*deferred);
+        deferredQueue(deferred->kind).erase(deferred->position);
     } else if (it->second.watched) {
         retired = unregisterReactorSource(id);
     }
-    auto pending = std::move(it->second.connection);
+    // Transfer the charge with the owner. No callback or admission check runs during the move.
+    ExtractedPending extracted{AdmissionReservation(transient_admission_),
+                               std::move(it->second.connection)};
     pending_connections_.erase(it);
     if (!retired) {
         return std::unexpected(retired.error());
     }
-    return pending;
+    return extracted;
 }
 
 Status<std::error_code> ProxyReactor::cancelPendingConnections() {
@@ -467,15 +473,17 @@ Status<std::error_code> ProxyReactor::cancelPendingConnections() {
 
 // If everything succeeds both endpoints are registered and SessionManager assumes ownership of
 // their file descriptors. If registration fails, the reactor source changes are rolled back.
-Result<detail::SessionId, ConnectionFailure> ProxyReactor::addSession(FileDescriptor upstream_fd,
-                                                                      FileDescriptor downstream_fd,
-                                                                      detail::Deadline deadline) {
+Result<detail::SessionId, ConnectionFailure>
+ProxyReactor::addSession(FileDescriptor upstream_fd, FileDescriptor downstream_fd,
+                         detail::Deadline deadline, AdmissionReservation& admission) {
     auto session = session_manager_.prepare(std::move(downstream_fd), std::move(upstream_fd));
     if (!session) {
         return std::unexpected(
             ConnectionFailure{ConnectionOperation::AllocateBuffers,
                               std::make_error_code(std::errc::not_enough_memory)});
     }
+    // Abseil table allocation failures remain fatal. Reserve before the handoff timestamp.
+    session_manager_.reserveForAdd();
     const auto id = session_manager_.allocateId();
     const detail::DeadlineKey idle_key{detail::DeadlineKind::Idle, id};
     constexpr uint32_t initial_events = EPOLLIN | EPOLLRDHUP;
@@ -504,26 +512,26 @@ Result<detail::SessionId, ConnectionFailure> ProxyReactor::addSession(FileDescri
         return rollback({ConnectionOperation::AddWatch, upstream.error()});
     }
 
-    // Check after the watches and before ownership transfers, including any deadline allocation.
-    const auto now = time_source_.now();
-    const ConnectionFailure expired{ConnectionOperation::EstablishmentDeadline,
-                                    std::make_error_code(std::errc::timed_out)};
-    if (now >= deadline) {
-        return rollback(expired);
-    }
-    if (timeouts_.idle.count() > 0) {
+    const bool idle_enabled = timeouts_.idle.count() > 0;
+    if (idle_enabled) {
         try {
-            deadlines_.schedule(idle_key, now + timeouts_.idle);
+            // Prepare both deadline indexes. Updating this key at handoff reuses its nodes.
+            deadlines_.schedule(idle_key, detail::Deadline::max());
         } catch (const std::bad_alloc&) {
             return rollback({ConnectionOperation::AllocateDeadline,
                              std::make_error_code(std::errc::not_enough_memory)});
         }
-        if (time_source_.now() >= deadline) {
-            return rollback(expired);
-        }
+    }
+    const auto handoff = time_source_.now();
+    if (handoff >= deadline) {
+        return rollback({ConnectionOperation::EstablishmentDeadline,
+                         std::make_error_code(std::errc::timed_out)});
+    }
+    if (idle_enabled) {
+        deadlines_.schedule(idle_key, handoff + timeouts_.idle);
     }
     session_manager_.add(id, std::move(*session), {*downstream, *upstream});
-    transient_admission_ = false;
+    admission.release();
     return id;
 }
 
@@ -762,8 +770,7 @@ Status<FatalReactorError> ProxyReactor::expireDeadlines(detail::Deadline now) {
             auto it = pending_connections_.find(key->id);
             if (it != pending_connections_.end()) {
                 try {
-                    allocation_.check(detail::AllocationPoint::DeferredDial);
-                    it->second.deferred = deferred_dials_.insert(deferred_dials_.end(), key->id);
+                    it->second.deferred = enqueueDeferredDial(key->id, it->second.connection);
                 } catch (const std::bad_alloc&) {
                     if (auto dropped = takePending(key->id); !dropped) {
                         return std::unexpected(FatalReactorError{dropped.error().message()});
@@ -800,18 +807,16 @@ std::optional<detail::Deadline> ProxyReactor::nextWakeup() const {
     return next;
 }
 
-void ProxyReactor::suspendAdmission(const char* operation, std::error_code code,
-                                    bool log_pressure) {
+void ProxyReactor::suspendAdmission(const char* operation, std::error_code code, bool report) {
     if (shutdown_state_ != ShutdownState::Running) {
         return;
     }
     if (!admission_retry_at_) {
         admission_retry_at_ = time_source_.now() + admission_retry_interval;
     }
-    if (log_pressure && !pressure_reported_) {
-        pressure_reported_ = true;
-        spdlog::warn("Admission paused after {} reported resource pressure (errno {})", operation,
-                     code.value());
+    if (report && !admission_pause_reported_) {
+        admission_pause_reported_ = true;
+        spdlog::warn("Admission paused after {} failed (errno {})", operation, code.value());
     }
 }
 
@@ -849,13 +854,13 @@ Status<FatalReactorError> ProxyReactor::handleListener(detail::ListenerRegistrat
         if (!accept_result) {
             auto error = accept_result.error();
             switch (classifyAcceptError(error)) {
-            case FailureKind::Connection:
+            case AcceptFailure::Connection:
                 spdlog::debug("Connection could not be accepted (errno {})", error.value());
                 continue;
-            case FailureKind::Pressure:
+            case AcceptFailure::Backoff:
                 suspendAdmission("accept4", error);
                 return {};
-            case FailureKind::Infrastructure:
+            case AcceptFailure::Infrastructure:
                 return std::unexpected(
                     FatalReactorError{std::format("Listener accept failed: {}", error.message())});
             }
@@ -882,7 +887,8 @@ Status<FatalReactorError> ProxyReactor::handleListener(detail::ListenerRegistrat
             continue;
         }
 
-        if (auto dispatch_result = handleDialResult(std::move(*dial_result)); !dispatch_result) {
+        if (auto dispatch_result = handleDialResult(std::move(*dial_result), reservation);
+            !dispatch_result) {
             return dispatch_result;
         }
     }
@@ -899,47 +905,73 @@ Status<FatalReactorError> ProxyReactor::handlePendingConnection(detail::SourceId
     if (shutdown_state_ != ShutdownState::Running) {
         return {};
     }
-    AdmissionReservation reservation(transient_admission_);
     size_t no_attempts = 0;
-    auto dial_result = upstream_dialer_.advanceDialAttempt(
-        std::move(*pending), time_source_, admission_retry_at_ ? no_attempts : attempts_left);
+    auto dial_result =
+        upstream_dialer_.advanceDialAttempt(std::move(pending->connection), time_source_,
+                                            admission_retry_at_ ? no_attempts : attempts_left);
     if (!dial_result) {
         return handleDialError(std::move(dial_result.error()));
     }
 
-    return handleDialResult(std::move(*dial_result));
+    return handleDialResult(std::move(*dial_result), pending->admission);
 }
 
 bool ProxyReactor::hasRunnableDials() const {
-    return shutdown_state_ == ShutdownState::Running && !admission_retry_at_ &&
-           !deferred_dials_.empty();
+    return shutdown_state_ == ShutdownState::Running &&
+           (!deferred_completions_.empty() ||
+            (!admission_retry_at_ && !deferred_attempts_.empty()));
+}
+
+ProxyReactor::DeferredDials& ProxyReactor::deferredQueue(DeferredDialKind kind) {
+    return kind == DeferredDialKind::CompletionQuery ? deferred_completions_ : deferred_attempts_;
+}
+
+ProxyReactor::QueuedDial
+ProxyReactor::enqueueDeferredDial(detail::SourceId id, const detail::PendingConnection& pending) {
+    allocation_.check(detail::AllocationPoint::DeferredDial);
+    const auto kind = pending.attempted_connection_fd ? DeferredDialKind::CompletionQuery
+                                                      : DeferredDialKind::SocketAttempt;
+    auto& queue = deferredQueue(kind);
+    return {kind, queue.insert(queue.end(), id)};
 }
 
 Status<FatalReactorError> ProxyReactor::resumeDeferredDials() {
-    const size_t count = std::min(deferred_dials_.size(), max_resumed_dials_per_turn);
-    for (size_t i = 0; i < count && hasRunnableDials(); ++i) {
-        const auto id = deferred_dials_.front();
+    // Give each queued dial at most one opportunity this turn, alternating eligible queues.
+    // A completion that needs a fresh socket joins the attempt FIFO for a later turn.
+    size_t attempts = deferred_attempts_.size();
+    size_t completions = deferred_completions_.size();
+    for (size_t i = 0; i < max_resumed_dials_per_turn && shutdown_state_ == ShutdownState::Running;
+         ++i) {
+        const bool attempt_ready = attempts > 0 && !admission_retry_at_;
+        if (!attempt_ready && completions == 0) {
+            break;
+        }
+        const bool complete = completions > 0 && (!attempt_ready || i % 2 == 0);
+        --(complete ? completions : attempts);
+        auto& queue = complete ? deferred_completions_ : deferred_attempts_;
+        const auto id = queue.front();
         auto& entry = pending_connections_.at(id);
-        size_t attempts_left = 1;
-        auto result = entry.connection.attempted_connection_fd
-                          ? upstream_dialer_.advanceDialAttempt(std::move(entry.connection),
-                                                                time_source_, attempts_left)
-                          : upstream_dialer_.resumeDial(std::move(entry.connection), time_source_,
-                                                        attempts_left);
+        size_t attempts_left = admission_retry_at_ ? 0 : 1;
+        auto result = complete ? upstream_dialer_.advanceDialAttempt(std::move(entry.connection),
+                                                                     time_source_, attempts_left)
+                               : upstream_dialer_.resumeDial(std::move(entry.connection),
+                                                             time_source_, attempts_left);
         if (result) {
             if (auto* deferred = std::get_if<detail::UpstreamDialDeferred>(&*result);
                 deferred && !deferred->interrupted) {
                 entry.connection = std::move(deferred->pending_connection);
-                deferred_dials_.splice(deferred_dials_.end(), deferred_dials_, *entry.deferred);
+                assert(!entry.connection.attempted_connection_fd);
+                deferred_attempts_.splice(deferred_attempts_.end(), queue,
+                                          entry.deferred->position);
+                entry.deferred->kind = DeferredDialKind::SocketAttempt;
                 continue;
             }
         }
         // A successful result already holds the sockets. Retire the old record before handoff.
         auto removed = takePending(id);
         assert(removed && "deferred entries have no watch to retire");
-        AdmissionReservation reservation(transient_admission_);
-        auto handled =
-            result ? handleDialResult(std::move(*result)) : handleDialError(result.error());
+        auto handled = result ? handleDialResult(std::move(*result), removed->admission)
+                              : handleDialError(result.error());
         if (!handled) {
             return handled;
         }
@@ -950,15 +982,16 @@ Status<FatalReactorError> ProxyReactor::resumeDeferredDials() {
     return {};
 }
 
-Status<FatalReactorError> ProxyReactor::handleDialResult(detail::UpstreamDialResult dial_result) {
+Status<FatalReactorError> ProxyReactor::handleDialResult(detail::UpstreamDialResult dial_result,
+                                                         AdmissionReservation& admission) {
     if (auto* connected = std::get_if<detail::UpstreamDialConnected>(&dial_result)) {
         spdlog::info("Connected to {} on behalf of client {}",
                      net::formatAddress(connected->upstream_address),
                      net::formatAddress(connected->accepted_address));
 
-        if (auto session_add_result =
-                addSession(std::move(connected->upstream_connection_fd),
-                           std::move(connected->accepted_connection_fd), connected->deadline);
+        if (auto session_add_result = addSession(std::move(connected->upstream_connection_fd),
+                                                 std::move(connected->accepted_connection_fd),
+                                                 connected->deadline, admission);
             !session_add_result) {
 
             return handleConnectionFailure(session_add_result.error());
@@ -976,7 +1009,7 @@ Status<FatalReactorError> ProxyReactor::handleDialResult(detail::UpstreamDialRes
         net::SocketAddress accepted_address = in_progress->pending_connection.accepted_address;
 
         if (auto register_result =
-                registerPendingConnection(std::move(in_progress->pending_connection));
+                registerPendingConnection(std::move(in_progress->pending_connection), admission);
             !register_result) {
             return handleConnectionFailure(register_result.error());
         }
@@ -989,7 +1022,7 @@ Status<FatalReactorError> ProxyReactor::handleDialResult(detail::UpstreamDialRes
             return {};
         }
         if (auto registered = registerPendingConnection(std::move(deferred.pending_connection),
-                                                        deferred.interrupted);
+                                                        admission, deferred.interrupted);
             !registered) {
             return handleConnectionFailure(registered.error());
         }
@@ -997,7 +1030,7 @@ Status<FatalReactorError> ProxyReactor::handleDialResult(detail::UpstreamDialRes
     }
 
     if (!admission_retry_at_) {
-        pressure_reported_ = false;
+        admission_pause_reported_ = false;
     }
     return {};
 }
