@@ -37,6 +37,6 @@ The defaults allow up to 512 connection-owned descriptors and limit how many cli
 
 At either limit Orbit pauses acceptance. Waiting clients occupy the kernel listen backlog, so a client-side TCP connect can succeed before Orbit accepts it or opens its upstream connection. If the backlog fills, connection establishment can stall or fail under the host's TCP policy.
 
-Temporary descriptor or other supported resource pressure also pauses acceptance. Orbit reevaluates admission after a 100 ms cooldown using the shared timer. A connection that encounters a resource failure during establishment can be closed. See [failure handling](architecture.md#failure-handling).
+Descriptor and other supported resource failures and accept permission denials pause acceptance. Orbit reevaluates admission after a 100 ms cooldown using the shared timer. Upstream completion queries can still run during cooldown, while candidates that need a fresh socket wait. A connection that encounters a resource failure during establishment can be closed. See [failure handling](architecture.md#failure-handling).
 
 The shared budget can be smaller than a directional watermark. Its 4 KiB minimum allows one block to back a receive. Under saturation, directions share released blocks in FIFO order and keep using any free space in their own existing tail block. Size the budget for the amount of backpressure and concurrent traffic the deployment should tolerate. See [shared forwarding payload budget](architecture.md#shared-forwarding-payload-budget).

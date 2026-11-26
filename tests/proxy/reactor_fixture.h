@@ -34,8 +34,9 @@ protected:
     }
 
     detail::SessionSourceIds install(test::SocketPair& downstream, test::SocketPair& upstream) {
+        ProxyReactor::AdmissionReservation admission(reactor->transient_admission_);
         auto added = reactor->addSession(std::move(upstream.local), std::move(downstream.local),
-                                         detail::Deadline::max());
+                                         detail::Deadline::max(), admission);
         if (!added) {
             throw std::system_error(added.error().code);
         }
@@ -66,7 +67,8 @@ protected:
     }
 
     detail::SourceId installPending(detail::PendingConnection pending) {
-        auto added = reactor->registerPendingConnection(std::move(pending));
+        ProxyReactor::AdmissionReservation admission(reactor->transient_admission_);
+        auto added = reactor->registerPendingConnection(std::move(pending), admission);
         if (!added) {
             throw std::system_error(added.error().code);
         }
@@ -81,6 +83,9 @@ protected:
     }
     size_t pendingCount() const { return reactor->pendingConnectionCount(); }
     size_t sessionCount() const { return reactor->session_manager_.size(); }
+    size_t totalCount() const { return pendingCount() + sessionCount(); }
+    bool canAdmit() const { return reactor->canAdmit(); }
+    auto extractPending(detail::SourceId id) { return reactor->takePending(id); }
     FileDescriptor connectToListener() const {
         const auto& listener = reactor->active_listener_->listener;
         const auto& address = listener.localAddress();
@@ -137,7 +142,8 @@ protected:
         return reactor->session_manager_.sourceIds(*ids.begin());
     }
     auto dialResult(detail::UpstreamDialResult result) {
-        auto status = reactor->handleDialResult(std::move(result));
+        ProxyReactor::AdmissionReservation admission(reactor->transient_admission_);
+        auto status = reactor->handleDialResult(std::move(result), admission);
         if (status) {
             synchronizeAdmission();
         }
@@ -161,10 +167,12 @@ protected:
                                      detail::DeadlineClock::now() + std::chrono::milliseconds(1));
     }
     auto arm() { return reactor->synchronizeTimer(); }
-    auto waitForEvents() { return reactor->poller_.wait(); }
+    auto waitForEvents(bool nonblocking = false) { return reactor->poller_.wait(nonblocking); }
     auto resumeReadyRead() { return reactor->resumeReadyRead(); }
     auto resumeDeferredDials() { return reactor->resumeDeferredDials(); }
-    auto deferredDialCount() const { return reactor->deferred_dials_.size(); }
+    auto deferredDialCount() const {
+        return reactor->deferred_attempts_.size() + reactor->deferred_completions_.size();
+    }
     bool hasRunnableDials() const { return reactor->hasRunnableDials(); }
     auto runTurn() { return reactor->runTurn(); }
     bool hasReadyRead() const { return reactor->session_manager_.hasReadyRead(); }

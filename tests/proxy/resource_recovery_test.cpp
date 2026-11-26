@@ -1,10 +1,17 @@
+#include <algorithm>
 #include <array>
 #include <cerrno>
 #include <chrono>
+#include <fcntl.h>
+#include <memory>
 #include <optional>
 #include <string>
+#include <vector>
 
 #include <gtest/gtest.h>
+#include <netinet/in.h>
+#include <spdlog/sinks/callback_sink.h>
+#include <spdlog/spdlog.h>
 #include <sys/epoll.h>
 #include <sys/socket.h>
 
@@ -15,6 +22,18 @@ namespace {
 
 using namespace std::chrono_literals;
 using detail::AllocationPoint;
+
+class ScopedLogger {
+public:
+    explicit ScopedLogger(std::shared_ptr<spdlog::logger> logger)
+        : previous_(spdlog::default_logger()) {
+        spdlog::set_default_logger(std::move(logger));
+    }
+    ~ScopedLogger() { spdlog::set_default_logger(previous_); }
+
+private:
+    std::shared_ptr<spdlog::logger> previous_;
+};
 
 class ResourceRecoveryTest : public ControlledReactorTest {
 protected:
@@ -48,6 +67,10 @@ protected:
                 .epoll = {this,
                           [](void* context, int epfd, int op, int fd, epoll_event* event) {
                               auto& self = *static_cast<ResourceRecoveryTest*>(context);
+                              if (self.observe_watches) {
+                                  self.watches.push_back(
+                                      {op, fd, self.pendingCount(), self.totalCount()});
+                              }
                               if (op == EPOLL_CTL_ADD) {
                                   self.previous_add = self.last_add;
                                   self.last_add = event->data.u64;
@@ -107,6 +130,15 @@ protected:
     detail::SourceId last_add = 0;
     std::optional<AllocationPoint> failed_allocation;
     int allocations_before_failure = 0;
+
+    struct WatchObservation {
+        int op;
+        int fd;
+        size_t pending;
+        size_t total;
+    };
+    bool observe_watches = false;
+    std::vector<WatchObservation> watches;
 };
 
 TEST_F(ResourceRecoveryTest, PersistentAcceptPressureRetriesOnlyOnTheSharedTimer) {
@@ -179,6 +211,219 @@ TEST_F(ResourceRecoveryTest, PendingCapacityAndPressureClearIndependentlyAndShut
     EXPECT_EQ(2, accept_calls);
     EXPECT_FALSE(listenerAccepting());
     expectForwarding(drain_client, drain_backend, drain.downstream);
+}
+
+TEST_F(ResourceRecoveryTest, PermissionDenialPacesTheSameBacklogEntryAndThenAdmitsIt) {
+    int pause_warnings = 0;
+    auto sink = std::make_shared<spdlog::sinks::callback_sink_mt>(
+        [&](const spdlog::details::log_msg& message) {
+            if (message.level == spdlog::level::warn) {
+                ++pause_warnings;
+            }
+        });
+    const ScopedLogger logger(std::make_shared<spdlog::logger>("permission-denial-test", sink));
+    auto server = net::Listener::create({"127.0.0.1", 0}, 4);
+    ASSERT_TRUE(server);
+    const auto& address = server->localAddress().addr;
+    auto port = ntohs(reinterpret_cast<const sockaddr_in*>(&address)->sin_port);
+    auto dialer = detail::UpstreamDialer::create({"127.0.0.1", port});
+    ASSERT_TRUE(dialer);
+    setUpstreamDialer(std::move(*dialer));
+
+    auto client = test::socketPair();
+    auto upstream = test::socketPair();
+    const auto established = install(client, upstream);
+    const auto listener = listenerId();
+    auto waiting = connectToListener();
+    ASSERT_EQ(1, send(waiting.get(), "q", 1, 0));
+    int calls = 0;
+    for (int denial : {EPERM, EPERM, EACCES}) {
+        accept_error = denial;
+        auto ready = waitForEvents(true);
+        ASSERT_TRUE(ready);
+        ASSERT_TRUE(std::ranges::any_of(*ready, [&](auto e) { return e.source_id == listener; }));
+        ASSERT_TRUE(dispatchBatch(*ready));
+        EXPECT_EQ(++calls, accept_calls);
+        ASSERT_TRUE(retryAt());
+        EXPECT_FALSE(listenerAccepting());
+        EXPECT_FALSE(hasRunnableDials());
+        for (int i = 0; i < 5; ++i) {
+            auto idle = waitForEvents(true);
+            ASSERT_TRUE(idle);
+            EXPECT_TRUE(idle->empty());
+            ASSERT_TRUE(dispatch({listener, EPOLLIN}));
+        }
+        clock.advanceTo(*retryAt() - 1ns);
+        ASSERT_TRUE(expire(clock.now()));
+        EXPECT_FALSE(listenerAccepting());
+        EXPECT_EQ(calls, accept_calls);
+        expectForwarding(client, upstream, established.downstream);
+        advanceToRetry();
+    }
+    EXPECT_EQ(1, pause_warnings);
+
+    accept_error = 0;
+    auto ready = waitForEvents(true);
+    ASSERT_TRUE(ready);
+    ASSERT_TRUE(dispatchBatch(*ready));
+    pollfd backend{server->fd(), POLLIN, 0};
+    ASSERT_EQ(1, poll(&backend, 1, 1000));
+    auto accepted = server->acceptClientConnection();
+    ASSERT_TRUE(accepted);
+    ASSERT_TRUE(std::holds_alternative<net::AcceptSuccess>(*accepted));
+    auto completion = waitForEvents(true);
+    ASSERT_TRUE(completion);
+    ASSERT_TRUE(dispatchBatch(*completion));
+    EXPECT_EQ(2u, sessionCount());
+    EXPECT_EQ(0u, pendingCount());
+    EXPECT_EQ(++calls, accept_calls);
+    EXPECT_FALSE(listenerAccepting()); // The successful admission now fills the total limit.
+}
+
+TEST_F(ResourceRecoveryTest, DenialCooldownStillRespectsAdmissionLimitsAndShutdown) {
+    auto client = test::socketPair();
+    auto upstream = test::socketPair();
+    auto live = install(client, upstream);
+    auto listener = listenerId();
+    accept_error = EPERM;
+    ASSERT_TRUE(dispatch({listener, EPOLLIN}));
+    ASSERT_TRUE(retryAt());
+    auto waiting = test::socketPair();
+    auto attempt = test::socketPair();
+    auto deadline = clock.now() + 1s;
+    installPending(waiting, attempt, deadline);
+    advanceToRetry();
+    EXPECT_FALSE(listenerAccepting());
+    ASSERT_TRUE(dispatch({listener, EPOLLIN}));
+    EXPECT_EQ(1, accept_calls);
+    clock.advanceTo(deadline);
+    ASSERT_TRUE(expire(deadline));
+    ASSERT_TRUE(listenerAccepting());
+    ASSERT_TRUE(dispatch({listener, EPOLLIN}));
+    auto retry = retryAt();
+    ASSERT_TRUE(retry);
+    ASSERT_TRUE(shutdownRequest());
+    clock.advanceTo(*retry);
+    ASSERT_TRUE(expire(clock.now()));
+    ASSERT_TRUE(dispatch({listener, EPOLLIN}));
+    EXPECT_EQ(2, accept_calls);
+    EXPECT_FALSE(listenerAccepting());
+    expectForwarding(client, upstream, live.downstream);
+}
+
+TEST_F(ResourceRecoveryTest, ExtractedPendingOwnerHoldsAdmissionThroughDescriptorDestruction) {
+    auto client = test::socketPair();
+    auto upstream = test::socketPair();
+    const auto open = {client.local.get(), upstream.local.get()};
+    auto pending = installPending(client, upstream);
+    {
+        auto extracted = extractPending(pending);
+        ASSERT_TRUE(extracted);
+        EXPECT_FALSE(watching(pending));
+        EXPECT_FALSE(registered(pending));
+        EXPECT_FALSE(nextDeadline());
+        for (int fd : open) {
+            EXPECT_NE(-1, fcntl(fd, F_GETFD));
+        }
+        EXPECT_EQ(1u, pendingCount());
+        EXPECT_EQ(1u, totalCount());
+        EXPECT_FALSE(canAdmit());
+    }
+    for (int fd : open) {
+        EXPECT_EQ(-1, fcntl(fd, F_GETFD));
+        EXPECT_EQ(EBADF, errno);
+    }
+    EXPECT_EQ(0u, totalCount());
+    EXPECT_TRUE(canAdmit());
+}
+
+TEST_F(ResourceRecoveryTest, PendingExpirationCountsExtractedSocketsUntilClose) {
+    auto client = test::socketPair();
+    auto upstream = test::socketPair();
+    const int client_fd = client.local.get();
+    const int upstream_fd = upstream.local.get();
+    const auto deadline = clock.now() + 10ms;
+    const auto pending = installPending(client, upstream, deadline);
+    int observed = 0;
+    auto sink = std::make_shared<spdlog::sinks::callback_sink_mt>(
+        [&](const spdlog::details::log_msg& message) {
+            if (message.payload == "Upstream connection establishment timed out") {
+                ++observed;
+                EXPECT_NE(-1, fcntl(client_fd, F_GETFD));
+                EXPECT_NE(-1, fcntl(upstream_fd, F_GETFD));
+                EXPECT_FALSE(registered(pending));
+                EXPECT_EQ(1u, pendingCount());
+                EXPECT_EQ(1u, totalCount());
+                EXPECT_FALSE(canAdmit());
+            }
+        });
+    auto logger = std::make_shared<spdlog::logger>("pending-expiry-test", sink);
+    logger->set_level(spdlog::level::debug);
+    const ScopedLogger scoped_logger(std::move(logger));
+
+    clock.advanceTo(deadline);
+    ASSERT_TRUE(expire(deadline));
+    EXPECT_EQ(1, observed);
+    EXPECT_EQ(0u, pendingCount());
+    EXPECT_EQ(0u, totalCount());
+    EXPECT_TRUE(listenerAccepting());
+    expectClosed(client);
+    expectClosed(upstream);
+}
+
+TEST_F(ResourceRecoveryTest, PendingPromotionKeepsOneAdmissionThroughRegistrationRollback) {
+    auto client = test::socketPair();
+    auto upstream = test::socketPair();
+    const auto live = install(client, upstream);
+    const auto idle = nextDeadline();
+    auto waiting = test::socketPair();
+    auto attempted = test::socketPair();
+    const auto pending = installPending(waiting, attempted);
+    failed_op = EPOLL_CTL_ADD;
+    ops_before_failure = 1;
+    observe_watches = true;
+
+    ASSERT_TRUE(dispatch({pending, EPOLLOUT}));
+    ASSERT_EQ(4u, watches.size()); // Old watch, two endpoint ADDs, rollback of the first ADD.
+    for (const auto& event : watches) {
+        EXPECT_EQ(1u, event.pending);
+        EXPECT_EQ(2u, event.total);
+    }
+    for (auto id : {pending, previous_add, last_add}) {
+        EXPECT_FALSE(registered(id));
+        EXPECT_FALSE(watching(id));
+    }
+    EXPECT_EQ(0u, pendingCount());
+    EXPECT_EQ(1u, totalCount());
+    EXPECT_EQ(idle, nextDeadline());
+    ASSERT_TRUE(retryAt());
+    expectClosed(waiting);
+    expectClosed(attempted);
+    expectForwarding(client, upstream, live.downstream);
+}
+
+TEST_F(ResourceRecoveryTest, ShutdownKeepsPendingAdmissionWhileRetiringTheWatch) {
+    auto client = test::socketPair();
+    auto upstream = test::socketPair();
+    const auto live = install(client, upstream);
+    auto waiting = test::socketPair();
+    auto attempt = test::socketPair();
+    const auto fd = attempt.local.get();
+    const auto pending = installPending(waiting, attempt);
+    observe_watches = true;
+
+    ASSERT_TRUE(shutdownRequest());
+    auto retirement = std::ranges::find_if(
+        watches, [&](const auto& event) { return event.op == EPOLL_CTL_DEL && event.fd == fd; });
+    ASSERT_NE(watches.end(), retirement);
+    EXPECT_EQ(1u, retirement->pending);
+    EXPECT_EQ(2u, retirement->total);
+    EXPECT_FALSE(registered(pending));
+    EXPECT_EQ(0u, pendingCount());
+    EXPECT_EQ(1u, totalCount());
+    expectClosed(waiting);
+    expectClosed(attempt);
+    expectForwarding(client, upstream, live.downstream);
 }
 
 TEST_F(ResourceRecoveryTest, EndpointAddPressureRollsBackFirstWatchAndPendingAddLeavesNoDeadline) {

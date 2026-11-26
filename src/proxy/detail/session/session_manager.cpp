@@ -70,6 +70,8 @@ std::optional<Session> SessionManager::prepare(FileDescriptor downstream,
     }
 }
 
+void SessionManager::reserveForAdd() { sessions_.reserve(sessions_.size() + 1); }
+
 void SessionManager::add(SessionId id, Session session, SessionSourceIds source_ids) {
     ManagedSession managed_session = {
         .session = std::move(session),

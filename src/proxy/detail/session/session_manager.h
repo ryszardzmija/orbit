@@ -76,6 +76,7 @@ public:
 
     SessionId allocateId();
     std::optional<Session> prepare(FileDescriptor downstream, FileDescriptor upstream) const;
+    void reserveForAdd();
     void add(SessionId id, Session session, SessionSourceIds source_ids);
     void remove(SessionId id);
 

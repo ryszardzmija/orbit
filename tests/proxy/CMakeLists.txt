@@ -14,6 +14,7 @@ add_executable(proxy_tests
 target_link_libraries(proxy_tests PRIVATE
     proxy
     GTest::gtest_main
+    spdlog::spdlog
 )
 
 orbit_discover_unit_tests(proxy_tests)

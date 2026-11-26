@@ -1,6 +1,7 @@
 #include <array>
 #include <cerrno>
 #include <chrono>
+#include <cstring>
 #include <optional>
 #include <system_error>
 #include <utility>
@@ -8,6 +9,7 @@
 
 #include <fcntl.h>
 #include <gtest/gtest.h>
+#include <netinet/in.h>
 #include <poll.h>
 #include <signal.h>
 #include <sys/epoll.h>
@@ -81,9 +83,12 @@ public:
     // Supply two resolved candidates independently of the host's DNS configuration.
     static UpstreamDialer withCandidates(const net::SocketAddress& candidate,
                                          net::DialOperations operations, size_t count = 2) {
-        return UpstreamDialer(
-            ResolvedUpstream({"backend", 1}, std::vector<net::SocketAddress>(count, candidate)),
-            operations);
+        return withCandidates(std::vector<net::SocketAddress>(count, candidate), operations);
+    }
+
+    static UpstreamDialer withCandidates(std::vector<net::SocketAddress> candidates,
+                                         net::DialOperations operations) {
+        return UpstreamDialer(ResolvedUpstream({"backend", 1}, std::move(candidates)), operations);
     }
 
     static PendingConnection failedAttempt(FileDescriptor client, Deadline deadline) {
@@ -579,6 +584,240 @@ TEST_F(FallbackReactorTest, PressureParksFallbackAndRecoveryKeepsTheOriginalDead
     EXPECT_EQ(1u, sessionCount());
     EXPECT_EQ(0u, pendingCount());
     EXPECT_FALSE(nextDeadline());
+}
+
+class CompletionRetryTest : public ControlledReactorTest {
+protected:
+    static net::SocketAddress candidate(uint16_t port) {
+        const sockaddr_in address{
+            .sin_family = AF_INET,
+            .sin_port = htons(port),
+            .sin_addr = {htonl(INADDR_LOOPBACK)},
+            .sin_zero = {},
+        };
+        net::SocketAddress result{.addrlen = sizeof(address), .addr = {}};
+        std::memcpy(&result.addr, &address, sizeof(address));
+        return result;
+    }
+
+    void SetUp() override {
+        createReactor({}, clock.source(), {}, {},
+                      {.accept = {.accept = [](void*, int, sockaddr*, socklen_t*, int) {
+                           errno = EMFILE;
+                           return -1;
+                       }}});
+        setUpstreamDialer(detail::UpstreamDialerTest::withCandidates(
+            {candidate(10001), candidate(10002)},
+            {
+                .context = this,
+                .socket =
+                    [](void* context, int domain, int type, int protocol) {
+                        auto& self = *static_cast<CompletionRetryTest*>(context);
+                        ++self.socket_calls;
+                        EXPECT_FALSE(self.retryAt());
+                        if (self.failed_fd != -1) {
+                            expectClosedDescriptor(self.failed_fd);
+                            EXPECT_EQ(1u, self.pendingCount());
+                            EXPECT_EQ(1u, self.totalCount());
+                        }
+                        return socket(domain, type, protocol);
+                    },
+                .connect =
+                    [](void* context, int, const sockaddr* address, socklen_t length) {
+                        auto& self = *static_cast<CompletionRetryTest*>(context);
+                        EXPECT_EQ(sizeof(sockaddr_in), length);
+                        sockaddr_in endpoint{};
+                        std::memcpy(&endpoint, address, sizeof(endpoint));
+                        self.connected_port = ntohs(endpoint.sin_port);
+                        return 0;
+                    },
+                .getsockopt =
+                    [](void* context, int fd, int level, int name, void* value, socklen_t* length) {
+                        auto& self = *static_cast<CompletionRetryTest*>(context);
+                        self.queried_fds.push_back(fd);
+                        EXPECT_GT(self.pendingCount(), 0u);
+                        if (std::exchange(self.interrupt_next_query, false)) {
+                            errno = EINTR;
+                            return -1;
+                        }
+                        if (self.completion_error != 0) {
+                            *static_cast<int*>(value) = self.completion_error;
+                            return 0;
+                        }
+                        return getsockopt(fd, level, name, value, length);
+                    },
+            }));
+    }
+
+    void startCooldown() {
+        ASSERT_TRUE(dispatch({listenerId(), EPOLLIN}));
+        ASSERT_TRUE(retryAt());
+        EXPECT_FALSE(listenerAccepting());
+    }
+
+    void interruptCompletion(detail::SourceId id) {
+        interrupt_next_query = true;
+        ASSERT_TRUE(dispatch({id, EPOLLOUT}));
+        EXPECT_FALSE(watching(id));
+        EXPECT_FALSE(registered(id));
+    }
+
+    void makeRetryReady() {
+        clock.advanceTo(clock.now() + 1ms);
+        ASSERT_TRUE(expire(clock.now()));
+    }
+
+    std::vector<int> queried_fds;
+    bool interrupt_next_query = false;
+    int completion_error = 0;
+    int socket_calls = 0;
+    int failed_fd = -1;
+    uint16_t connected_port = 0;
+};
+
+TEST_F(CompletionRetryTest, CompletesDuringCooldownBehindADeferredSocketAttempt) {
+    auto waiting = test::socketPair();
+    const auto waiting_deadline = clock.now() + 1s;
+    installPending({std::move(waiting.local), {}, std::nullopt, 0, waiting_deadline});
+    auto client = test::socketPair();
+    auto upstream = test::socketPair();
+    const int fd = upstream.local.get();
+    const auto deadline = clock.now() + 30ms;
+    auto pending = installPending(client, upstream, deadline);
+    startCooldown();
+    ASSERT_GT(*retryAt(), deadline);
+
+    interruptCompletion(pending);
+    makeRetryReady();
+    EXPECT_EQ(2u, deferredDialCount());
+    EXPECT_TRUE(hasRunnableDials());
+    ASSERT_TRUE(resumeDeferredDials());
+    EXPECT_EQ((std::vector<int>{fd, fd}), queried_fds);
+    ASSERT_EQ(1u, sessionCount());
+    EXPECT_EQ(1u, pendingCount());
+    EXPECT_EQ(waiting_deadline, nextDeadline());
+    EXPECT_EQ(0, socket_calls);
+    EXPECT_FALSE(hasRunnableDials());
+    EXPECT_FALSE(listenerAccepting());
+    const auto session = currentSessionSources();
+    ASSERT_EQ(1, send(client.peer.get(), "q", 1, 0));
+    ASSERT_TRUE(dispatch({session.downstream, EPOLLIN}));
+    char byte;
+    ASSERT_EQ(1, recv(upstream.peer.get(), &byte, 1, 0));
+    EXPECT_EQ('q', byte);
+}
+
+TEST_F(CompletionRetryTest, FailedCompletionParksTheNextCandidateUntilCooldownEnds) {
+    auto client = test::socketPair();
+    auto failed = test::socketPair();
+    failed_fd = failed.local.get();
+    const auto deadline = clock.now() + 500ms;
+    auto pending = installPending(client, failed, deadline);
+    startCooldown();
+    interruptCompletion(pending);
+    completion_error = ECONNREFUSED;
+    makeRetryReady();
+    ASSERT_TRUE(resumeDeferredDials());
+    EXPECT_EQ((std::vector<int>{failed_fd, failed_fd}), queried_fds);
+    expectClosedDescriptor(failed_fd);
+    EXPECT_EQ(0, socket_calls);
+    EXPECT_EQ(1u, pendingCount());
+    EXPECT_EQ(1u, totalCount());
+    EXPECT_EQ(deadline, nextDeadline());
+    EXPECT_FALSE(hasRunnableDials());
+
+    clock.advanceTo(*retryAt());
+    ASSERT_TRUE(expire(clock.now()));
+    ASSERT_TRUE(resumeDeferredDials());
+    EXPECT_EQ(1, socket_calls);
+    EXPECT_EQ(10002, connected_port);
+    EXPECT_EQ(0u, pendingCount());
+    EXPECT_EQ(1u, sessionCount());
+    EXPECT_FALSE(nextWakeup());
+}
+
+TEST_F(CompletionRetryTest, DeferredCompletionRejectsEstablishmentAtDeadlineEquality) {
+    auto client = test::socketPair();
+    auto upstream = test::socketPair();
+    const int client_fd = client.local.get();
+    const int upstream_fd = upstream.local.get();
+    const auto at = clock.now() + 2ms;
+    auto pending = installPending(client, upstream, at);
+    startCooldown();
+    interruptCompletion(pending);
+    makeRetryReady();
+    ASSERT_EQ(1u, deferredDialCount());
+    clock.advanceTo(at);
+
+    // A runnable continuation can see the deadline before timer dispatch.
+    ASSERT_TRUE(resumeDeferredDials());
+    EXPECT_EQ((std::vector<int>{upstream_fd}), queried_fds);
+    EXPECT_EQ(0, socket_calls);
+    EXPECT_EQ(0u, totalCount());
+    EXPECT_EQ(0u, deferredDialCount());
+    EXPECT_FALSE(nextDeadline());
+    expectClosedDescriptor(client_fd);
+    expectClosedDescriptor(upstream_fd);
+}
+
+TEST_F(CompletionRetryTest, CompletionAndSocketQueuesShareTheDeferredBudget) {
+    std::vector<test::SocketPair> clients;
+    std::vector<test::SocketPair> upstreams;
+    const auto at = clock.now() + 1s;
+    for (int i = 0; i < 6; ++i) {
+        clients.push_back(test::socketPair());
+        installPending({std::move(clients.back().local), {}, std::nullopt, 0, at});
+        clients.push_back(test::socketPair());
+        upstreams.push_back(test::socketPair());
+        interruptCompletion(installPending(clients.back(), upstreams.back(), at));
+    }
+    queried_fds.clear();
+    makeRetryReady();
+    ASSERT_EQ(12u, deferredDialCount());
+    ASSERT_TRUE(resumeDeferredDials());
+    EXPECT_EQ(4, socket_calls);
+    EXPECT_EQ(4u, queried_fds.size());
+    EXPECT_EQ(8u, sessionCount());
+    EXPECT_EQ(4u, pendingCount());
+    EXPECT_EQ(12u, totalCount());
+    EXPECT_EQ(4u, deferredDialCount());
+
+    ASSERT_TRUE(resumeDeferredDials());
+    EXPECT_EQ(6, socket_calls);
+    EXPECT_EQ(6u, queried_fds.size());
+    EXPECT_EQ(12u, sessionCount());
+    EXPECT_EQ(0u, pendingCount());
+    EXPECT_FALSE(hasRunnableDials());
+    EXPECT_FALSE(nextDeadline());
+}
+
+TEST_F(CompletionRetryTest, ShutdownCancelsReadyAndTimedCompletionRetries) {
+    auto first_client = test::socketPair();
+    auto first_upstream = test::socketPair();
+    auto second_client = test::socketPair();
+    auto second_upstream = test::socketPair();
+    const auto open = {first_client.local.get(), first_upstream.local.get(),
+                       second_client.local.get(), second_upstream.local.get()};
+    auto first = installPending(first_client, first_upstream);
+    auto second = installPending(second_client, second_upstream);
+    startCooldown();
+    interruptCompletion(first);
+    makeRetryReady();
+    interruptCompletion(second);
+    EXPECT_EQ(1u, deferredDialCount());
+    EXPECT_EQ(2u, pendingCount());
+    ASSERT_TRUE(shutdownRequest());
+    EXPECT_TRUE(stopped());
+    EXPECT_FALSE(retryAt());
+    EXPECT_EQ(0u, deferredDialCount());
+    EXPECT_EQ(0u, totalCount());
+    EXPECT_FALSE(nextDeadline());
+    ASSERT_TRUE(resumeDeferredDials());
+    EXPECT_EQ(2u, queried_fds.size());
+    EXPECT_EQ(0, socket_calls);
+    for (int fd : open) {
+        expectClosedDescriptor(fd);
+    }
 }
 
 TEST_F(FallbackReactorTest, SignalInABusyBatchCancelsDeferredWorkAndLetsSessionsDrain) {

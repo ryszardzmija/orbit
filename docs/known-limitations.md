@@ -51,6 +51,7 @@ Source baseline is `e3aec7b`. A source-confirmed finding follows from the implem
 ## LIM-009 — Reactor work budgets are incomplete
 
 - **M2.5 disposition** — Readiness dispatch, interrupted I/O, candidate attempts and continuation processing have [work-count budgets](architecture.md#work-per-reactor-turn). Controlled tests cover sustained candidate failure, continued traffic, timer cancellation, interrupted operations and transitions to and from a runnable queue.
+- **M2-A01 and M2-A02 disposition** — Resolved in M2.6. Existing-socket completion queries share the deferred dial budget and can run during admission cooldown, while fresh socket attempts wait in their own FIFO. Accept permission failures use the shared timed backoff even if the listen backlog stays readable.
 - **Remaining scope** — Work counts provide service opportunities. Wall-clock latency still depends on readiness volume, scheduling, syscall cost, hash table maintenance, allocation and teardown. Startup name resolution can block. Mixed-workload latency and the costs of dial and shutdown bursts remain unmeasured.
 
 ## LIM-010 — Logging is the runtime observability surface
@@ -67,6 +68,7 @@ Source baseline is `e3aec7b`. A source-confirmed finding follows from the implem
 - **Classification and priority** — Testing gap, high.
 - **Source and evidence** — [GoogleTest units](../tests/CMakeLists.txt) and [loopback integration](../tests/integration/proxy_sessions_test.py) cover M1 forwarding, deadlines, hangup and shutdown. M2 adds controlled partial sends and exact occupancy checks, admission and fault tests, global allocation and resumption tests, mixed readiness batches and a Linux descriptor-limit regression. Direct system-wide pressure, kernel DEL failure and live IPv6 forwarding remain coverage gaps.
 - **M1-A01 disposition** — Resolved. The audit reproduced an expired idle session surviving when a later operation in the same notification refreshed its deadline. Controlled-clock tests verify separate I/O checks for combined readiness and deferred hangup reads, and test activity at the expiry boundary.
+- **M2-A03 and M2-A04 disposition** — Resolved in M2.6. Slow establishment preparation leaves the full idle interval available from handoff. Extraction retains both admission slots through descriptor disposal or transfer. Controlled tests cover equality at both deadlines and observe open, counted descriptors during expiry. [INV-SES-009](invariants.md#deadlines), [INV-SES-006](invariants.md#session-lifecycle)
 - **Conditions and impact** — Regressions in rare event combinations and failures can pass the existing suite. The harness still uses deliberate delays for reset, slow-reader and idle-CPU scenarios. Orbit's CLI rejects port zero, so the bind-after-release window for its listener still exists. It can cause a startup failure if another process takes the port.
 - **Verification** — Confirmed by test inventory. Churn and transfer cases are useful indirect coverage with limited control over the targeted state.
 - **Follow-up** — Select deterministic fault and timeout coverage when modifying the other paths. See LIM-016 for the M0.2 harness fixes.

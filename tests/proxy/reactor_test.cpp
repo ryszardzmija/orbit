@@ -340,6 +340,94 @@ INSTANTIATE_TEST_SUITE_P(ConnectDeadline, ConnectedHandoffDeadlineTest, testing:
                              return info.param == 0ns ? "AtDeadline" : "AfterDeadline";
                          });
 
+class IdleHandoffTest : public ControlledReactorTest {
+protected:
+    void SetUp() override {
+        createReactor(
+            {.idle = 1ms}, clock.source(), {}, {.max_connections = 1, .max_pending_connections = 1},
+            {.allocation = {this, [](void* context, detail::AllocationPoint point) noexcept {
+                                auto& self = *static_cast<IdleHandoffTest*>(context);
+                                if (point == detail::AllocationPoint::DeadlineIndex) {
+                                    if (auto at =
+                                            std::exchange(self.preparation_ends, std::nullopt)) {
+                                        ++self.observed_preparations;
+                                        EXPECT_EQ(1u, self.pendingCount());
+                                        EXPECT_EQ(1u, self.totalCount());
+                                        EXPECT_EQ(0u, self.sessionCount());
+                                        EXPECT_FALSE(self.canAdmit());
+                                        self.clock.advanceTo(*at);
+                                    }
+                                }
+                                return false;
+                            }}});
+    }
+
+    std::optional<detail::Deadline> preparation_ends;
+    int observed_preparations = 0;
+};
+
+TEST_F(IdleHandoffTest, CompleteIdleIntervalStartsAfterEstablishmentPreparation) {
+    int preparations = 0;
+    for (auto delay : {1ms, 3ms}) {
+        SCOPED_TRACE(delay.count());
+        auto client = test::socketPair();
+        auto upstream = test::socketPair();
+        auto pending = installPending(client, upstream, clock.now() + 30ms);
+        const auto handoff = clock.now() + delay;
+        const auto expires = handoff + 1ms;
+        preparation_ends = handoff;
+        ASSERT_TRUE(dispatch({pending, EPOLLOUT}));
+        EXPECT_EQ(++preparations, observed_preparations);
+        ASSERT_EQ(expires, nextDeadline());
+        EXPECT_EQ(0u, pendingCount());
+        EXPECT_EQ(1u, totalCount());
+        const auto live = currentSessionSources();
+        // I/O at handoff leaves this deadline unchanged, since the controlled clock is stationary.
+        ASSERT_EQ(1, send(client.peer.get(), "a", 1, 0));
+        ASSERT_TRUE(dispatch({live.downstream, EPOLLIN}));
+        char byte;
+        ASSERT_EQ(1, recv(upstream.peer.get(), &byte, 1, 0));
+        EXPECT_EQ('a', byte);
+        EXPECT_EQ(expires, nextDeadline());
+        clock.advanceTo(expires - 1ns);
+        ASSERT_TRUE(expire(clock.now()));
+        EXPECT_TRUE(registered(live.downstream));
+        clock.advanceTo(expires);
+        ASSERT_TRUE(expire(clock.now()));
+        EXPECT_FALSE(registered(live.downstream));
+        EXPECT_FALSE(registered(live.upstream));
+        EXPECT_EQ(0u, totalCount());
+        EXPECT_FALSE(nextDeadline());
+        EXPECT_EQ(0, recv(client.peer.get(), &byte, 1, 0));
+        EXPECT_EQ(0, recv(upstream.peer.get(), &byte, 1, 0));
+    }
+}
+
+TEST_F(IdleHandoffTest, PreparationReachingConnectDeadlineRollsBackTheIdleKeyAndWatches) {
+    auto client = test::socketPair();
+    auto upstream = test::socketPair();
+    const auto fds = {client.local.get(), upstream.local.get()};
+    const auto deadline = clock.now() + 1ms;
+    auto pending = installPending(client, upstream, deadline);
+    preparation_ends = deadline;
+    ASSERT_TRUE(dispatch({pending, EPOLLOUT}));
+    EXPECT_EQ(1, observed_preparations);
+    EXPECT_EQ(deadline, clock.now());
+    EXPECT_EQ(0u, pendingCount());
+    EXPECT_EQ(0u, sessionCount());
+    EXPECT_EQ(0u, totalCount());
+    EXPECT_FALSE(nextWakeup());
+    EXPECT_TRUE(listenerAccepting());
+    for (auto id : {pending, pending + 1, pending + 2}) {
+        EXPECT_FALSE(registered(id));
+        EXPECT_FALSE(watching(id));
+    }
+    for (int fd : fds) {
+        EXPECT_EQ(-1, fcntl(fd, F_GETFD));
+        EXPECT_EQ(EBADF, errno);
+    }
+}
+
 TEST_F(ControlledReactorTest, ExpiredPendingHandoffReleasesBothSockets) {
     auto client = test::socketPair();
     auto attempt = test::socketPair();
