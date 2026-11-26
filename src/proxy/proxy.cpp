@@ -1,7 +1,5 @@
 #include "proxy/proxy.h"
 
-#include <algorithm>
-#include <array>
 #include <cassert>
 #include <cstdint>
 #include <expected>
@@ -123,6 +121,7 @@ ProxyReactor::ProxyReactor(detail::EpollPoller poller, FileDescriptor shutdown_s
                   },
               .forwarder_buffer_capacity = forwarder_buf_cap,
               .sender_buffer_capacity = sender_buf_cap,
+              .buffer_budget = resources.buffer_budget,
           },
           operations.stream, operations.allocation),
       shutdown_signal_fd_(std::move(shutdown_signal_fd)),
@@ -158,6 +157,9 @@ ProxyReactor::createImpl(const net::ListenSocketAddress& listen_address,
     }
     if (!resources.validConnectionLimits()) {
         return std::unexpected(ProxyCreateError{"Invalid connection admission limits"});
+    }
+    if (!resources.validBufferBudget()) {
+        return std::unexpected(ProxyCreateError{"Invalid global forwarding buffer budget"});
     }
     auto poller_create_result = detail::EpollPoller::create(operations.epoll);
     if (!poller_create_result) {
@@ -221,7 +223,7 @@ Status<ProxyRuntimeError> ProxyReactor::start() {
         if (auto armed = synchronizeTimer(); !armed) {
             return std::unexpected(ProxyRuntimeError{armed.error().message()});
         }
-        auto wait_result = poller_.wait();
+        auto wait_result = poller_.wait(session_manager_.hasReadyRead());
         if (!wait_result) {
             return std::unexpected(ProxyRuntimeError{wait_result.error().message()});
         }
@@ -237,6 +239,11 @@ Status<ProxyRuntimeError> ProxyReactor::start() {
                 break;
             }
         }
+        if (!shouldStop()) {
+            if (auto resumed = resumeReadyRead(); !resumed) {
+                return std::unexpected(ProxyRuntimeError{resumed.error().message});
+            }
+        }
     }
 
     if (auto disarmed = synchronizeTimer(); !disarmed) {
@@ -245,7 +252,15 @@ Status<ProxyRuntimeError> ProxyReactor::start() {
     return {};
 }
 
-Status<FatalReactorError> ProxyReactor::dispatch(detail::ReadyEvent event) {
+Status<FatalReactorError> ProxyReactor::resumeReadyRead() {
+    if (auto source = session_manager_.takeReadyRead()) {
+        // This also retries a hung-up source whose readable edge was already consumed.
+        return dispatch({*source, EPOLLIN}, true);
+    }
+    return {};
+}
+
+Status<FatalReactorError> ProxyReactor::dispatch(detail::ReadyEvent event, bool from_wait_queue) {
     auto registration = sources_.find(event.source_id);
 
     if (!registration) {
@@ -254,7 +269,9 @@ Status<FatalReactorError> ProxyReactor::dispatch(detail::ReadyEvent event) {
 
     auto status = std::visit(
         overloaded{
-            [&](detail::EndpointRegistration r) { return handleEndpoint(r, event.events); },
+            [&](detail::EndpointRegistration r) {
+                return handleEndpoint(r, event.events, from_wait_queue);
+            },
             [&](detail::ListenerRegistration r) -> Status<FatalReactorError> {
                 if (event.events & (EPOLLERR | EPOLLHUP)) {
                     return std::unexpected(FatalReactorError{"Listener reported error or hangup"});
@@ -471,7 +488,7 @@ Result<detail::SessionId, ConnectionFailure> ProxyReactor::addSession(FileDescri
 }
 
 Status<FatalReactorError> ProxyReactor::handleEndpoint(detail::EndpointRegistration registration,
-                                                       uint32_t event_mask) {
+                                                       uint32_t event_mask, bool from_wait_queue) {
     detail::SessionId session_id = registration.session_id;
 
     if (!session_manager_.contains(session_id)) {
@@ -485,9 +502,6 @@ Status<FatalReactorError> ProxyReactor::handleEndpoint(detail::EndpointRegistrat
     }
     auto* idle = idle_deadline ? &*idle_deadline : nullptr;
 
-    using SessionEventHandler = detail::SessionEventResult (detail::SessionManager::*)(
-        detail::SessionId, detail::EndpointRole, detail::IdleDeadline*);
-
     // Error and full hangup supersede ordinary readiness in the same notification.
     // A full hangup has its own bounded read and cannot accept queued output.
     if (event_mask & (EPOLLERR | EPOLLHUP)) {
@@ -500,19 +514,25 @@ Status<FatalReactorError> ProxyReactor::handleEndpoint(detail::EndpointRegistrat
         return {};
     }
 
-    static constexpr std::array<std::pair<uint32_t, SessionEventHandler>, 3> handlers = {{
-        {EPOLLIN, &detail::SessionManager::handleReadable},
-        {EPOLLOUT, &detail::SessionManager::handleWritable},
-        {EPOLLRDHUP, &detail::SessionManager::handlePeerHalfClosed},
-    }};
-
-    for (const auto& [event_flag, handler] : handlers) {
+    for (auto event_flag : {EPOLLIN, EPOLLOUT, EPOLLRDHUP}) {
         if (!(event_mask & event_flag)) {
             continue;
         }
 
-        auto result = applySessionEventResult(
-            session_id, (session_manager_.*handler)(session_id, registration.role, idle), idle);
+        detail::SessionEventResult action;
+        switch (event_flag) {
+        case EPOLLIN:
+            action = session_manager_.handleReadable(session_id, registration.role, idle,
+                                                     from_wait_queue);
+            break;
+        case EPOLLOUT:
+            action = session_manager_.handleWritable(session_id, registration.role, idle);
+            break;
+        default:
+            action = session_manager_.handlePeerHalfClosed(session_id, registration.role, idle);
+            break;
+        }
+        auto result = applySessionEventResult(session_id, action, idle);
         if (!result) {
             return std::unexpected(result.error());
         }

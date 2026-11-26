@@ -59,9 +59,8 @@ public:
     // Whether a source is currently being watched.
     bool isWatching(SourceId id) const;
 
-    // Blocks until at least one watched source becomes ready. Interruptions
-    // are retried internally.
-    Result<std::vector<ReadyEvent>, std::error_code> wait();
+    // Blocks until readiness by default. A runnable continuation can request a zero-time poll.
+    Result<std::vector<ReadyEvent>, std::error_code> wait(bool nonblocking = false);
 
 private:
     static constexpr std::size_t event_buf_cap = 1024;

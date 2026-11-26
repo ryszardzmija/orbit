@@ -26,11 +26,12 @@ void SendBuffer::ListNode::setNext(std::unique_ptr<ListNode> next) { next_ = std
 
 // SendBuffer
 SendBuffer::SendBuffer(size_t block_size, size_t high_watermark, size_t low_watermark,
-                       AllocationChecks allocation)
+                       AllocationChecks allocation, BufferBudget* budget)
     : block_size_(block_size),
       high_watermark_(high_watermark),
       low_watermark_(low_watermark),
-      allocation_(allocation) {
+      allocation_(allocation),
+      budget_(budget) {
     if (block_size == 0) {
         throw std::invalid_argument("block_size cannot be zero, got block_size=" +
                                     std::to_string(block_size));
@@ -76,18 +77,53 @@ size_t SendBuffer::remainingCapacity() const {
 }
 
 bool SendBuffer::write(std::span<const uint8_t> data) {
-    if (data.size() > remainingCapacity()) {
+    auto reservation = reserveAppend(data.size());
+    return write(data, reservation);
+}
+
+size_t SendBuffer::tailCapacity() const { return tail_ ? block_size_ - write_pos_ : 0; }
+
+size_t SendBuffer::blocksNeeded(size_t bytes) const {
+    const size_t reusable = tailCapacity();
+    if (bytes <= reusable) {
+        return 0;
+    }
+    const size_t needed = bytes - reusable;
+    return needed / block_size_ + (needed % block_size_ != 0);
+}
+
+SendBuffer::AppendReservation SendBuffer::reserveAppend(size_t requested, bool allow_new_blocks) {
+    requested = std::min(requested, remainingCapacity());
+    if (!budget_) {
+        return {*this, requested, {}};
+    }
+    const size_t needed = blocksNeeded(requested);
+    const size_t available = allow_new_blocks ? budget_->available() / block_size_ : 0;
+    const size_t reserved_blocks = std::min(needed, available);
+    auto blocks = budget_->reserve(reserved_blocks * block_size_);
+    if (reserved_blocks < needed) {
+        // This sum is strictly smaller than requested.
+        requested = tailCapacity() + reserved_blocks * block_size_;
+    }
+    return {*this, requested, std::move(blocks)};
+}
+
+bool SendBuffer::write(std::span<const uint8_t> data, AppendReservation& reservation) {
+    if (reservation.buffer_ != this || data.size() > reservation.capacity() ||
+        data.size() > remainingCapacity() ||
+        (budget_ && blocksNeeded(data.size()) > reservation.blocks_.bytes() / block_size_)) {
         return false;
     }
-    writeData(data);
+    reservation.buffer_ = nullptr;
+    writeData(data, reservation.blocks_);
     updateStatus();
     return true;
 }
 
-void SendBuffer::writeData(std::span<const uint8_t> data) {
+void SendBuffer::writeData(std::span<const uint8_t> data, BufferBudget::Reservation& blocks) {
     while (!data.empty()) {
         if (tail_ == nullptr || write_pos_ == block_size_) {
-            addBlock();
+            addBlock(blocks);
         }
 
         size_t to_copy = std::min(data.size(), block_size_ - write_pos_);
@@ -98,7 +134,7 @@ void SendBuffer::writeData(std::span<const uint8_t> data) {
     }
 }
 
-void SendBuffer::addBlock() {
+void SendBuffer::addBlock(BufferBudget::Reservation& blocks) {
     allocation_.check(AllocationPoint::PayloadBlock);
     if (tail_ == nullptr) {
         head_ = std::make_unique<ListNode>(block_size_);
@@ -109,6 +145,9 @@ void SendBuffer::addBlock() {
     }
     write_pos_ = 0;
     allocated_capacity_ += block_size_;
+    if (budget_) {
+        blocks.commit(block_size_);
+    }
 }
 
 uint8_t* SendBuffer::getDestPtr() { return tail_->data().subspan(write_pos_).data(); }
@@ -165,6 +204,9 @@ void SendBuffer::consumeData(size_t num_bytes) {
 void SendBuffer::discardBlock() {
     head_ = head_->takeNext();
     allocated_capacity_ -= block_size_;
+    if (budget_) {
+        budget_->release(block_size_);
+    }
     if (head_ == nullptr) {
         tail_ = nullptr;
         write_pos_ = 0;

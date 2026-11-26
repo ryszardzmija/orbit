@@ -24,12 +24,16 @@ struct ForwardError {
     FailedOp failed_op;
 };
 
+enum class ForwardOutcome { KeepOpen, WaitForCapacity };
+
 class Forwarder {
 public:
     static Forwarder create(size_t capacity);
 
-    Status<ForwardError> forward(SessionEndpoint& source, SessionEndpoint& destination,
-                                 IdleDeadline* idle, const net::StreamOperations& operations);
+    Result<ForwardOutcome, ForwardError> forward(SessionEndpoint& source,
+                                                 SessionEndpoint& destination, IdleDeadline* idle,
+                                                 const net::StreamOperations& operations,
+                                                 bool allow_new_blocks);
 
 private:
     explicit Forwarder(size_t capacity);

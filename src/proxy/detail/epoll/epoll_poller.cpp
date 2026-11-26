@@ -143,10 +143,10 @@ Status<std::error_code> EpollPoller::retire(SourceId id) {
 
 bool EpollPoller::isWatching(SourceId id) const { return watched_.contains(id); }
 
-Result<std::vector<ReadyEvent>, std::error_code> EpollPoller::wait() {
+Result<std::vector<ReadyEvent>, std::error_code> EpollPoller::wait(bool nonblocking) {
     while (true) {
         int n = epoll_wait(epfd_.get(), event_buffer_.data(),
-                           static_cast<int>(event_buffer_.size()), -1);
+                           static_cast<int>(event_buffer_.size()), nonblocking ? 0 : -1);
 
         if (n == -1 && errno == EINTR) {
             continue;

@@ -62,7 +62,10 @@ SessionEventResult closeSession(std::optional<std::string> error = std::nullopt)
 
 SessionManager::SessionManager(const SessionManagerOptions& options,
                                net::StreamOperations operations, AllocationChecks allocation)
-    : send_buffer_factory_(options.send_buffer, allocation),
+    : buffer_budget_(std::make_unique<BufferBudget>(options.buffer_budget)),
+      block_size_(options.send_buffer.block_size),
+      allocation_(allocation),
+      send_buffer_factory_(options.send_buffer, allocation, *buffer_budget_),
       forwarder_(Forwarder::create(options.forwarder_buffer_capacity)),
       sender_(PendingDataSender::create(options.sender_buffer_capacity)),
       operations_(operations) {}
@@ -92,6 +95,9 @@ void SessionManager::add(SessionId id, Session session, SessionSourceIds source_
 }
 
 void SessionManager::remove(SessionId id) {
+    auto& session = getSession(id);
+    cancelReadWait(session.downstream);
+    cancelReadWait(session.upstream);
     size_t erased = sessions_.erase(id);
     assert(erased == 1 && "session ID not found");
 }
@@ -99,6 +105,33 @@ void SessionManager::remove(SessionId id) {
 bool SessionManager::contains(SessionId id) const { return sessions_.contains(id); }
 
 bool SessionManager::empty() const { return sessions_.empty(); }
+
+bool SessionManager::hasReadyRead() const {
+    return !waiting_reads_.empty() && buffer_budget_->available() >= block_size_;
+}
+
+std::optional<SourceId> SessionManager::takeReadyRead() {
+    if (!hasReadyRead()) {
+        return std::nullopt;
+    }
+    const auto [id, role] = waiting_reads_.front();
+    auto it = sessions_.find(id);
+    if (it == sessions_.end()) {
+        waiting_reads_.pop_front();
+        return std::nullopt;
+    }
+    auto& managed = it->second;
+    cancelReadWait(getEndpoint(managed.session, role));
+    return role == EndpointRole::Downstream ? managed.source_ids.downstream
+                                            : managed.source_ids.upstream;
+}
+
+void SessionManager::cancelReadWait(SessionEndpoint& endpoint) {
+    if (auto wait = endpoint.state.capacity_wait) {
+        waiting_reads_.erase(*wait);
+        endpoint.state.capacity_wait.reset();
+    }
+}
 
 SessionSourceIds SessionManager::sourceIds(SessionId id) const {
     return getManagedSession(id).source_ids;
@@ -118,7 +151,7 @@ bool SessionManager::shouldRetire(SessionId id, EndpointRole role) const {
 }
 
 SessionEventResult SessionManager::handleReadable(SessionId id, EndpointRole role,
-                                                  IdleDeadline* idle) {
+                                                  IdleDeadline* idle, bool from_wait_queue) {
     Session& session = getSession(id);
     SessionEndpoint& source = getEndpoint(session, role);
     SessionEndpoint& destination = getOtherEndpoint(session, role);
@@ -130,12 +163,24 @@ SessionEventResult SessionManager::handleReadable(SessionId id, EndpointRole rol
         return keepOpen();
     }
 
-    if (auto result = forwarder_.forward(source, destination, idle, operations_); !result) {
+    // While a waiter exists, newly ready directions may use tail space but cannot take a block.
+    const bool allow_new_blocks = from_wait_queue || waiting_reads_.empty();
+    auto result = forwarder_.forward(source, destination, idle, operations_, allow_new_blocks);
+    if (!result) {
         if (result.error().failed_op == FailedOp::Buffer &&
             result.error().code == std::errc::not_enough_memory) {
             return closeSession();
         }
         return closeSession("Forwarding failed: " + result.error().code.message());
+    }
+    if (*result == ForwardOutcome::WaitForCapacity) {
+        try {
+            allocation_.check(AllocationPoint::WaitingRead);
+            source.state.capacity_wait = waiting_reads_.insert(waiting_reads_.end(), {id, role});
+        } catch (const std::bad_alloc&) {
+            return closeSession();
+        }
+        return keepOpen();
     }
 
     if (auto result = halfCloseIfReady(source, destination, idle); !result) {
@@ -189,6 +234,7 @@ SessionEventResult SessionManager::handleHangup(SessionId id, EndpointRole role,
     Session& session = getSession(id);
     SessionEndpoint& hungup = getEndpoint(session, role);
     hungup.state.send_buffer.reset();
+    cancelReadWait(getOtherEndpoint(session, role));
     hungup.state.peer_half_closed = true;
     if (shouldClose(session)) {
         return closeSession();
@@ -213,6 +259,7 @@ SessionEventResult SessionManager::handleError(SessionId id, EndpointRole role) 
 SessionEndpoint SessionManager::getInitialSessionEndpoint(FileDescriptor fd) const {
     EndpointState endpoint_state = {
         .send_buffer = send_buffer_factory_.make(),
+        .capacity_wait = std::nullopt,
         .peer_half_closed = false,
         .half_close_sent = false,
         .done_reading = false,
@@ -266,6 +313,7 @@ EndpointInterests SessionManager::getInterests(const SessionEndpoint& endpoint,
         // Stop reading once the destination has hung up: anything we read could only be forwarded
         // to a socket that can no longer receive it.
         .readable = !endpoint.state.done_reading && other.state.canWrite() &&
+                    !endpoint.state.capacity_wait &&
                     other.state.send_buffer->status() == SendBuffer::BufferStatus::Accepting,
         // Never attempt to write to a hung-up socket.
         .writable = endpoint.state.canWrite() && !endpoint.state.send_buffer->empty(),
