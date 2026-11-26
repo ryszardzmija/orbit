@@ -6,6 +6,7 @@
 #include <system_error>
 #include <variant>
 
+#include "common/steady_time_source.h"
 #include "net/dialer.h"
 #include "proxy/detail/pending_connection.h"
 #include "proxy/detail/resolved_upstream.h"
@@ -42,22 +43,25 @@ public:
 
     std::expected<UpstreamDialResult, UpstreamDialError>
     dial(FileDescriptor accepted_connection, const net::SocketAddress& accepted_address,
-         Deadline deadline);
+         Deadline deadline, const SteadyTimeSource& time_source);
     std::expected<UpstreamDialResult, UpstreamDialError>
-    advanceDialAttempt(PendingConnection pending_connection);
+    advanceDialAttempt(PendingConnection pending_connection, const SteadyTimeSource& time_source);
 
     const net::ResolutionEndpoint& upstreamEndpoint() const;
 
 private:
     friend class UpstreamDialerTest;
-    explicit UpstreamDialer(detail::ResolvedUpstream resolved_upstream);
+    explicit UpstreamDialer(detail::ResolvedUpstream resolved_upstream,
+                            net::DialOperations operations = {});
 
     void addError(PendingConnection& pending_connection, net::DialFailedOp failed_op,
                   std::error_code error_code);
     std::expected<UpstreamDialResult, UpstreamDialError>
-    tryCandidatesFrom(PendingConnection pending_connection, std::size_t first_candidate_idx);
+    tryCandidatesFrom(PendingConnection pending_connection, std::size_t first_candidate_idx,
+                      const SteadyTimeSource& time_source);
 
     detail::ResolvedUpstream resolved_upstream_;
+    net::DialOperations operations_;
 };
 
 } // namespace orbit::proxy::detail

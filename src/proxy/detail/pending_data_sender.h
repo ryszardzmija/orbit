@@ -5,6 +5,7 @@
 #include <string>
 
 #include "common/status.h"
+#include "net/socket_io.h"
 #include "proxy/detail/session/idle_deadline.h"
 #include "proxy/detail/session/session_state.h"
 
@@ -18,7 +19,8 @@ class PendingDataSender {
 public:
     static PendingDataSender create(size_t capacity);
 
-    Status<SendError> sendPending(SessionEndpoint& destination, IdleDeadline* idle);
+    Status<SendError> sendPending(SessionEndpoint& destination, IdleDeadline* idle,
+                                  const net::StreamOperations& operations);
 
 private:
     explicit PendingDataSender(size_t capacity);

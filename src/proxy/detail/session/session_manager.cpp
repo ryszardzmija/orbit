@@ -60,10 +60,12 @@ SessionEventResult closeSession(std::optional<std::string> error = std::nullopt)
 
 } // namespace
 
-SessionManager::SessionManager(const SessionManagerOptions& options)
+SessionManager::SessionManager(const SessionManagerOptions& options,
+                               net::StreamOperations operations)
     : send_buffer_factory_(options.send_buffer),
       forwarder_(Forwarder::create(options.forwarder_buffer_capacity)),
-      sender_(PendingDataSender::create(options.sender_buffer_capacity)) {}
+      sender_(PendingDataSender::create(options.sender_buffer_capacity)),
+      operations_(operations) {}
 
 SessionId SessionManager::allocateId() { return session_id_generator_.getNextId(); }
 
@@ -121,7 +123,7 @@ SessionEventResult SessionManager::handleReadable(SessionId id, EndpointRole rol
         return keepOpen();
     }
 
-    if (auto result = forwarder_.forward(source, destination, idle); !result) {
+    if (auto result = forwarder_.forward(source, destination, idle, operations_); !result) {
         return closeSession("Forwarding failed: " + result.error().message);
     }
 
@@ -145,7 +147,7 @@ SessionEventResult SessionManager::handleWritable(SessionId id, EndpointRole rol
         return keepOpen();
     }
 
-    if (auto result = sender_.sendPending(destination, idle); !result) {
+    if (auto result = sender_.sendPending(destination, idle, operations_); !result) {
         return closeSession("Sending pending outbound data failed: " + result.error().message);
     }
 

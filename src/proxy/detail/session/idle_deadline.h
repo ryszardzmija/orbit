@@ -5,6 +5,7 @@
 #include <optional>
 #include <utility>
 
+#include "common/steady_time_source.h"
 #include "proxy/detail/deadlines.h"
 
 namespace orbit::proxy::detail {
@@ -14,17 +15,19 @@ namespace orbit::proxy::detail {
 // owns the scheduled entry and applies the resulting refresh or close.
 class IdleDeadline {
 public:
-    IdleDeadline(Deadline expires_at, std::chrono::milliseconds interval)
+    IdleDeadline(Deadline expires_at, std::chrono::milliseconds interval,
+                 const SteadyTimeSource& time_source)
         : expires_at_(expires_at),
-          interval_(interval) {}
+          interval_(interval),
+          time_source_(time_source) {}
 
-    bool canStartIo() { return !expired_ && check(DeadlineClock::now()); }
+    bool canStartIo() { return !expired_ && check(time_source_.now()); }
 
     bool recordTransfer(size_t bytes) {
         if (bytes == 0) {
             return !expired_;
         }
-        const auto observed_at = DeadlineClock::now();
+        const auto observed_at = time_source_.now();
         if (!check(observed_at)) {
             return false;
         }
@@ -50,6 +53,7 @@ private:
 
     Deadline expires_at_;
     std::chrono::milliseconds interval_;
+    const SteadyTimeSource& time_source_;
     bool expired_ = false;
     bool refreshed_ = false;
 };

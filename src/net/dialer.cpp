@@ -11,8 +11,13 @@
 namespace orbit::net {
 
 std::expected<DialSuccess, DialError> dial(const SocketAddress& address,
-                                           std::chrono::steady_clock::time_point deadline) {
-    int fd = socket(address.addr.ss_family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+                                           SteadyTimeSource::TimePoint deadline,
+                                           const SteadyTimeSource& time_source,
+                                           const DialOperations& operations) {
+    const int family = address.addr.ss_family;
+    constexpr int socket_type = SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC;
+    int fd = operations.socket ? operations.socket(operations.context, family, socket_type, 0)
+                               : ::socket(family, socket_type, 0);
     if (fd == -1) {
         return std::unexpected(DialError{
             .code = std::error_code(errno, std::system_category()),
@@ -22,13 +27,16 @@ std::expected<DialSuccess, DialError> dial(const SocketAddress& address,
     FileDescriptor socket_fd(fd);
 
     // Socket creation can consume the remaining budget for this attempt.
-    if (std::chrono::steady_clock::now() >= deadline) {
+    if (time_source.now() >= deadline) {
         return std::unexpected(DialError{
             .code = std::make_error_code(std::errc::timed_out),
             .failed_op = DialFailedOp::Deadline,
         });
     }
-    int result = connect(fd, reinterpret_cast<const sockaddr*>(&address.addr), address.addrlen);
+    const auto* socket_address = reinterpret_cast<const sockaddr*>(&address.addr);
+    int result = operations.connect
+                     ? operations.connect(operations.context, fd, socket_address, address.addrlen)
+                     : ::connect(fd, socket_address, address.addrlen);
 
     if (result == -1 && errno == EINPROGRESS) {
         return DialSuccess{

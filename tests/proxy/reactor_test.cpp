@@ -1,12 +1,15 @@
 #include <algorithm>
 #include <cerrno>
+#include <chrono>
 #include <fcntl.h>
+#include <optional>
 #include <vector>
 
 #include <gtest/gtest.h>
 #include <poll.h>
 #include <sys/epoll.h>
 #include <sys/socket.h>
+#include <sys/timerfd.h>
 
 #include "reactor_fixture.h"
 
@@ -152,30 +155,37 @@ TEST_F(ProxyReactorTest, GracefulShutdownCancelsPendingsAndTimerEscalatesEstabli
     EXPECT_EQ(0, recv(backend.peer.get(), &byte, 1, 0));
 }
 
-TEST_F(ProxyReactorTest, ExpiredBudgetBeatsAlreadyWritableCompletion) {
+TEST_F(ControlledReactorTest, ExpiredBudgetBeatsAlreadyWritableCompletion) {
     auto client = test::socketPair();
     auto attempt = test::socketPair();
-    auto pending = installPending(client, attempt, detail::DeadlineClock::now());
+    const auto at = clock.now() + 10ms;
+    auto pending = installPending(client, attempt, at);
+    ASSERT_EQ(at, nextDeadline());
+    clock.advanceTo(at);
     // SO_ERROR on this connected socket is zero. Its copied completion precedes the timer.
     ASSERT_TRUE(dispatch({pending, EPOLLOUT}));
     EXPECT_FALSE(registered(pending));
+    EXPECT_FALSE(watching(pending));
     EXPECT_FALSE(nextDeadline());
     char byte;
     EXPECT_EQ(0, recv(client.peer.get(), &byte, 1, 0));
     EXPECT_EQ(0, recv(attempt.peer.get(), &byte, 1, 0));
 }
 
-TEST_F(ProxyReactorTest, SuccessfulPromotionCancelsDialDeadlineAndRetainsHalfClosedRequest) {
+TEST_F(ControlledReactorTest, SuccessfulPromotionCancelsDialDeadlineAndRetainsHalfClosedRequest) {
     auto client = test::socketPair();
     auto attempt = test::socketPair();
     ASSERT_EQ(1, send(client.peer.get(), "q", 1, 0));
     ASSERT_EQ(0, shutdown(client.peer.get(), SHUT_WR));
-    auto pending = installPending(client, attempt);
-    ASSERT_TRUE(nextDeadline());
+    const auto at = clock.now() + 10ms;
+    auto pending = installPending(client, attempt, at);
+    ASSERT_EQ(at, nextDeadline());
+    clock.advanceTo(at - 1ns);
     ASSERT_TRUE(dispatch({pending, EPOLLOUT}));
     EXPECT_FALSE(nextDeadline());
     EXPECT_FALSE(registered(pending));
-    ASSERT_TRUE(expire(detail::DeadlineClock::now() + 20s));
+    clock.advanceTo(at);
+    ASSERT_TRUE(expire(clock.now()));
     auto live = currentSessionSources();
     ASSERT_TRUE(dispatch({live.downstream, EPOLLIN}));
     ASSERT_TRUE(dispatch({live.downstream, EPOLLIN}));
@@ -212,17 +222,93 @@ TEST_F(ProxyReactorTest, StalledAttemptExpiresWithoutDisturbingEstablishedTraffi
     EXPECT_EQ('a', byte);
 }
 
-TEST_F(ProxyReactorTest, ExpiredConnectedHandoffReleasesBothRegisteredEndpoints) {
+class ConnectedHandoffDeadlineTest : public ControlledReactorTest,
+                                     public testing::WithParamInterface<std::chrono::nanoseconds> {
+protected:
+    void SetUp() override {
+        createReactor({.idle = 60s},
+                      {this, [](void* context) noexcept {
+                           auto& fixture = *static_cast<ConnectedHandoffDeadlineTest*>(context);
+                           const auto now = fixture.clock.source().now();
+                           if (now == fixture.handoff_time) {
+                               const auto [downstream, upstream] = fixture.handoff_sources;
+                               fixture.observed_both_endpoints =
+                                   fixture.registered(downstream) && fixture.watching(downstream) &&
+                                   fixture.registered(upstream) && fixture.watching(upstream);
+                           }
+                           return now;
+                       }});
+    }
+
+    std::optional<detail::Deadline> handoff_time;
+    detail::SessionSourceIds handoff_sources{};
+    bool observed_both_endpoints = false;
+};
+
+TEST_P(ConnectedHandoffDeadlineTest, ExpiredHandoffReleasesBothRegisteredEndpoints) {
     auto client = test::socketPair();
     auto backend = test::socketPair();
-    ASSERT_TRUE(dialResult(detail::UpstreamDialConnected{
-        std::move(client.local), std::move(backend.local), {}, {}, detail::DeadlineClock::now()}));
+    const int client_fd = client.local.get();
+    const int backend_fd = backend.local.get();
+    const auto at = clock.now() + 1ms;
+    const auto pending = installPending(client, backend, at);
+    ASSERT_EQ(at, nextDeadline());
+    ASSERT_TRUE(watching(pending));
+    // The handoff allocates the next two source IDs for the connected endpoints.
+    handoff_sources = {pending + 1, pending + 2};
+    handoff_time = at + GetParam();
+    clock.advanceTo(at - 1ns);
+    clock.advanceAfterNextRead(*handoff_time);
+
+    // Completion reads just before expiry. The handoff reads after both watches are added.
+    ASSERT_TRUE(dispatch({pending, EPOLLOUT}));
+    EXPECT_TRUE(observed_both_endpoints);
+    for (auto source : {pending, handoff_sources.downstream, handoff_sources.upstream}) {
+        EXPECT_FALSE(registered(source)) << source;
+        EXPECT_FALSE(watching(source)) << source;
+    }
     EXPECT_FALSE(nextDeadline());
+    for (int fd : {client_fd, backend_fd}) {
+        EXPECT_EQ(-1, fcntl(fd, F_GETFD)) << fd;
+        EXPECT_EQ(EBADF, errno) << fd;
+    }
     char byte;
     EXPECT_EQ(0, recv(client.peer.get(), &byte, 1, 0));
     EXPECT_EQ(0, recv(backend.peer.get(), &byte, 1, 0));
     ASSERT_TRUE(shutdownRequest());
     EXPECT_TRUE(stopped());
+}
+
+INSTANTIATE_TEST_SUITE_P(ConnectDeadline, ConnectedHandoffDeadlineTest, testing::Values(0ns, 1ns),
+                         [](const testing::TestParamInfo<std::chrono::nanoseconds>& info) {
+                             return info.param == 0ns ? "AtDeadline" : "AfterDeadline";
+                         });
+
+TEST_F(ControlledReactorTest, ExpiredPendingHandoffReleasesBothSockets) {
+    auto client = test::socketPair();
+    auto attempt = test::socketPair();
+    const auto at = clock.now() + 1ms;
+    clock.advanceTo(at);
+    ASSERT_TRUE(dialResult(detail::UpstreamDialInProgress{
+        {std::move(client.local), {}, std::move(attempt.local), 0, at, {}}}));
+    EXPECT_FALSE(nextDeadline());
+    char byte;
+    EXPECT_EQ(0, recv(client.peer.get(), &byte, 1, 0));
+    EXPECT_EQ(0, recv(attempt.peer.get(), &byte, 1, 0));
+}
+
+TEST_F(ControlledReactorTest, SimulatedDeadlineCannotArmKernelTimer) {
+    auto client = test::socketPair();
+    auto attempt = test::socketPair();
+    installPending(client, attempt, clock.now() + 1ms);
+    ASSERT_TRUE(nextDeadline());
+    auto result = arm();
+    ASSERT_FALSE(result);
+    EXPECT_EQ(std::errc::operation_not_supported, result.error());
+    itimerspec timer{};
+    ASSERT_EQ(0, timerfd_gettime(timerFd(), &timer));
+    EXPECT_EQ(0, timer.it_value.tv_sec);
+    EXPECT_EQ(0, timer.it_value.tv_nsec);
 }
 
 TEST_F(ProxyReactorTest, RegistrationFailureReleasesClientAndDialDeadline) {

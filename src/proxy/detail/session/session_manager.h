@@ -8,6 +8,7 @@
 #include <absl/container/flat_hash_map.h>
 
 #include "common/fd.h"
+#include "net/socket_io.h"
 #include "proxy/detail/buffer/send_buffer_factory.h"
 #include "proxy/detail/buffer/send_buffer_options.h"
 #include "proxy/detail/forwarding.h"
@@ -56,7 +57,8 @@ struct SessionEventResult {
 // Owns active sessions and performs session-local I/O and state transitions.
 class SessionManager {
 public:
-    explicit SessionManager(const SessionManagerOptions& options);
+    explicit SessionManager(const SessionManagerOptions& options,
+                            net::StreamOperations operations = {});
 
     SessionId allocateId();
     void add(SessionId id, FileDescriptor downstream, FileDescriptor upstream,
@@ -104,6 +106,7 @@ private:
     SendBufferFactory send_buffer_factory_;
     Forwarder forwarder_;
     PendingDataSender sender_;
+    net::StreamOperations operations_;
 };
 
 } // namespace orbit::proxy::detail

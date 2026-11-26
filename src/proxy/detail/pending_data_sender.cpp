@@ -17,7 +17,8 @@ PendingDataSender PendingDataSender::create(size_t capacity) {
     return PendingDataSender(capacity);
 }
 
-Status<SendError> PendingDataSender::sendPending(SessionEndpoint& destination, IdleDeadline* idle) {
+Status<SendError> PendingDataSender::sendPending(SessionEndpoint& destination, IdleDeadline* idle,
+                                                 const net::StreamOperations& operations) {
     assert(destination.state.send_buffer != nullptr);
 
     size_t bytes_buffered =
@@ -27,8 +28,8 @@ Status<SendError> PendingDataSender::sendPending(SessionEndpoint& destination, I
         return {};
     }
 
-    auto send_result =
-        net::trySend(destination.fd.get(), std::span<const uint8_t>(buf_.get(), bytes_buffered));
+    auto send_result = net::trySend(
+        destination.fd.get(), std::span<const uint8_t>(buf_.get(), bytes_buffered), operations);
     if (!send_result) {
         return std::unexpected(SendError{send_result.error().message()});
     }

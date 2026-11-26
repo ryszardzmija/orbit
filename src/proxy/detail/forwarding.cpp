@@ -19,11 +19,13 @@ Forwarder Forwarder::create(size_t capacity) {
 }
 
 Status<ForwardError> Forwarder::forward(SessionEndpoint& source, SessionEndpoint& destination,
-                                        IdleDeadline* idle) {
+                                        IdleDeadline* idle,
+                                        const net::StreamOperations& operations) {
     assert(destination.state.send_buffer != nullptr);
     assert(destination.state.send_buffer->status() == SendBuffer::BufferStatus::Accepting);
 
-    auto recv_result = net::tryRecv(source.fd.get(), std::span<uint8_t>(buf_.get(), capacity_));
+    auto recv_result =
+        net::tryRecv(source.fd.get(), std::span<uint8_t>(buf_.get(), capacity_), operations);
     if (!recv_result) {
         return std::unexpected(ForwardError{
             .message = recv_result.error().message(),
@@ -53,8 +55,8 @@ Status<ForwardError> Forwarder::forward(SessionEndpoint& source, SessionEndpoint
         if (idle && !idle->canStartIo()) {
             return {};
         }
-        auto send_result =
-            net::trySend(destination.fd.get(), std::span<uint8_t>(buf_.get(), bytes_read));
+        auto send_result = net::trySend(destination.fd.get(),
+                                        std::span<uint8_t>(buf_.get(), bytes_read), operations);
         if (!send_result) {
             bufferData(destination, bytes_read);
             return std::unexpected(ForwardError{
