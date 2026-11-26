@@ -937,7 +937,9 @@ ProxyReactor::enqueueDeferredDial(detail::SourceId id, const detail::PendingConn
 
 Status<FatalReactorError> ProxyReactor::resumeDeferredDials() {
     // Give each queued dial at most one opportunity this turn, alternating eligible queues.
-    // A completion that needs a fresh socket joins the attempt FIFO for a later turn.
+    // A failed completion may try one fallback socket in the same slot outside cooldown.
+    // If cooldown or the slot's budget prevents a fresh socket, the next candidate
+    // waits in the socket-attempt FIFO.
     size_t attempts = deferred_attempts_.size();
     size_t completions = deferred_completions_.size();
     for (size_t i = 0; i < max_resumed_dials_per_turn && shutdown_state_ == ShutdownState::Running;

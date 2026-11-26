@@ -142,8 +142,11 @@ protected:
         return reactor->session_manager_.sourceIds(*ids.begin());
     }
     auto dialResult(detail::UpstreamDialResult result) {
-        ProxyReactor::AdmissionReservation admission(reactor->transient_admission_);
-        auto status = reactor->handleDialResult(std::move(result), admission);
+        Status<FatalReactorError> status;
+        {
+            ProxyReactor::AdmissionReservation admission(reactor->transient_admission_);
+            status = reactor->handleDialResult(std::move(result), admission);
+        }
         if (status) {
             synchronizeAdmission();
         }

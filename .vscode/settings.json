@@ -1,7 +1,0 @@
-{
-    "clangd.arguments": [
-        "--header-insertion=never",
-        "--completion-style=detailed"
-    ],
-    "editor.formatOnSave": true
-}
