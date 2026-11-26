@@ -1,10 +1,13 @@
 #pragma once
 
+#include <cerrno>
 #include <chrono>
 #include <optional>
 #include <stdexcept>
 
 #include <gtest/gtest.h>
+#include <poll.h>
+#include <sys/socket.h>
 
 #include "controlled_clock.h"
 #include "proxy/proxy.h"
@@ -35,6 +38,7 @@ protected:
         if (!added) {
             throw std::runtime_error(added.error().message);
         }
+        synchronizeAdmission();
         return reactor->session_manager_.sourceIds(*added);
     }
 
@@ -62,11 +66,45 @@ protected:
         if (!added) {
             throw std::system_error(added.error());
         }
+        synchronizeAdmission();
         return *added;
     }
 
     auto shutdownRequest() { return reactor->handleShutdownRequest(); }
     auto listenerId() const { return reactor->active_listener_->listener_id; }
+    bool listenerAccepting() const {
+        return reactor->active_listener_ && reactor->active_listener_->read_enabled;
+    }
+    size_t pendingCount() const { return reactor->pendingConnectionCount(); }
+    size_t sessionCount() const { return reactor->session_manager_.size(); }
+    FileDescriptor connectToListener() const {
+        const auto& listener = reactor->active_listener_->listener;
+        const auto& address = listener.localAddress();
+        int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+        if (fd == -1) {
+            throw std::system_error(errno, std::system_category());
+        }
+        FileDescriptor client(fd);
+        if (connect(client.get(), reinterpret_cast<const sockaddr*>(&address.addr),
+                    address.addrlen) != 0) {
+            if (errno != EINPROGRESS) {
+                throw std::system_error(errno, std::system_category());
+            }
+            pollfd ready{client.get(), POLLOUT, 0};
+            if (poll(&ready, 1, 1000) != 1) {
+                throw std::runtime_error("Client did not connect to the test listener");
+            }
+            int error = 0;
+            socklen_t size = sizeof(error);
+            if (getsockopt(client.get(), SOL_SOCKET, SO_ERROR, &error, &size) != 0) {
+                error = errno;
+            }
+            if (error != 0) {
+                throw std::system_error(error, std::system_category());
+            }
+        }
+        return client;
+    }
     bool stopped() const { return reactor->shouldStop(); }
     int timerFd() const { return reactor->timer_fd_.get(); }
     auto handleTimer() { return reactor->handleTimer({}); }
@@ -92,7 +130,13 @@ protected:
         return reactor->handleDialResult(std::move(result));
     }
     auto nextDeadline() const { return reactor->deadlines_.next(); }
-    auto expire(detail::Deadline now) { return reactor->expireDeadlines(now); }
+    auto expire(detail::Deadline now) {
+        auto result = reactor->expireDeadlines(now);
+        if (result) {
+            return reactor->synchronizeListener();
+        }
+        return result;
+    }
     void shortenGrace() {
         reactor->deadlines_.schedule({detail::DeadlineKind::Shutdown, 0},
                                      detail::DeadlineClock::now() + std::chrono::milliseconds(1));
@@ -101,6 +145,13 @@ protected:
     auto waitForEvents() { return reactor->poller_.wait(); }
 
     std::optional<ProxyReactor> reactor;
+
+private:
+    void synchronizeAdmission() {
+        if (auto result = reactor->synchronizeListener(); !result) {
+            throw std::system_error(result.error());
+        }
+    }
 };
 
 class ControlledReactorTest : public ProxyReactorTest {

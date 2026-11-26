@@ -171,6 +171,7 @@ protected:
 };
 
 TEST_F(FallbackReactorTest, DeadlineExpiringDuringFallbackClosesAttemptAndKeepsEstablishedTraffic) {
+    createReactor({}, clock.source(), {}, {.max_connections = 2, .max_pending_connections = 1});
     auto listener = net::Listener::create({"127.0.0.1", 0}, 4);
     ASSERT_TRUE(listener);
     setUpstreamDialer(detail::UpstreamDialerTest::withCandidates(listener->localAddress(),
@@ -192,6 +193,7 @@ TEST_F(FallbackReactorTest, DeadlineExpiringDuringFallbackClosesAttemptAndKeepsE
     auto pending = installPending(std::move(attempt));
     ASSERT_EQ(at, nextDeadline());
     ASSERT_TRUE(watching(pending));
+    ASSERT_FALSE(listenerAccepting());
     observation.advance_after_socket = at;
     clock.advanceTo(at - 1ns);
 
@@ -205,6 +207,7 @@ TEST_F(FallbackReactorTest, DeadlineExpiringDuringFallbackClosesAttemptAndKeepsE
     EXPECT_FALSE(registered(pending));
     EXPECT_FALSE(watching(pending));
     EXPECT_FALSE(nextDeadline());
+    EXPECT_TRUE(listenerAccepting());
     auto accepted = listener->acceptClientConnection();
     ASSERT_TRUE(accepted);
     EXPECT_TRUE(std::holds_alternative<net::AcceptWouldBlock>(*accepted));
@@ -215,6 +218,60 @@ TEST_F(FallbackReactorTest, DeadlineExpiringDuringFallbackClosesAttemptAndKeepsE
     ASSERT_TRUE(dispatch({live.upstream, EPOLLIN}));
     ASSERT_EQ(1, recv(client.peer.get(), &byte, 1, 0));
     EXPECT_EQ('b', byte);
+}
+
+TEST_F(FallbackReactorTest, ImmediateAttemptsReserveAdmissionAndReleaseOnFailureOrPromotion) {
+    createReactor({}, clock.source(), {}, {.max_connections = 1, .max_pending_connections = 1});
+    using Fixture = decltype(this);
+    struct Attempts {
+        Fixture fixture;
+        bool succeed = false;
+        int calls = 0;
+    } attempts{this};
+    auto backend = net::Listener::create({"127.0.0.1", 0}, 4);
+    ASSERT_TRUE(backend);
+    setUpstreamDialer(detail::UpstreamDialerTest::withCandidates(
+        backend->localAddress(), {
+                                     .context = &attempts,
+                                     .connect =
+                                         [](void* context, int, const sockaddr*, socklen_t) {
+                                             auto& state = *static_cast<Attempts*>(context);
+                                             EXPECT_EQ(1u, state.fixture->pendingCount());
+                                             EXPECT_EQ(0u, state.fixture->sessionCount());
+                                             ++state.calls;
+                                             if (state.succeed) {
+                                                 return 0;
+                                             }
+                                             errno = ECONNREFUSED;
+                                             return -1;
+                                         },
+                                 }));
+
+    auto failed = connectToListener();
+    ASSERT_TRUE(dispatch({listenerId(), EPOLLIN}));
+    EXPECT_EQ(2, attempts.calls);
+    EXPECT_EQ(0u, pendingCount());
+    EXPECT_TRUE(listenerAccepting());
+    char byte;
+    ASSERT_EQ(0, recv(failed.get(), &byte, 1, 0));
+
+    attempts.succeed = true;
+    auto connected = connectToListener();
+    ASSERT_TRUE(dispatch({listenerId(), EPOLLIN}));
+    EXPECT_EQ(3, attempts.calls);
+    EXPECT_EQ(0u, pendingCount());
+    EXPECT_EQ(1u, sessionCount());
+    EXPECT_FALSE(listenerAccepting());
+
+    auto queued = connectToListener();
+    ASSERT_TRUE(dispatch({listenerId(), EPOLLIN}));
+    EXPECT_EQ(3, attempts.calls);
+    ASSERT_TRUE(dispatch({currentSessionSources().upstream, EPOLLERR}));
+    EXPECT_EQ(0u, sessionCount());
+    EXPECT_TRUE(listenerAccepting());
+    ASSERT_TRUE(dispatch({listenerId(), EPOLLIN}));
+    EXPECT_EQ(4, attempts.calls);
+    EXPECT_EQ(1u, sessionCount());
 }
 
 } // namespace orbit::proxy

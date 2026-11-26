@@ -41,6 +41,8 @@ protected:
             "ORBIT_IDLE_TIMEOUT_MS",
             "ORBIT_BUFFER_HIGH_WATERMARK_BYTES",
             "ORBIT_BUFFER_LOW_WATERMARK_BYTES",
+            "ORBIT_MAX_CONNECTIONS",
+            "ORBIT_MAX_PENDING_CONNECTIONS",
         };
 
         for (const char* variable : environment_variables) {
@@ -234,4 +236,27 @@ TEST_F(ConfigTest, ValidatesDirectionalWatermarksAfterCliAndEnvironmentSelection
     ASSERT_TRUE(maximum);
     EXPECT_EQ(16777216u, maximum->resources.buffer_high_watermark);
     EXPECT_EQ(16777215u, maximum->resources.buffer_low_watermark);
+}
+
+TEST_F(ConfigTest, ValidatesTotalAndPendingAdmissionLimits) {
+    const auto defaults = parseArguments({"--upstream", "backend:1"});
+    ASSERT_TRUE(defaults);
+    EXPECT_EQ(256u, defaults->resources.max_connections);
+    EXPECT_EQ(64u, defaults->resources.max_pending_connections);
+
+    ASSERT_EQ(0, setenv("ORBIT_MAX_CONNECTIONS", "2", 1));
+    ASSERT_EQ(0, setenv("ORBIT_MAX_PENDING_CONNECTIONS", "3", 1));
+    EXPECT_FALSE(parseArguments({"--upstream", "backend:1"}));
+    for (auto invalid : {"", "-1", "0", "65536", "9999999999999999999999"}) {
+        SCOPED_TRACE(invalid);
+        ASSERT_EQ(0, setenv("ORBIT_MAX_CONNECTIONS", invalid, 1));
+        EXPECT_FALSE(parseArguments({"--upstream", "backend:1", "--max-pending-connections", "1"}));
+        EXPECT_FALSE(parseArguments({"--upstream", "backend:1", "--max-connections", "2",
+                                     "--max-pending-connections", invalid}));
+    }
+    const auto validated = parseArguments(
+        {"--upstream", "backend:1", "--max-connections", "2", "--max-pending-connections", "1"});
+    ASSERT_TRUE(validated);
+    EXPECT_EQ(2u, validated->resources.max_connections);
+    EXPECT_EQ(1u, validated->resources.max_pending_connections);
 }

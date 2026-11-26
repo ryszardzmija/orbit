@@ -133,11 +133,13 @@ class ProxyHarness:
             time.sleep(min(POLL_INTERVAL, remaining))
         raise TimeoutError(f"Orbit did not report listener readiness within {STARTUP_TIMEOUT}s")
 
-    def connect_session(self):
+    def connect_client(self):
         self.require_running("connecting a client")
-        client = self.resources.enter_context(
+        return self.resources.enter_context(
             socket.create_connection(("127.0.0.1", self.proxy_port), timeout=SOCKET_TIMEOUT)
         )
+
+    def accept_backend(self):
         deadline = time.monotonic() + SOCKET_TIMEOUT
         while (remaining := deadline - time.monotonic()) > 0:
             self.require_running("waiting for the upstream connection")
@@ -151,8 +153,11 @@ class ProxyHarness:
                     continue
                 self.resources.enter_context(backend)
                 backend.settimeout(SOCKET_TIMEOUT)
-                return client, backend
+                return backend
         raise TimeoutError(f"backend did not receive Orbit's connection within {SOCKET_TIMEOUT}s")
+
+    def connect_session(self):
+        return self.connect_client(), self.accept_backend()
 
     def request_shutdown(self):
         self.require_running("requesting shutdown")
@@ -470,6 +475,29 @@ class ProxySessionIntegrationTest(unittest.TestCase):
         expect_eof(backend)
 
 
+class AdmissionIntegrationTest(unittest.TestCase):
+    def test_backlogged_client_runs_after_established_session_releases_slot(self):
+        proxy = ProxyHarness()
+        self.addCleanup(proxy.close)
+        proxy.start([self.orbit_binary, "--max-connections", "1", "--max-pending-connections", "1"])
+        client, backend = proxy.connect_session()
+        queued = proxy.connect_client()
+        send_message(queued, b"from-backlog")
+        send_message(client, b"still-forwarding")
+        self.assertEqual(b"still-forwarding", recv_message(backend))
+        ready, _, _ = select.select([proxy.backend_listener], [], [], 0.15)
+        self.assertEqual([], ready)
+
+        finish_session(client, backend)
+        second_backend = proxy.accept_backend()
+        self.assertEqual(b"from-backlog", recv_message(second_backend))
+        send_message(second_backend, b"admitted")
+        self.assertEqual(b"admitted", recv_message(queued))
+        finish_session(queued, second_backend)
+        proxy.request_shutdown()
+        proxy.wait_for_clean_exit()
+
+
 class IdleExpirationIntegrationTest(unittest.TestCase):
     def test_configured_idle_timeout_closes_established_tcp_pair(self):
         proxy = ProxyHarness()
@@ -549,5 +577,6 @@ class ProxyHarnessTest(unittest.TestCase):
 if __name__ == "__main__":
     orbit_binary = sys.argv.pop(1)
     ProxySessionIntegrationTest.orbit_binary = orbit_binary
+    AdmissionIntegrationTest.orbit_binary = orbit_binary
     IdleExpirationIntegrationTest.orbit_binary = orbit_binary
     unittest.main(verbosity=2, buffer=True)

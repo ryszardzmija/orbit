@@ -127,6 +127,9 @@ private:
     Status<std::error_code> handleShutdownRequest();
     Status<std::error_code> synchronizeTimer();
     Status<std::error_code> expireDeadlines(detail::Deadline now);
+    Status<std::error_code> synchronizeListener();
+    size_t pendingConnectionCount() const;
+    bool canAdmit() const;
 
     // Session state synchronization
     Result<EndpointEventOutcome, FatalReactorError>
@@ -154,6 +157,10 @@ private:
     detail::Deadlines deadlines_;
     std::optional<detail::Deadline> armed_deadline_;
     TimeoutConfig timeouts_;
+    size_t max_connections_;
+    size_t max_pending_connections_;
+    // The reactor has at most one admission between ownership records at any instant.
+    bool transient_admission_ = false;
     SteadyTimeSource time_source_;
     absl::flat_hash_map<detail::SourceId, detail::PendingConnection> pending_connections_;
     std::optional<detail::ActiveListener> active_listener_;
