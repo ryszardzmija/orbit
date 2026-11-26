@@ -144,13 +144,17 @@ std::expected<Listener, ListenError> Listener::create(const ListenSocketAddress&
         std::format("listen {}:{} failed: {}", address.interface, address.port, attempts)));
 }
 
-std::expected<AcceptResult, std::error_code> Listener::acceptClientConnection() {
+std::expected<AcceptResult, std::error_code>
+Listener::acceptClientConnection(const AcceptOperations& operations) {
     while (true) {
         sockaddr_storage client_addr = {};
         socklen_t client_addr_len = sizeof(client_addr);
 
-        int fd = accept4(listen_fd_.get(), reinterpret_cast<sockaddr*>(&client_addr),
-                         &client_addr_len, SOCK_CLOEXEC | SOCK_NONBLOCK);
+        auto* address = reinterpret_cast<sockaddr*>(&client_addr);
+        constexpr int flags = SOCK_CLOEXEC | SOCK_NONBLOCK;
+        int fd = operations.accept ? operations.accept(operations.context, listen_fd_.get(),
+                                                       address, &client_addr_len, flags)
+                                   : accept4(listen_fd_.get(), address, &client_addr_len, flags);
 
         if (fd == -1 && errno == EINTR) {
             continue;

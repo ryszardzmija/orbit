@@ -346,7 +346,7 @@ TEST_F(ControlledReactorTest, ExpiredPendingHandoffReleasesBothSockets) {
     const auto at = clock.now() + 1ms;
     clock.advanceTo(at);
     ASSERT_TRUE(dialResult(detail::UpstreamDialInProgress{
-        {std::move(client.local), {}, std::move(attempt.local), 0, at, {}}}));
+        {std::move(client.local), {}, std::move(attempt.local), 0, at}}));
     EXPECT_FALSE(nextDeadline());
     char byte;
     EXPECT_EQ(0, recv(client.peer.get(), &byte, 1, 0));
@@ -372,8 +372,8 @@ TEST_F(ProxyReactorTest, RegistrationFailureReleasesClientAndDialDeadline) {
     int fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
     ASSERT_GE(fd, 0);
     auto at = detail::DeadlineClock::now() + 10s;
-    ASSERT_TRUE(dialResult(detail::UpstreamDialInProgress{
-        {std::move(waiting.local), {}, FileDescriptor(fd), 0, at, {}}}));
+    ASSERT_TRUE(dialResult(
+        detail::UpstreamDialInProgress{{std::move(waiting.local), {}, FileDescriptor(fd), 0, at}}));
     EXPECT_FALSE(nextDeadline());
     char byte;
     EXPECT_EQ(0, recv(waiting.peer.get(), &byte, 1, 0));

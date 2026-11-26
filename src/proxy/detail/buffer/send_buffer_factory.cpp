@@ -6,13 +6,15 @@
 
 namespace orbit::proxy::detail {
 
-SendBufferFactory::SendBufferFactory(const SendBufferOptions& config)
+SendBufferFactory::SendBufferFactory(const SendBufferOptions& config, AllocationChecks allocation)
     : block_size_(config.block_size),
       high_watermark_(config.high_watermark),
-      low_watermark_(config.low_watermark) {}
+      low_watermark_(config.low_watermark),
+      allocation_(allocation) {}
 
 std::unique_ptr<SendBuffer> SendBufferFactory::make() const {
-    return std::make_unique<SendBuffer>(block_size_, high_watermark_, low_watermark_);
+    allocation_.check(AllocationPoint::SendBuffer);
+    return std::make_unique<SendBuffer>(block_size_, high_watermark_, low_watermark_, allocation_);
 }
 
 } // namespace orbit::proxy::detail

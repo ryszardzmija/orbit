@@ -2,6 +2,7 @@ import concurrent.futures
 from contextlib import ExitStack, redirect_stdout
 import io
 import os
+import resource
 import select
 import shlex
 import signal
@@ -125,13 +126,16 @@ class ProxyHarness:
             raise RuntimeError(f"Orbit exited with status {exit_code} while {operation}")
 
     def wait_for_readiness(self):
+        self.wait_for_log(READY_MESSAGE, "starting")
+
+    def wait_for_log(self, message, operation):
         deadline = time.monotonic() + STARTUP_TIMEOUT
         while (remaining := deadline - time.monotonic()) > 0:
-            self.require_running("starting")
-            if READY_MESSAGE in os.pread(self.log.fileno(), LOG_LIMIT, 0):
+            self.require_running(operation)
+            if message in os.pread(self.log.fileno(), LOG_LIMIT, 0):
                 return
             time.sleep(min(POLL_INTERVAL, remaining))
-        raise TimeoutError(f"Orbit did not report listener readiness within {STARTUP_TIMEOUT}s")
+        raise TimeoutError(f"Orbit did not log {message!r} within {STARTUP_TIMEOUT}s")
 
     def connect_client(self):
         self.require_running("connecting a client")
@@ -494,6 +498,34 @@ class AdmissionIntegrationTest(unittest.TestCase):
         send_message(second_backend, b"admitted")
         self.assertEqual(b"admitted", recv_message(queued))
         finish_session(queued, second_backend)
+        proxy.request_shutdown()
+        proxy.wait_for_clean_exit()
+
+    def test_descriptor_pressure_recovers_while_existing_session_stays_open(self):
+        proxy = ProxyHarness()
+        self.addCleanup(proxy.close)
+        proxy.start([self.orbit_binary])
+        client, backend = proxy.connect_session()
+        send_message(client, b"ready")
+        self.assertEqual(b"ready", recv_message(backend))
+        pid = proxy.process.pid
+        original = resource.prlimit(pid, resource.RLIMIT_NOFILE)
+        open_fds = {int(name) for name in os.listdir(f"/proc/{pid}/fd")}
+        first_free = next(fd for fd in range(max(open_fds) + 2) if fd not in open_fds)
+        resource.prlimit(pid, resource.RLIMIT_NOFILE, (first_free, original[1]))
+        try:
+            queued = proxy.connect_client()
+            send_message(queued, b"waiting-for-descriptors")
+            proxy.wait_for_log(b"Admission paused after accept4", "exhausting descriptors")
+            send_message(backend, b"still-forwarding")
+            self.assertEqual(b"still-forwarding", recv_message(client))
+        finally:
+            resource.prlimit(pid, resource.RLIMIT_NOFILE, original)
+
+        recovered = proxy.accept_backend()
+        self.assertEqual(b"waiting-for-descriptors", recv_message(recovered))
+        finish_session(queued, recovered)
+        finish_session(client, backend)
         proxy.request_shutdown()
         proxy.wait_for_clean_exit()
 

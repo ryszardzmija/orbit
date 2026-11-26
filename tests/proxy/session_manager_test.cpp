@@ -44,7 +44,9 @@ TEST_P(HangupTest, PausedQueuePreservesResidualInputUntilTheDestinationDrains) {
     ASSERT_LT(filler, 1024 * 1024u);
 
     auto id = manager.allocateId();
-    manager.add(id, std::move(downstream.local), std::move(upstream.local), {1, 2});
+    auto session = manager.prepare(std::move(downstream.local), std::move(upstream.local));
+    ASSERT_TRUE(session);
+    manager.add(id, std::move(*session), {1, 2});
     auto source_interests = [&] {
         return from_client ? manager.interests(id).downstream : manager.interests(id).upstream;
     };
@@ -93,7 +95,9 @@ TEST(SessionManagerTest, WouldBlockAfterHangupKeepsInputEligibleForANewEdge) {
     auto source = socketPair();
     auto dest = socketPair();
     auto id = manager.allocateId();
-    manager.add(id, std::move(source.local), std::move(dest.local), {1, 2});
+    auto session = manager.prepare(std::move(source.local), std::move(dest.local));
+    ASSERT_TRUE(session);
+    manager.add(id, std::move(*session), {1, 2});
     EXPECT_EQ(SessionEventAction::KeepOpen,
               manager.handleHangup(id, EndpointRole::Downstream).action);
     EXPECT_TRUE(manager.interests(id).downstream.readable);
@@ -118,7 +122,9 @@ TEST(SessionManagerTest, TerminalWriteShutdownFailureClosesTheSession) {
     int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     ASSERT_GE(fd, 0);
     auto id = manager.allocateId();
-    manager.add(id, std::move(client.local), FileDescriptor(fd), {1, 2});
+    auto session = manager.prepare(std::move(client.local), FileDescriptor(fd));
+    ASSERT_TRUE(session);
+    manager.add(id, std::move(*session), {1, 2});
     ASSERT_EQ(0, shutdown(client.peer.get(), SHUT_WR));
     auto result = manager.handleReadable(id, EndpointRole::Downstream);
     EXPECT_EQ(SessionEventAction::Close, result.action);

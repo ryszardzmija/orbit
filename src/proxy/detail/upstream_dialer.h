@@ -27,11 +27,6 @@ struct UpstreamDialInProgress {
 
 using UpstreamDialResult = std::variant<UpstreamDialConnected, UpstreamDialInProgress>;
 
-struct UpstreamDialError {
-    std::string error_messages;
-    std::optional<std::error_code> socket_creation_error;
-};
-
 struct UpstreamDialerCreateError {
     std::string message;
 };
@@ -41,11 +36,12 @@ public:
     static std::expected<UpstreamDialer, UpstreamDialerCreateError>
     create(const net::ResolutionEndpoint& upstream_address);
 
-    std::expected<UpstreamDialResult, UpstreamDialError>
+    std::expected<UpstreamDialResult, net::DialError>
     dial(FileDescriptor accepted_connection, const net::SocketAddress& accepted_address,
          Deadline deadline, const SteadyTimeSource& time_source);
-    std::expected<UpstreamDialResult, UpstreamDialError>
-    advanceDialAttempt(PendingConnection pending_connection, const SteadyTimeSource& time_source);
+    std::expected<UpstreamDialResult, net::DialError>
+    advanceDialAttempt(PendingConnection pending_connection, const SteadyTimeSource& time_source,
+                       bool allow_fallback = true);
 
     const net::ResolutionEndpoint& upstreamEndpoint() const;
 
@@ -54,9 +50,7 @@ private:
     explicit UpstreamDialer(detail::ResolvedUpstream resolved_upstream,
                             net::DialOperations operations = {});
 
-    void addError(PendingConnection& pending_connection, net::DialFailedOp failed_op,
-                  std::error_code error_code);
-    std::expected<UpstreamDialResult, UpstreamDialError>
+    std::expected<UpstreamDialResult, net::DialError>
     tryCandidatesFrom(PendingConnection pending_connection, std::size_t first_candidate_idx,
                       const SteadyTimeSource& time_source);
 

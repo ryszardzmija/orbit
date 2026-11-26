@@ -2,37 +2,37 @@
 
 #include <cassert>
 #include <expected>
-#include <format>
 #include <string>
 #include <system_error>
 
 #include <sys/socket.h>
 
-#include "net/address_format.h"
 #include "net/dialer.h"
 
 namespace orbit::proxy::detail {
 
 namespace {
 
-std::expected<void, std::error_code> checkConnectCompletion(int fd) {
+std::expected<void, net::DialError> checkConnectCompletion(int fd) {
     int socket_error = 0;
     socklen_t error_size = sizeof(socket_error);
 
     if (int result = getsockopt(fd, SOL_SOCKET, SO_ERROR, &socket_error, &error_size);
         result == -1) {
-        return std::unexpected(std::error_code(errno, std::system_category()));
+        return std::unexpected(net::DialError{std::error_code(errno, std::system_category()),
+                                              net::DialFailedOp::CompletionQuery});
     }
 
     if (socket_error != 0) {
-        return std::unexpected(std::error_code(socket_error, std::system_category()));
+        return std::unexpected(net::DialError{std::error_code(socket_error, std::system_category()),
+                                              net::DialFailedOp::Completion});
     }
 
     return {};
 }
 
-UpstreamDialError timedOut() {
-    return {"overall connection establishment deadline expired", std::nullopt};
+net::DialError timedOut() {
+    return {std::make_error_code(std::errc::timed_out), net::DialFailedOp::Deadline};
 }
 
 } // namespace
@@ -55,7 +55,7 @@ UpstreamDialer::create(const net::ResolutionEndpoint& upstream_address) {
     return UpstreamDialer(std::move(resolved_upstream));
 }
 
-std::expected<UpstreamDialResult, UpstreamDialError>
+std::expected<UpstreamDialResult, net::DialError>
 UpstreamDialer::dial(FileDescriptor accepted_connection, const net::SocketAddress& accepted_address,
                      Deadline deadline, const SteadyTimeSource& time_source) {
     assert(resolved_upstream_.candidates().size() > 0);
@@ -66,15 +66,14 @@ UpstreamDialer::dial(FileDescriptor accepted_connection, const net::SocketAddres
         .attempted_connection_fd = std::nullopt,
         .attempted_address_idx = 0,
         .deadline = deadline,
-        .error_messages = {},
     };
 
     return tryCandidatesFrom(std::move(pending_connection), 0, time_source);
 }
 
-std::expected<UpstreamDialResult, UpstreamDialError>
+std::expected<UpstreamDialResult, net::DialError>
 UpstreamDialer::advanceDialAttempt(PendingConnection pending_connection,
-                                   const SteadyTimeSource& time_source) {
+                                   const SteadyTimeSource& time_source, bool allow_fallback) {
     assert(pending_connection.attempted_connection_fd.has_value());
 
     if (time_source.now() >= pending_connection.deadline) {
@@ -94,12 +93,15 @@ UpstreamDialer::advanceDialAttempt(PendingConnection pending_connection,
         };
     }
 
-    addError(pending_connection, net::DialFailedOp::Connect, completion_result.error());
+    size_t next_idx = pending_connection.attempted_address_idx + 1;
+    if (!allow_fallback || next_idx >= resolved_upstream_.candidates().size() ||
+        net::classifyDialError(completion_result.error()) != net::DialFailureKind::Candidate) {
+        return std::unexpected(completion_result.error());
+    }
 
     // The failed asynchronous attempt must no longer remain owned by pending connection.
     pending_connection.attempted_connection_fd.reset();
 
-    size_t next_idx = pending_connection.attempted_address_idx + 1;
     return tryCandidatesFrom(std::move(pending_connection), next_idx, time_source);
 }
 
@@ -107,7 +109,7 @@ const net::ResolutionEndpoint& UpstreamDialer::upstreamEndpoint() const {
     return resolved_upstream_.configuredEndpoint();
 }
 
-std::expected<UpstreamDialResult, UpstreamDialError>
+std::expected<UpstreamDialResult, net::DialError>
 UpstreamDialer::tryCandidatesFrom(PendingConnection pending_connection,
                                   std::size_t first_candidate_idx,
                                   const SteadyTimeSource& time_source) {
@@ -120,24 +122,14 @@ UpstreamDialer::tryCandidatesFrom(PendingConnection pending_connection,
         auto dial_result = net::dial(resolved_upstream_.candidates()[i],
                                      pending_connection.deadline, time_source, operations_);
         if (!dial_result) {
-            if (dial_result.error().failed_op == net::DialFailedOp::Deadline) {
-                return std::unexpected(timedOut());
-            }
             if (dial_result.error().failed_op == net::DialFailedOp::Connect &&
                 dial_result.error().code.value() == EINTR) {
                 continue; // Retry the same address with a fresh socket and the remaining budget.
             }
-            addError(pending_connection, dial_result.error().failed_op, dial_result.error().code);
-
-            // Failure to create a socket should be treated as fatal since retries
-            // are unlikely to succeed.
-            if (dial_result.error().failed_op == net::DialFailedOp::Socket) {
-                return std::unexpected(UpstreamDialError{
-                    std::move(pending_connection.error_messages), dial_result.error().code});
+            if (net::classifyDialError(dial_result.error()) != net::DialFailureKind::Candidate ||
+                ++i == resolved_upstream_.candidates().size()) {
+                return std::unexpected(dial_result.error());
             }
-
-            // Otherwise attempt to dial the next address.
-            ++i;
             continue;
         }
 
@@ -160,21 +152,8 @@ UpstreamDialer::tryCandidatesFrom(PendingConnection pending_connection,
         };
     }
 
-    return std::unexpected(
-        UpstreamDialError{std::move(pending_connection.error_messages), std::nullopt});
-}
-
-void UpstreamDialer::addError(PendingConnection& pending_connection, net::DialFailedOp failed_op,
-                              std::error_code error_code) {
-    if (!pending_connection.error_messages.empty()) {
-        pending_connection.error_messages += " ";
-    }
-
-    const auto& candidate =
-        resolved_upstream_.candidates()[pending_connection.attempted_address_idx];
-    const char* operation = failed_op == net::DialFailedOp::Socket ? "socket" : "connect";
-    pending_connection.error_messages +=
-        std::format("[{} {}: {}]", net::formatAddress(candidate), operation, error_code.message());
+    return std::unexpected(net::DialError{std::make_error_code(std::errc::host_unreachable),
+                                          net::DialFailedOp::Connect});
 }
 
 } // namespace orbit::proxy::detail

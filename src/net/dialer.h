@@ -22,6 +22,8 @@ struct DialSuccess {
 enum class DialFailedOp {
     Socket,
     Connect,
+    Completion,
+    CompletionQuery,
     Deadline,
 };
 
@@ -29,6 +31,11 @@ struct DialError {
     std::error_code code;
     DialFailedOp failed_op;
 };
+
+enum class DialFailureKind { Candidate, Timeout, Pressure, Infrastructure };
+
+DialFailureKind classifyDialError(DialError error);
+const char* dialOperationName(DialFailedOp operation);
 
 // Optional syscall overrides borrow their context and follow the socket/connect errno conventions.
 struct DialOperations {

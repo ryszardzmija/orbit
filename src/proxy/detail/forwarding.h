@@ -3,7 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
-#include <string>
+#include <system_error>
 
 #include "common/status.h"
 #include "net/socket_io.h"
@@ -15,11 +15,12 @@ namespace orbit::proxy::detail {
 enum class FailedOp {
     Send,
     Recv,
+    Buffer,
 };
 
 // The session is broken and needs to be torn down.
 struct ForwardError {
-    std::string message;
+    std::error_code code;
     FailedOp failed_op;
 };
 

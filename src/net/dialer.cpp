@@ -10,6 +10,52 @@
 
 namespace orbit::net {
 
+DialFailureKind classifyDialError(DialError error) {
+    const int code = error.code.value();
+    switch (error.failed_op) {
+    case DialFailedOp::Socket:
+        switch (code) {
+        case EMFILE:
+        case ENFILE:
+        case ENOMEM:
+        case ENOBUFS:
+            return DialFailureKind::Pressure;
+        case EAFNOSUPPORT:
+        case EPROTONOSUPPORT:
+        case EACCES:
+        case EPERM:
+            return DialFailureKind::Candidate;
+        default:
+            return DialFailureKind::Infrastructure;
+        }
+    case DialFailedOp::Connect:
+    case DialFailedOp::Completion:
+        return code == ENOMEM || code == ENOBUFS ? DialFailureKind::Pressure
+                                                 : DialFailureKind::Candidate;
+    case DialFailedOp::CompletionQuery:
+        return DialFailureKind::Candidate;
+    case DialFailedOp::Deadline:
+        return DialFailureKind::Timeout;
+    }
+    return DialFailureKind::Infrastructure;
+}
+
+const char* dialOperationName(DialFailedOp operation) {
+    switch (operation) {
+    case DialFailedOp::Socket:
+        return "upstream socket";
+    case DialFailedOp::Connect:
+        return "connect";
+    case DialFailedOp::Completion:
+        return "connect completion";
+    case DialFailedOp::CompletionQuery:
+        return "getsockopt(SO_ERROR)";
+    case DialFailedOp::Deadline:
+        return "connection establishment deadline";
+    }
+    return "upstream dial";
+}
+
 std::expected<DialSuccess, DialError> dial(const SocketAddress& address,
                                            SteadyTimeSource::TimePoint deadline,
                                            const SteadyTimeSource& time_source,

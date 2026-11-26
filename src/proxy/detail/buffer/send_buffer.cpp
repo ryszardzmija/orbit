@@ -25,10 +25,12 @@ SendBuffer::ListNode* SendBuffer::ListNode::next() const { return next_.get(); }
 void SendBuffer::ListNode::setNext(std::unique_ptr<ListNode> next) { next_ = std::move(next); }
 
 // SendBuffer
-SendBuffer::SendBuffer(size_t block_size, size_t high_watermark, size_t low_watermark)
+SendBuffer::SendBuffer(size_t block_size, size_t high_watermark, size_t low_watermark,
+                       AllocationChecks allocation)
     : block_size_(block_size),
       high_watermark_(high_watermark),
-      low_watermark_(low_watermark) {
+      low_watermark_(low_watermark),
+      allocation_(allocation) {
     if (block_size == 0) {
         throw std::invalid_argument("block_size cannot be zero, got block_size=" +
                                     std::to_string(block_size));
@@ -97,6 +99,7 @@ void SendBuffer::writeData(std::span<const uint8_t> data) {
 }
 
 void SendBuffer::addBlock() {
+    allocation_.check(AllocationPoint::PayloadBlock);
     if (tail_ == nullptr) {
         head_ = std::make_unique<ListNode>(block_size_);
         tail_ = head_.get();

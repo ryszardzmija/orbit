@@ -33,7 +33,7 @@ Status<ForwardError> Forwarder::forward(SessionEndpoint& source, SessionEndpoint
         net::tryRecv(source.fd.get(), std::span<uint8_t>(buf_.get(), receive_capacity), operations);
     if (!recv_result) {
         return std::unexpected(ForwardError{
-            .message = recv_result.error().message(),
+            .code = recv_result.error(),
             .failed_op = FailedOp::Recv,
         });
     }
@@ -63,7 +63,7 @@ Status<ForwardError> Forwarder::forward(SessionEndpoint& source, SessionEndpoint
         auto send_result = net::trySend(destination.fd.get(), unsent, operations);
         if (!send_result) {
             return std::unexpected(ForwardError{
-                .message = send_result.error().message(),
+                .code = send_result.error(),
                 .failed_op = FailedOp::Send,
             });
         }
@@ -75,13 +75,21 @@ Status<ForwardError> Forwarder::forward(SessionEndpoint& source, SessionEndpoint
         unsent = unsent.subspan(bytes_written);
     }
 
-    if (!queue.write(unsent)) {
+    try {
+        if (queue.write(unsent)) {
+            return {};
+        }
+    } catch (const std::bad_alloc&) {
+        // The owner must close because it cannot retain all bytes already read.
         return std::unexpected(ForwardError{
-            .message = "Directional send buffer rejected received bytes",
-            .failed_op = FailedOp::Send,
+            .code = std::make_error_code(std::errc::not_enough_memory),
+            .failed_op = FailedOp::Buffer,
         });
     }
-    return {};
+    return std::unexpected(ForwardError{
+        .code = std::make_error_code(std::errc::no_buffer_space),
+        .failed_op = FailedOp::Buffer,
+    });
 }
 
 } // namespace orbit::proxy::detail

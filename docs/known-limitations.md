@@ -84,11 +84,8 @@ Source baseline is `e3aec7b`. A source-confirmed finding follows from the implem
 
 ## LIM-013 — Resource exhaustion can stop the reactor
 
-- **Classification and priority** — Architectural risk, high.
-- **Source and evidence** — `EMFILE` and `ENFILE` remain process-fatal on accept or upstream socket creation. Connect and SO_ERROR failures are local after M1.4. A failed pending ADD is also local. The fd and heap paths have no admission fallback or overload recovery mechanism.
-- **Conditions and impact** — Exhausting available descriptors or failing a heap allocation can still end the process and close independent sessions.
-- **Verification** — Source-confirmed status routing. Resource exhaustion and allocation failure were not induced in validation.
-- **Follow-up** — Establish overload behavior before expanding upstream fan-out. Review the terminal dial error policy by syscall and errno, and add tests for isolation and cleanup under recoverable resource pressure.
+- **M2.3 disposition** — Timed admission retry handles descriptor and other specified kernel pressure on accept, dial and connection watch operations. Buffer allocation and connection setup recover at the boundaries documented in [failure handling](architecture.md#failure-handling). Injected faults and a Linux descriptor-limit regression exercise cleanup and continued established forwarding.
+- **Remaining scope** — Heap allocation failures in Abseil's `flat_hash_map`, other unsupported allocation failures, and reactor infrastructure or integrity errors can stop Orbit. Abseil's pinned `flat_hash_map` header explicitly states that the table lacks exception safety. The Linux OOM killer can end the process. A persistent descriptor shortage keeps admission paused between retries.
 
 ## LIM-014 — Failed write shutdown may leave a session waiting
 

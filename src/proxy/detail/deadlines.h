@@ -8,6 +8,8 @@
 #include <set>
 #include <utility>
 
+#include "proxy/detail/allocation.h"
+
 namespace orbit::proxy::detail {
 
 using DeadlineClock = std::chrono::steady_clock;
@@ -24,6 +26,8 @@ struct DeadlineKey {
 // At most one ordered entry per live key. The index also supports immediate cancellation.
 class Deadlines {
 public:
+    explicit Deadlines(AllocationChecks allocation = {})
+        : allocation_(allocation) {}
     void schedule(DeadlineKey key, Deadline at);
     void cancel(DeadlineKey key);
     std::optional<Deadline> scheduledAt(DeadlineKey key) const;
@@ -32,6 +36,7 @@ public:
     std::optional<DeadlineKey> popDue(Deadline now);
 
 private:
+    AllocationChecks allocation_;
     std::map<DeadlineKey, Deadline> times_;
     std::set<std::pair<Deadline, DeadlineKey>> ordered_;
 };

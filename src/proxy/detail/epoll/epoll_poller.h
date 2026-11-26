@@ -20,6 +20,11 @@ struct ReadyEvent {
     uint32_t events;
 };
 
+struct EpollOperations {
+    void* context = nullptr;
+    int (*control)(void*, int epfd, int op, int fd, epoll_event*) = nullptr;
+};
+
 // Owns an epoll instance and tracks the file descriptors registered with it.
 //
 // Each watched file descriptor is associated with an application-level SourceId.
@@ -30,7 +35,7 @@ struct ReadyEvent {
 // registrations.
 class EpollPoller {
 public:
-    static Result<EpollPoller, std::error_code> create();
+    static Result<EpollPoller, std::error_code> create(EpollOperations operations = {});
 
     // Starts watching fd under SourceId with the given epoll interest mask.
     Status<std::error_code> add(SourceId id, int fd, uint32_t interests);
@@ -66,12 +71,15 @@ private:
         uint32_t interests;
     };
 
-    explicit EpollPoller(FileDescriptor epfd);
+    EpollPoller(FileDescriptor epfd, EpollOperations operations);
+
+    int control(int op, int fd, epoll_event* event);
 
     Status<std::error_code> setInterestsImpl(SourceId source_id, uint32_t new_interests,
                                              WatchedFd& watched_fd);
 
     FileDescriptor epfd_;
+    EpollOperations operations_;
     absl::flat_hash_map<SourceId, WatchedFd> watched_;
     std::array<epoll_event, event_buf_cap> event_buffer_;
 };

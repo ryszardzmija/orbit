@@ -58,11 +58,12 @@ struct SessionEventResult {
 class SessionManager {
 public:
     explicit SessionManager(const SessionManagerOptions& options,
-                            net::StreamOperations operations = {});
+                            net::StreamOperations operations = {},
+                            AllocationChecks allocation = {});
 
     SessionId allocateId();
-    void add(SessionId id, FileDescriptor downstream, FileDescriptor upstream,
-             SessionSourceIds source_ids);
+    std::optional<Session> prepare(FileDescriptor downstream, FileDescriptor upstream) const;
+    void add(SessionId id, Session session, SessionSourceIds source_ids);
     void remove(SessionId id);
 
     bool contains(SessionId id) const;
