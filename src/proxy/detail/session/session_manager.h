@@ -67,6 +67,7 @@ public:
 
     bool contains(SessionId id) const;
     bool empty() const;
+    size_t size() const { return sessions_.size(); }
     auto ids() const { return std::views::keys(sessions_); }
     SessionSourceIds sourceIds(SessionId id) const;
     SessionInterests interests(SessionId id) const;

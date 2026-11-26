@@ -380,6 +380,7 @@ TEST_F(ProxyReactorTest, RegistrationFailureReleasesClientAndDialDeadline) {
 }
 
 TEST_F(ProxyReactorTest, ExpirationBurstLeavesDueWorkArmedForAnotherTurn) {
+    createReactor({}, {}, {}, {.max_pending_connections = 128});
     std::vector<detail::SourceId> ids;
     auto at = detail::DeadlineClock::now();
     for (int i = 0; i < 65; ++i) {
@@ -396,6 +397,76 @@ TEST_F(ProxyReactorTest, ExpirationBurstLeavesDueWorkArmedForAnotherTurn) {
     ASSERT_TRUE(handleTimer());
     EXPECT_FALSE(nextDeadline());
     EXPECT_EQ(0, std::ranges::count_if(ids, [&](auto id) { return registered(id); }));
+}
+
+TEST_F(ControlledReactorTest, PromotionUsesTheSameTotalSlotUntilAnIdleSessionExpires) {
+    createReactor({.idle = 60s}, clock.source(), {},
+                  {.max_connections = 2, .max_pending_connections = 2});
+    auto client = test::socketPair();
+    auto backend = test::socketPair();
+    const auto live = install(client, backend);
+    auto pending_client = test::socketPair();
+    auto pending_peer = test::socketPair();
+    const auto pending = installPending(pending_client, pending_peer);
+    EXPECT_EQ(1u, pendingCount());
+    EXPECT_FALSE(listenerAccepting());
+
+    ASSERT_TRUE(dispatch({pending, EPOLLOUT}));
+    EXPECT_EQ(0u, pendingCount());
+    EXPECT_EQ(2u, sessionCount());
+    EXPECT_FALSE(listenerAccepting());
+    ASSERT_EQ(1, send(backend.peer.get(), "x", 1, 0));
+    ASSERT_TRUE(dispatch({live.upstream, EPOLLIN}));
+    char byte;
+    ASSERT_EQ(1, recv(client.peer.get(), &byte, 1, 0));
+    EXPECT_EQ('x', byte);
+
+    clock.advanceTo(clock.now() + 1s);
+    setIdleAt(live.downstream, clock.now());
+    ASSERT_TRUE(expire(clock.now()));
+    EXPECT_EQ(1u, sessionCount());
+    EXPECT_TRUE(listenerAccepting());
+}
+
+TEST_F(ControlledReactorTest, PendingLimitSuppressesLiveAndStaleListenerNotifications) {
+    createReactor({}, clock.source(), {}, {.max_connections = 3, .max_pending_connections = 1});
+    auto waiting = test::socketPair();
+    auto attempt = test::socketPair();
+    const auto at = clock.now() + 10ms;
+    const auto pending = installPending(waiting, attempt, at);
+    const auto listener = listenerId();
+    ASSERT_FALSE(listenerAccepting());
+    const auto incoming = connectToListener();
+    auto client = test::socketPair();
+    auto backend = test::socketPair();
+    const auto live = install(client, backend);
+    ASSERT_EQ(1, send(client.peer.get(), "x", 1, 0));
+    const auto events = waitForEvents();
+    ASSERT_TRUE(events);
+    EXPECT_TRUE(std::ranges::none_of(*events, [&](auto e) { return e.source_id == listener; }));
+    ASSERT_TRUE(dispatch({listener, EPOLLIN}));
+    EXPECT_EQ(1u, pendingCount());
+    EXPECT_EQ(at, nextDeadline());
+    char byte;
+    ASSERT_EQ(-1, recv(incoming.get(), &byte, 1, MSG_DONTWAIT));
+    EXPECT_EQ(EAGAIN, errno);
+    ASSERT_TRUE(dispatch({live.downstream, EPOLLIN}));
+    ASSERT_EQ(1, recv(backend.peer.get(), &byte, 1, 0));
+    EXPECT_EQ('x', byte);
+
+    clock.advanceTo(at);
+    ASSERT_TRUE(expire(at));
+    EXPECT_EQ(0u, pendingCount());
+    EXPECT_FALSE(registered(pending));
+    EXPECT_TRUE(listenerAccepting());
+    auto resumed = waitForEvents();
+    ASSERT_TRUE(resumed);
+    EXPECT_TRUE(std::ranges::any_of(*resumed, [&](auto e) { return e.source_id == listener; }));
+    ASSERT_TRUE(shutdownRequest());
+    ASSERT_TRUE(dispatch({listener, EPOLLIN}));
+    EXPECT_FALSE(listenerAccepting());
+    EXPECT_FALSE(registered(listener));
+    EXPECT_EQ(1u, sessionCount());
 }
 
 } // namespace orbit::proxy

@@ -28,7 +28,8 @@ Source baseline is `e3aec7b`. A source-confirmed finding follows from the implem
 ## LIM-005 — Admission and application buffer limits are absent
 
 - **M2.1 disposition** — Both directions enforce strict logical limits and account for allocated blocks. The sum of the two directional bounds limits the payload allocation attributable to one session.
-- **Remaining scope** — Connection admission and aggregate payload capacity still require independent limits. Node overhead, process memory and kernel TCP queue usage are outside the directional bounds. See [LIM-013](#lim-013--resource-exhaustion-can-stop-the-reactor) for resource failure handling.
+- **M2.2 disposition** — The reactor bounds total and pending admission and pauses acceptance at either limit. The total limit and the bound on each session together limit allocated payload capacity.
+- **Remaining scope** — Operators cannot set an independent aggregate payload budget. Node overhead, process memory and kernel TCP queue usage are outside the directional bounds. See [LIM-013](#lim-013--resource-exhaustion-can-stop-the-reactor) for resource failure handling.
 
 ## LIM-006 — Pending dials have mixed graceful shutdown behavior
 

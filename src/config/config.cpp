@@ -137,6 +137,8 @@ std::expected<Config, ConfigError> parseConfig(int argc, char** argv) {
     auto idle_ms = std::to_string(config.timeouts.idle.count());
     auto buffer_high = std::to_string(config.resources.buffer_high_watermark);
     auto buffer_low = std::to_string(config.resources.buffer_low_watermark);
+    auto connection_limit = std::to_string(config.resources.max_connections);
+    auto pending_limit = std::to_string(config.resources.max_pending_connections);
 
     CLI::App app("orbit - a TCP reverse proxy");
     app.set_version_flag("--version", "orbit 0.1.0");
@@ -184,6 +186,16 @@ std::expected<Config, ConfigError> parseConfig(int argc, char** argv) {
                        "Resume paused reads at or below this queue size in bytes")
             ->envname("ORBIT_BUFFER_LOW_WATERMARK_BYTES")
             ->capture_default_str();
+    const auto* connection_option =
+        app.add_option("--max-connections", connection_limit,
+                       "Maximum admitted pending and established connections combined")
+            ->envname("ORBIT_MAX_CONNECTIONS")
+            ->capture_default_str();
+    const auto* pending_option =
+        app.add_option("--max-pending-connections", pending_limit,
+                       "Maximum admitted clients establishing upstream connections")
+            ->envname("ORBIT_MAX_PENDING_CONNECTIONS")
+            ->capture_default_str();
 
     try {
         app.parse(argc, argv);
@@ -195,6 +207,10 @@ std::expected<Config, ConfigError> parseConfig(int argc, char** argv) {
                           ResourceConfig::max_directional_limit);
         config.resources.buffer_low_watermark =
             parseResource(*low_option, buffer_low, 0, config.resources.buffer_high_watermark - 1);
+        config.resources.max_connections = parseResource(*connection_option, connection_limit, 1,
+                                                         ResourceConfig::connection_limit_ceiling);
+        config.resources.max_pending_connections =
+            parseResource(*pending_option, pending_limit, 1, config.resources.max_connections);
 
         config.upstreams.reserve(upstream_values.size());
         for (const std::string& upstream_value : upstream_values) {

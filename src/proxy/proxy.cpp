@@ -1,6 +1,7 @@
 #include "proxy/proxy.h"
 
 #include <array>
+#include <cassert>
 #include <cstdint>
 #include <expected>
 #include <format>
@@ -30,6 +31,21 @@ constexpr detail::DeadlineKey shutdown_deadline{detail::DeadlineKind::Shutdown, 
 template <class... Ts>
 struct overloaded : Ts... {
     using Ts::operator()...;
+};
+
+// Reserves both a total and an establishment slot until a map takes ownership or setup fails.
+struct AdmissionReservation {
+    explicit AdmissionReservation(bool& transient)
+        : transient(transient) {
+        assert(!transient);
+        transient = true;
+    }
+
+    AdmissionReservation(const AdmissionReservation&) = delete;
+    AdmissionReservation& operator=(const AdmissionReservation&) = delete;
+    ~AdmissionReservation() { transient = false; }
+
+    bool& transient;
 };
 
 bool isRecoverableAcceptError(const std::error_code& error) {
@@ -86,6 +102,8 @@ ProxyReactor::ProxyReactor(detail::EpollPoller poller, FileDescriptor shutdown_s
       shutdown_signal_fd_(std::move(shutdown_signal_fd)),
       timer_fd_(std::move(timer_fd)),
       timeouts_(timeouts),
+      max_connections_(resources.max_connections),
+      max_pending_connections_(resources.max_pending_connections),
       time_source_(time_source),
       upstream_dialer_(std::move(upstream_dialer)) {}
 
@@ -109,6 +127,9 @@ ProxyReactor::createImpl(const net::ListenSocketAddress& listen_address,
     }
     if (!resources.validBufferWatermarks()) {
         return std::unexpected(ProxyCreateError{"Invalid directional buffer watermarks"});
+    }
+    if (!resources.validConnectionLimits()) {
+        return std::unexpected(ProxyCreateError{"Invalid connection admission limits"});
     }
     auto poller_create_result = detail::EpollPoller::create();
     if (!poller_create_result) {
@@ -203,7 +224,7 @@ Status<FatalReactorError> ProxyReactor::dispatch(detail::ReadyEvent event) {
         return {};
     }
 
-    return std::visit(
+    auto status = std::visit(
         overloaded{
             [&](detail::EndpointRegistration r) { return handleEndpoint(r, event.events); },
             [&](detail::ListenerRegistration r) { return handleListener(r); },
@@ -214,6 +235,13 @@ Status<FatalReactorError> ProxyReactor::dispatch(detail::ReadyEvent event) {
             },
         },
         *registration);
+    if (!status) {
+        return status;
+    }
+    if (auto interests = synchronizeListener(); !interests) {
+        return std::unexpected(FatalReactorError{interests.error().message()});
+    }
+    return {};
 }
 
 Status<std::error_code> ProxyReactor::closeSession(detail::SessionId session_id) {
@@ -314,6 +342,7 @@ ProxyReactor::registerPendingConnection(detail::PendingConnection pending_connec
         deadlines_.schedule({detail::DeadlineKind::Connect, *registered},
                             pending_connection.deadline);
         pending_connections_.emplace(*registered, std::move(pending_connection));
+        transient_admission_ = false;
     }
     return registered;
 }
@@ -398,6 +427,7 @@ Result<detail::SessionId, AddSessionError> ProxyReactor::addSession(FileDescript
                              .downstream = downstream_id,
                              .upstream = upstream_id,
                          });
+    transient_admission_ = false;
 
     if (timeouts_.idle.count() > 0) {
         deadlines_.schedule({detail::DeadlineKind::Idle, session_id},
@@ -585,8 +615,34 @@ Status<std::error_code> ProxyReactor::expireDeadlines(detail::Deadline now) {
     return {};
 }
 
+size_t ProxyReactor::pendingConnectionCount() const {
+    return pending_connections_.size() + transient_admission_;
+}
+
+bool ProxyReactor::canAdmit() const {
+    const size_t pending = pendingConnectionCount();
+    return shutdown_state_ == ShutdownState::Running && pending < max_pending_connections_ &&
+           session_manager_.size() + pending < max_connections_;
+}
+
+Status<std::error_code> ProxyReactor::synchronizeListener() {
+    if (!active_listener_) {
+        return {};
+    }
+    const bool enabled = canAdmit();
+    if (enabled == active_listener_->read_enabled) {
+        return {};
+    }
+    auto result = poller_.setInterests(active_listener_->listener_id, enabled ? EPOLLIN : 0);
+    if (result) {
+        active_listener_->read_enabled = enabled;
+    }
+    return result;
+}
+
 Status<FatalReactorError> ProxyReactor::handleListener(detail::ListenerRegistration) {
-    for (int i = 0; i < max_accept_batch_size; i++) {
+    for (int i = 0; i < max_accept_batch_size && canAdmit(); ++i) {
+        AdmissionReservation reservation(transient_admission_);
         auto accept_result = active_listener_->listener.acceptClientConnection();
         if (!accept_result) {
             if (isRecoverableAcceptError(accept_result.error())) {
@@ -635,6 +691,7 @@ Status<FatalReactorError> ProxyReactor::handlePendingConnection(detail::SourceId
     if (shutdown_state_ != ShutdownState::Running) {
         return {};
     }
+    AdmissionReservation reservation(transient_admission_);
     auto dial_result = upstream_dialer_.advanceDialAttempt(std::move(*pending), time_source_);
     if (!dial_result) {
         return handleDialError(std::move(dial_result.error()));
